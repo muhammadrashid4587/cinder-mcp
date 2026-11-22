@@ -375,13 +375,16 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_keyspace_summary(self):
+    def test_prompts_list_returns_both_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 1)
+        self.assertEqual(len(prompts), 2)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
+        self.assertEqual(prompts[1]["name"], "key-deep-dive")
+        self.assertEqual(prompts[1]["arguments"][0]["name"], "key")
+        self.assertTrue(prompts[1]["arguments"][0]["required"])
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -430,6 +433,85 @@ class McpTests(unittest.TestCase):
         self.assertIn("error", reply)
         self.assertEqual(reply["error"]["code"], -32602)
         self.assertIn("unknown prompt: nope", reply["error"]["message"])
+
+    def test_prompts_get_deep_dive_string_key(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {
+                "key": "user:1", "value": "alice", "ex": 3600},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "user:2", "value": "bob"},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "cache:x", "value": "c"},
+        })
+        reply = self._call("prompts/get", 4, {
+            "name": "key-deep-dive", "arguments": {"key": "user:1"},
+        })
+        messages = reply["result"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        text = messages[0]["content"]["text"]
+        self.assertIn("Deep dive on key 'user:1'.", text)
+        self.assertIn("Type: string", text)
+        self.assertIn("Size: 5 bytes", text)
+        self.assertIn("Sample value:\nalice", text)
+        ttl_line = [l for l in text.split("\n") if l.startswith("TTL:")][0]
+        remaining = int(ttl_line.split()[1])
+        self.assertTrue(0 < remaining <= 3600)
+        # Only the sibling in the same namespace counts as related.
+        self.assertIn("- user:2", text)
+        self.assertNotIn("cache:x", text)
+        self.assertIn("kv_expire", text)
+
+    def test_prompts_get_deep_dive_string_no_expiry(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("prompts/get", 2, {
+            "name": "key-deep-dive", "arguments": {"key": "plain"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("TTL: no expiry set", text)
+        self.assertIn("Size: 1 bytes", text)
+        self.assertIn("Related keys (0):", text)
+        self.assertIn("(none)", text)
+
+    def test_prompts_get_deep_dive_list_key(self):
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        reply = self._call("prompts/get", 1, {
+            "name": "key-deep-dive", "arguments": {"key": "todo"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Type: list", text)
+        self.assertIn("Size: 2 elements", text)
+        self.assertNotIn("Sample value:", text)
+
+    def test_prompts_get_deep_dive_truncates_long_value(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "big", "value": "x" * 250},
+        })
+        reply = self._call("prompts/get", 2, {
+            "name": "key-deep-dive", "arguments": {"key": "big"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Size: 250 bytes", text)
+        self.assertIn("... (truncated)", text)
+        self.assertNotIn("x" * 250, text)
+
+    def test_prompts_get_deep_dive_missing_key_returns_error(self):
+        reply = self._call("prompts/get", 1, {
+            "name": "key-deep-dive", "arguments": {"key": "ghost"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("key not found: ghost", reply["error"]["message"])
+
+    def test_prompts_get_deep_dive_requires_key_argument(self):
+        reply = self._call("prompts/get", 1, {"name": "key-deep-dive"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("requires a key argument", reply["error"]["message"])
 
     def test_resources_read_unknown_uri_returns_error(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://nope"})

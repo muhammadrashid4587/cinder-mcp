@@ -60,6 +60,7 @@ Fetchable with `resources/list` and `resources/read`.
 | Prompt | Arguments | Notes |
 | --- | --- | --- |
 | `keyspace-summary` | `pattern` (optional, defaults to `*`) | Samples `INFO`, lists the keys matching the pattern, and asks the model to summarize the keyspace and suggest what to check next: keys worth reading, TTLs worth checking, and keys that look stale |
+| `key-deep-dive` | `key` (required) | Inspects one key in detail — type, TTL, size, a sample of its value (truncated at 200 chars), and the keys sharing its namespace — and asks the model to judge whether the key looks healthy |
 
 Fetchable with `prompts/list` and `prompts/get`.
 
@@ -88,3 +89,4 @@ requests return JSON-RPC errors.
 - ~~Sampling the cinder INFO output as a `cinder://info` resource~~ (done, v0.3.0)
 - ~~Resource (URI) support for reading keys as MCP resources (`cinder://key/<key>`)~~ (done, v0.4.0)
 - ~~Prompt support (`prompts/list`, `prompts/get`)~~ (done, v0.5.0)
+- ~~Per-key deep-dive prompt (`key-deep-dive`: type, TTL, size, sample value, related keys)~~ (done, v0.6.0)
