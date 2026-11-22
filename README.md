@@ -51,6 +51,7 @@ Wire it into an MCP client as a stdio server with the command
 | URI | Cinder command | Notes |
 | --- | --- | --- |
 | `cinder://info` | `INFO` | Server version, uptime, commands processed, key count |
+| `cinder://key/<key>` | `EXISTS` + `GET` / `LLEN` / `SCARD` / `HLEN` | Value and type as JSON; not-found error for missing keys. Non-string values report their type and length instead of a value (cinder has no `TYPE` command, so the type is probed) |
 
 Fetchable with `resources/list` and `resources/read`.
 
@@ -77,5 +78,5 @@ requests return JSON-RPC errors.
 ## Roadmap
 
 - ~~Sampling the cinder INFO output as a `cinder://info` resource~~ (done, v0.3.0)
-- Resource (URI) support for reading keys as MCP resources (`cinder://key/<key>`)
+- ~~Resource (URI) support for reading keys as MCP resources (`cinder://key/<key>`)~~ (done, v0.4.0)
 - Prompt support (`prompts/list`, `prompts/get`)

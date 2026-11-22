@@ -71,6 +71,9 @@ def main():
             })["result"]["serverInfo"])
             tools = send(mcp, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             print("tools:", [t["name"] for t in tools["result"]["tools"]])
+            resources = send(mcp, {"jsonrpc": "2.0", "id": 3, "method": "resources/list"})
+            print("resources:", [r.get("uri") or r.get("uriTemplate")
+                                 for r in resources["result"]["resources"]])
             for i, call in enumerate([
                 ("kv_set", {"key": "demo:counter", "value": "41"}),
                 ("kv_incr", {"key": "demo:counter"}),
@@ -80,12 +83,25 @@ def main():
                 ("kv_expire", {"key": "demo:counter", "seconds": 3600}),
                 ("kv_ttl", {"key": "demo:counter"}),
                 ("kv_exists", {"key": "demo:missing"}),
-            ], start=3):
+            ], start=4):
                 reply = send(mcp, {
                     "jsonrpc": "2.0", "id": i, "method": "tools/call",
                     "params": {"name": call[0], "arguments": call[1]},
                 })
                 print(call[0], "->", reply["result"]["content"][0]["text"])
+            for i, uri in enumerate([
+                "cinder://info",
+                "cinder://key/demo:counter",
+                "cinder://key/demo:missing",
+            ], start=12):
+                reply = send(mcp, {
+                    "jsonrpc": "2.0", "id": i, "method": "resources/read",
+                    "params": {"uri": uri},
+                })
+                if "result" in reply:
+                    print(uri, "->", reply["result"]["contents"][0]["text"])
+                else:
+                    print(uri, "-> error", reply["error"]["message"])
             return 0
         finally:
             mcp.stdin.close()

@@ -1,9 +1,11 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE) to prove the MCP layer
-works: the handshake, the tool list, a SET-then-GET round trip, and clean
+GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN)
+to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
+Keys in the fake store may also hold a list, set, or dict value so the
+per-key resource's type probing can be exercised.
 """
 
 import io
@@ -136,7 +138,17 @@ class FakeCinder(threading.Thread):
                     self.store[key] = (value, expires)
                     self._reply(conn, "+OK\r\n")
                 elif name == "GET" and len(args) == 1:
-                    self._reply(conn, self._bulk(self._get(args[0])))
+                    value = self._get(args[0])
+                    if value is not None and not isinstance(value, str):
+                        self._reply(conn, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                    else:
+                        self._reply(conn, self._bulk(value))
+                elif name == "LLEN" and len(args) == 1:
+                    self._reply(conn, self._container_len(args[0], list))
+                elif name == "SCARD" and len(args) == 1:
+                    self._reply(conn, self._container_len(args[0], set))
+                elif name == "HLEN" and len(args) == 1:
+                    self._reply(conn, self._container_len(args[0], dict))
                 elif name == "DEL":
                     n = sum(1 for k in args if self._get(k) is not None)
                     for k in args:
@@ -188,6 +200,15 @@ class FakeCinder(threading.Thread):
                     self._reply(conn, "-ERR unknown command\r\n")
         finally:
             conn.close()
+
+    def _container_len(self, key, kind):
+        value = self._get(key)
+        if value is None:
+            return ":0\r\n"
+        if not isinstance(value, kind):
+            return ("-WRONGTYPE Operation against a key holding the "
+                    "wrong kind of value\r\n")
+        return ":%d\r\n" % len(value)
 
     def _incr(self, key, by):
         current = self._get(key)
@@ -283,12 +304,66 @@ class McpTests(unittest.TestCase):
         remaining = int(ttl["result"]["content"][0]["text"])
         self.assertTrue(0 < remaining <= 3600)
 
-    def test_resources_list_returns_info_resource(self):
+    def test_resources_list_returns_info_and_key_template(self):
         listed = self._call("resources/list", 1)
         resources = listed["result"]["resources"]
-        self.assertEqual(len(resources), 1)
+        self.assertEqual(len(resources), 2)
         self.assertEqual(resources[0]["uri"], "cinder://info")
         self.assertEqual(resources[0]["mimeType"], "text/plain")
+        self.assertEqual(resources[1]["uriTemplate"], "cinder://key/{key}")
+        self.assertEqual(resources[1]["mimeType"], "application/json")
+
+    def test_resources_read_key_string_returns_value_and_type(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "hello", "value": "world"},
+        })
+        reply = self._call("resources/read", 2, {"uri": "cinder://key/hello"})
+        contents = reply["result"]["contents"]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0]["uri"], "cinder://key/hello")
+        self.assertEqual(contents[0]["mimeType"], "application/json")
+        self.assertEqual(json.loads(contents[0]["text"]), {
+            "key": "hello", "type": "string", "value": "world",
+        })
+
+    def test_resources_read_key_missing_returns_not_found(self):
+        reply = self._call("resources/read", 1, {"uri": "cinder://key/ghost"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("key not found: ghost", reply["error"]["message"])
+
+    def test_resources_read_key_list_returns_type_and_length(self):
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        reply = self._call("resources/read", 1, {"uri": "cinder://key/todo"})
+        self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
+            "key": "todo", "type": "list", "length": 2,
+        })
+
+    def test_resources_read_key_set_and_hash(self):
+        self.fake.store["tags"] = ({"a", "b", "c"}, None)
+        reply = self._call("resources/read", 1, {"uri": "cinder://key/tags"})
+        self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
+            "key": "tags", "type": "set", "length": 3,
+        })
+        self.fake.store["user:1"] = ({"name": "mammu"}, None)
+        reply = self._call("resources/read", 2, {"uri": "cinder://key/user:1"})
+        self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
+            "key": "user:1", "type": "hash", "length": 1,
+        })
+
+    def test_resources_read_key_url_decodes_key(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a b", "value": "v"},
+        })
+        reply = self._call("resources/read", 2, {"uri": "cinder://key/a%20b"})
+        self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
+            "key": "a b", "type": "string", "value": "v",
+        })
+
+    def test_resources_read_key_empty_key_returns_error(self):
+        reply = self._call("resources/read", 1, {"uri": "cinder://key/"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
 
     def test_resources_read_info_returns_server_info(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://info"})

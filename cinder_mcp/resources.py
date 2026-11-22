@@ -2,11 +2,22 @@
 
 Resources are read-only URIs an MCP client can fetch, as opposed to
 tools which are actions. Each resource maps to a cinder command whose
-output is returned as text. The only resource so far is cinder://info,
-which samples cinder's INFO output (version, uptime, key count).
+output is returned as text. cinder://info samples cinder's INFO output;
+cinder://key/<key> exposes one key's value and type as JSON.
+
+Cinder has no TYPE command, so the key resource works out the type by
+probing: GET succeeds for strings, otherwise LLEN / SCARD / HLEN are
+tried in turn and the first one that does not answer WRONGTYPE names
+the type. A missing key is a not-found error, not an empty resource.
 """
 
+import json
+from urllib.parse import unquote
+
+from .resp import RespError
+
 INFO_URI = "cinder://info"
+KEY_URI_PREFIX = "cinder://key/"
 
 RESOURCES = [
     {
@@ -17,6 +28,15 @@ RESOURCES = [
             "key count, and AOF fsync policy."
         ),
         "mimeType": "text/plain",
+    },
+    {
+        "uriTemplate": KEY_URI_PREFIX + "{key}",
+        "name": "Key value",
+        "description": (
+            "The value and type of a single key, as JSON. "
+            "Returns a not-found error when the key does not exist."
+        ),
+        "mimeType": "application/json",
     },
 ]
 
@@ -29,4 +49,45 @@ def read_resource(client, uri):
         if text is None:
             raise ValueError("cinder returned no INFO output")
         return {"uri": uri, "mimeType": "text/plain", "text": text}
+    if uri.startswith(KEY_URI_PREFIX):
+        return _read_key_resource(client, uri)
     raise ValueError("unknown resource: %s" % uri)
+
+
+def _read_key_resource(client, uri):
+    key = unquote(uri[len(KEY_URI_PREFIX):])
+    if not key:
+        raise ValueError("cinder://key/ requires a key")
+    if client.command("EXISTS", key) == 0:
+        raise ValueError("key not found: %s" % key)
+    try:
+        value = client.command("GET", key)
+    except RespError:
+        # Not a string: probe the container types. The first command
+        # that does not answer WRONGTYPE names the type.
+        for probe, kind in (("LLEN", "list"), ("SCARD", "set"), ("HLEN", "hash")):
+            try:
+                length = client.command(probe, key)
+            except RespError:
+                continue
+            return _key_content(uri, key, kind, None, length)
+        raise ValueError("key has an unreadable type: %s" % key)
+    if value is None:
+        # The key expired between EXISTS and GET.
+        raise ValueError("key not found: %s" % key)
+    return _key_content(uri, key, "string", value)
+
+
+def _key_content(uri, key, kind, value, length=None):
+    payload = {"key": key, "type": kind}
+    if kind == "string":
+        payload["value"] = value
+    else:
+        # Non-string values are not readable as a single resource
+        # value; report the size instead.
+        payload["length"] = length
+    return {
+        "uri": uri,
+        "mimeType": "application/json",
+        "text": json.dumps(payload),
+    }
