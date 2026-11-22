@@ -2,7 +2,8 @@
 
 Protocol: JSON-RPC 2.0, one message per line on stdin/stdout (the MCP
 stdio transport). Supported methods: initialize, ping, tools/list,
-tools/call. Notifications (messages without an id) get no reply.
+tools/call, resources/list, resources/read. Notifications (messages
+without an id) get no reply.
 
 Run: python3 -m cinder_mcp.server [--host 127.0.0.1] [--port 6379]
 Or point it at a cinder with CINDER_HOST / CINDER_PORT.
@@ -14,10 +15,11 @@ import os
 import sys
 
 from .resp import ConnectionError, RespClient, RespError
+from .resources import RESOURCES, read_resource
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -49,6 +51,10 @@ class MCPServer:
                 response = self._result(msg_id, {"tools": TOOLS})
             elif method == "tools/call":
                 response = self._result(msg_id, self._tools_call(params))
+            elif method == "resources/list":
+                response = self._result(msg_id, {"resources": RESOURCES})
+            elif method == "resources/read":
+                response = self._result(msg_id, self._resources_read(params))
             else:
                 response = self._error(msg_id, -32601, "Method not found: %s" % method)
         except (ConnectionError, RespError) as exc:
@@ -63,7 +69,7 @@ class MCPServer:
     def _initialize(self, params):
         return {
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "resources": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }
 
@@ -73,6 +79,12 @@ class MCPServer:
             raise ValueError("tools/call requires a tool name")
         result = call_tool(self.client, name, params.get("arguments") or {})
         return {"content": [{"type": "text", "text": _render(result)}]}
+
+    def _resources_read(self, params):
+        uri = params.get("uri")
+        if not isinstance(uri, str):
+            raise ValueError("resources/read requires a resource uri")
+        return {"contents": [read_resource(self.client, uri)]}
 
     @staticmethod
     def _result(msg_id, result):

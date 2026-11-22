@@ -174,6 +174,16 @@ class FakeCinder(threading.Thread):
                         value, _ = self.store[args[0]]
                         self.store[args[0]] = (value, time.time() + seconds)
                         self._reply(conn, ":1\r\n")
+                elif name == "INFO":
+                    info = (
+                        "# Server\r\n"
+                        "cinder_version:0.4.0\r\n"
+                        "uptime_in_seconds:42\r\n"
+                        "total_commands_processed:7\r\n"
+                        "# Keyspace\r\n"
+                        "keys:%d\r\n" % len(self.store)
+                    )
+                    self._reply(conn, self._bulk(info))
                 else:
                     self._reply(conn, "-ERR unknown command\r\n")
         finally:
@@ -205,6 +215,7 @@ class McpTests(unittest.TestCase):
         init = self._call("initialize", 1, {"protocolVersion": "2024-11-05"})
         self.assertEqual(init["result"]["serverInfo"]["name"], "cinder-mcp")
         self.assertIn("tools", init["result"]["capabilities"])
+        self.assertIn("resources", init["result"]["capabilities"])
         listed = self._call("tools/list", 2)
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
@@ -271,6 +282,27 @@ class McpTests(unittest.TestCase):
         })
         remaining = int(ttl["result"]["content"][0]["text"])
         self.assertTrue(0 < remaining <= 3600)
+
+    def test_resources_list_returns_info_resource(self):
+        listed = self._call("resources/list", 1)
+        resources = listed["result"]["resources"]
+        self.assertEqual(len(resources), 1)
+        self.assertEqual(resources[0]["uri"], "cinder://info")
+        self.assertEqual(resources[0]["mimeType"], "text/plain")
+
+    def test_resources_read_info_returns_server_info(self):
+        reply = self._call("resources/read", 1, {"uri": "cinder://info"})
+        contents = reply["result"]["contents"]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0]["uri"], "cinder://info")
+        self.assertEqual(contents[0]["mimeType"], "text/plain")
+        self.assertIn("cinder_version:0.4.0", contents[0]["text"])
+        self.assertIn("keys:0", contents[0]["text"])
+
+    def test_resources_read_unknown_uri_returns_error(self):
+        reply = self._call("resources/read", 1, {"uri": "cinder://nope"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
 
     def test_unreachable_cinder_returns_clean_jsonrpc_error(self):
         dead = MCPServer(RespClient("127.0.0.1", 1))  # nothing listens here
