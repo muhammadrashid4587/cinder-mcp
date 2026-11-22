@@ -74,6 +74,8 @@ def main():
             resources = send(mcp, {"jsonrpc": "2.0", "id": 3, "method": "resources/list"})
             print("resources:", [r.get("uri") or r.get("uriTemplate")
                                  for r in resources["result"]["resources"]])
+            prompts = send(mcp, {"jsonrpc": "2.0", "id": 4, "method": "prompts/list"})
+            print("prompts:", [p["name"] for p in prompts["result"]["prompts"]])
             for i, call in enumerate([
                 ("kv_set", {"key": "demo:counter", "value": "41"}),
                 ("kv_incr", {"key": "demo:counter"}),
@@ -83,7 +85,7 @@ def main():
                 ("kv_expire", {"key": "demo:counter", "seconds": 3600}),
                 ("kv_ttl", {"key": "demo:counter"}),
                 ("kv_exists", {"key": "demo:missing"}),
-            ], start=4):
+            ], start=5):
                 reply = send(mcp, {
                     "jsonrpc": "2.0", "id": i, "method": "tools/call",
                     "params": {"name": call[0], "arguments": call[1]},

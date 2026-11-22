@@ -2,8 +2,8 @@
 
 Protocol: JSON-RPC 2.0, one message per line on stdin/stdout (the MCP
 stdio transport). Supported methods: initialize, ping, tools/list,
-tools/call, resources/list, resources/read. Notifications (messages
-without an id) get no reply.
+tools/call, resources/list, resources/read, prompts/list, prompts/get.
+Notifications (messages without an id) get no reply.
 
 Run: python3 -m cinder_mcp.server [--host 127.0.0.1] [--port 6379]
 Or point it at a cinder with CINDER_HOST / CINDER_PORT.
@@ -15,11 +15,12 @@ import os
 import sys
 
 from .resp import ConnectionError, RespClient, RespError
+from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, read_resource
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -55,6 +56,10 @@ class MCPServer:
                 response = self._result(msg_id, {"resources": RESOURCES})
             elif method == "resources/read":
                 response = self._result(msg_id, self._resources_read(params))
+            elif method == "prompts/list":
+                response = self._result(msg_id, {"prompts": PROMPTS})
+            elif method == "prompts/get":
+                response = self._result(msg_id, self._prompts_get(params))
             else:
                 response = self._error(msg_id, -32601, "Method not found: %s" % method)
         except (ConnectionError, RespError) as exc:
@@ -69,7 +74,7 @@ class MCPServer:
     def _initialize(self, params):
         return {
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}, "resources": {}},
+            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }
 
@@ -85,6 +90,12 @@ class MCPServer:
         if not isinstance(uri, str):
             raise ValueError("resources/read requires a resource uri")
         return {"contents": [read_resource(self.client, uri)]}
+
+    def _prompts_get(self, params):
+        name = params.get("name")
+        if not isinstance(name, str):
+            raise ValueError("prompts/get requires a prompt name")
+        return get_prompt(self.client, name, params.get("arguments") or {})
 
     @staticmethod
     def _result(msg_id, result):

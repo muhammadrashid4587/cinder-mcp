@@ -55,6 +55,14 @@ Wire it into an MCP client as a stdio server with the command
 
 Fetchable with `resources/list` and `resources/read`.
 
+## Prompts
+
+| Prompt | Arguments | Notes |
+| --- | --- | --- |
+| `keyspace-summary` | `pattern` (optional, defaults to `*`) | Samples `INFO`, lists the keys matching the pattern, and asks the model to summarize the keyspace and suggest what to check next: keys worth reading, TTLs worth checking, and keys that look stale |
+
+Fetchable with `prompts/list` and `prompts/get`.
+
 ## Demo
 
 `scripts/demo.py` starts a real cinder on port 7777, runs the MCP server
@@ -79,4 +87,4 @@ requests return JSON-RPC errors.
 
 - ~~Sampling the cinder INFO output as a `cinder://info` resource~~ (done, v0.3.0)
 - ~~Resource (URI) support for reading keys as MCP resources (`cinder://key/<key>`)~~ (done, v0.4.0)
-- Prompt support (`prompts/list`, `prompts/get`)
+- ~~Prompt support (`prompts/list`, `prompts/get`)~~ (done, v0.5.0)

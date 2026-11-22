@@ -237,6 +237,7 @@ class McpTests(unittest.TestCase):
         self.assertEqual(init["result"]["serverInfo"]["name"], "cinder-mcp")
         self.assertIn("tools", init["result"]["capabilities"])
         self.assertIn("resources", init["result"]["capabilities"])
+        self.assertIn("prompts", init["result"]["capabilities"])
         listed = self._call("tools/list", 2)
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
@@ -373,6 +374,62 @@ class McpTests(unittest.TestCase):
         self.assertEqual(contents[0]["mimeType"], "text/plain")
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
+
+    def test_prompts_list_returns_keyspace_summary(self):
+        listed = self._call("prompts/list", 1)
+        prompts = listed["result"]["prompts"]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["name"], "keyspace-summary")
+        self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
+        self.assertFalse(prompts[0]["arguments"][0]["required"])
+
+    def test_prompts_get_empty_keyspace(self):
+        reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
+        messages = reply["result"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        text = messages[0]["content"]["text"]
+        self.assertIn("Keys matching '*' (0):", text)
+        self.assertIn("(no keys)", text)
+        self.assertIn("cinder_version:0.4.0", text)
+
+    def test_prompts_get_lists_live_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "user:1", "value": "a"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "user:2", "value": "b"},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "cache:x", "value": "c"},
+        })
+        reply = self._call("prompts/get", 4, {"name": "keyspace-summary"})
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Keys matching '*' (3):", text)
+        self.assertIn("- user:1", text)
+        self.assertIn("- cache:x", text)
+        self.assertIn("kv_ttl", text)
+
+    def test_prompts_get_pattern_filters_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "user:1", "value": "a"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "cache:x", "value": "c"},
+        })
+        reply = self._call("prompts/get", 3, {
+            "name": "keyspace-summary", "arguments": {"pattern": "user:*"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Keys matching 'user:*' (1):", text)
+        self.assertIn("- user:1", text)
+        self.assertNotIn("cache:x", text)
+
+    def test_prompts_get_unknown_prompt_returns_error(self):
+        reply = self._call("prompts/get", 1, {"name": "nope"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("unknown prompt: nope", reply["error"]["message"])
 
     def test_resources_read_unknown_uri_returns_error(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://nope"})
