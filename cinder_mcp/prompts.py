@@ -10,7 +10,12 @@ detail — its type, TTL, size, a sample of its value, and the keys
 related to it — and asks the model to judge whether that one key
 looks healthy. ttl-audit scans the keyspace, groups every key by how
 soon it expires, and asks the model to flag keys expiring soon and
-keys with no expiry that the operator should act on.
+keys with no expiry that the operator should act on. cleanup-plan
+inspects the live keyspace — INFO, KEYS, and a per-key TTL, type,
+and size sample — classifies every key as safe to delete, expiring
+soon, risky to delete without confirmation, or keep, and asks the
+model to turn that into a concrete cleanup plan with exact kv_del
+calls.
 """
 
 from .resp import RespError
@@ -27,9 +32,25 @@ MAX_SOON_KEYS = 10
 # At most this many no-expiry keys are listed in the ttl-audit.
 MAX_NO_EXPIRY_KEYS = 20
 
+# At most this many keys are listed per section in the cleanup-plan.
+MAX_CLEANUP_KEYS = 20
+
 # TTL bucket boundaries, in seconds: under 1 hour, under 1 day,
 # under 1 week, over 1 week. Keys with TTL -1 have no expiry.
 BUCKET_BOUNDS = (3600, 86400, 604800)
+
+# Cleanup-plan classification thresholds, in seconds. A key expiring
+# within the hour dies on its own almost immediately, so deleting it
+# early changes nothing; a key expiring within a day needs a renew-or-
+# let-go decision; anything longer-lived is kept by default.
+CLEANUP_SAFE_TTL = 3600
+CLEANUP_SOON_TTL = 86400
+
+# Name segments that suggest a key holds temporary data: a no-expiry
+# key in one of these namespaces is flagged as likely stale, but it
+# still needs a human to confirm the delete — the name is a hint, not
+# proof the key is safe to drop.
+TEMP_NAME_HINTS = ("cache", "tmp", "temp", "session", "sess", "lock", "rate")
 
 PROMPTS = [
     {
@@ -76,6 +97,22 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "cleanup-plan",
+        "description": (
+            "Plan a keyspace cleanup: inspect the live keyspace, "
+            "classify every key as safe to delete, expiring soon, "
+            "risky to delete without confirmation, or keep, and "
+            "produce a concrete cleanup plan with exact kv_del calls."
+        ),
+        "arguments": [
+            {
+                "name": "pattern",
+                "description": "Glob pattern of keys to include (* and ?). Defaults to all keys.",
+                "required": False,
+            },
+        ],
+    },
 ]
 
 
@@ -96,6 +133,8 @@ def get_prompt(client, name, arguments):
         return _key_deep_dive(client, arguments)
     if name == "ttl-audit":
         return _ttl_audit(client, arguments)
+    if name == "cleanup-plan":
+        return _cleanup_plan(client, arguments)
     raise ValueError("unknown prompt: %s" % name)
 
 
@@ -134,42 +173,41 @@ def _keyspace_summary(client, arguments):
     }
 
 
+def _inspect_key(client, key):
+    """Type and size of one key, plus a sample value for string keys.
+    Returns (kind, size_text, sample) where sample is the string value
+    for string keys and None for containers. Cinder has no TYPE
+    command, so the type is probed the same way the per-key resource
+    does: GET succeeds for strings, otherwise LLEN / SCARD / HLEN are
+    tried in turn and the first one that does not answer WRONGTYPE
+    names it."""
+    try:
+        value = client.command("GET", key)
+    except RespError:
+        # Not a string: probe the container types.
+        for probe, name in (("LLEN", "list"), ("SCARD", "set"), ("HLEN", "hash")):
+            try:
+                length = client.command(probe, key)
+            except RespError:
+                continue
+            return name, "%d elements" % length, None
+        raise ValueError("key has an unreadable type: %s" % key)
+    if value is None:
+        # The key expired between EXISTS and GET, or was deleted.
+        raise ValueError("key not found: %s" % key)
+    return "string", "%d bytes" % len(value.encode("utf-8")), value
+
+
 def _key_deep_dive(client, arguments):
     """One key in detail: type, TTL, size, a sample of its value, and
-    the keys that share its namespace. Cinder has no TYPE command, so
-    the type is probed the same way the per-key resource does: GET
-    succeeds for strings, otherwise LLEN / SCARD / HLEN are tried in
-    turn and the first one that does not answer WRONGTYPE names it."""
+    the keys that share its namespace."""
     key = arguments.get("key")
     if not key:
         raise ValueError("key-deep-dive requires a key argument")
     if client.command("EXISTS", key) == 0:
         raise ValueError("key not found: %s" % key)
     ttl = client.command("TTL", key)
-    try:
-        value = client.command("GET", key)
-    except RespError:
-        # Not a string: probe the container types.
-        kind = None
-        length = None
-        for probe, name in (("LLEN", "list"), ("SCARD", "set"), ("HLEN", "hash")):
-            try:
-                length = client.command(probe, key)
-            except RespError:
-                continue
-            kind = name
-            break
-        if kind is None:
-            raise ValueError("key has an unreadable type: %s" % key)
-        size = "%d elements" % length
-        sample = None
-    else:
-        if value is None:
-            # The key expired between EXISTS and GET.
-            raise ValueError("key not found: %s" % key)
-        kind = "string"
-        size = "%d bytes" % len(value.encode("utf-8"))
-        sample = value
+    kind, size, sample = _inspect_key(client, key)
     if ttl == -2:
         ttl_text = "expired while reading"
     elif ttl == -1:
@@ -309,6 +347,130 @@ def _ttl_audit(client, arguments):
     ])
     return {
         "description": _prompt_def("ttl-audit")["description"],
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }
+
+
+def _classify_cleanup(name, ttl):
+    """Classify one key for the cleanup plan: "safe", "soon", "risky",
+    or "keep". A key expiring within the hour is safe to delete now —
+    it dies on its own almost immediately, so deleting early changes
+    nothing. A key expiring within a day needs a renew-or-let-go
+    decision. A key with no expiry is risky: only a human who knows
+    what the key is for can say whether deleting it is safe, so it
+    goes to the confirm list. A key living longer than a day is kept
+    by default. ttl is the raw TTL reply: -1 means no expiry."""
+    if ttl == -1:
+        return "risky"
+    if ttl < CLEANUP_SAFE_TTL:
+        return "safe"
+    if ttl < CLEANUP_SOON_TTL:
+        return "soon"
+    return "keep"
+
+
+def _looks_temporary(name):
+    """True when a key name suggests temporary data: one of its ':'
+    segments is a temp hint (cache, tmp, session, lock, ...). A
+    substring match would misfire on names like "mycache", so the
+    segments are compared exactly."""
+    return any(segment in TEMP_NAME_HINTS for segment in name.split(":"))
+
+
+def _cleanup_plan(client, arguments):
+    """Inspect the live keyspace — INFO, KEYS, and a per-key TTL, type,
+    and size sample — classify every key as safe to delete, expiring
+    soon, risky to delete without confirmation, or keep, and ask the
+    model to turn that into a concrete cleanup plan. Keys that expire
+    between the KEYS scan and the TTL probe (TTL -2) are counted
+    separately rather than classified. Keys that vanish between the
+    TTL probe and the type probe are skipped the same way."""
+    pattern = arguments.get("pattern", "*")
+    info = client.command("INFO")
+    keys = client.command("KEYS", pattern)
+    if keys is None:
+        keys = []
+    sections = {"safe": [], "soon": [], "risky": [], "keep": []}
+    expired = 0
+    for key in sorted(keys):
+        ttl = client.command("TTL", key)
+        if ttl == -2:
+            expired += 1
+            continue
+        try:
+            kind, size, _sample = _inspect_key(client, key)
+        except ValueError:
+            # The key vanished between the TTL probe and the type probe.
+            expired += 1
+            continue
+        category = _classify_cleanup(key, ttl)
+        if ttl == -1:
+            ttl_text = "no expiry"
+        else:
+            ttl_text = "expires in %s" % _format_ttl(ttl)
+        note = ""
+        if category == "risky" and _looks_temporary(key):
+            note = ", looks temporary"
+        sections[category].append(
+            "- %s (%s, %s, %s%s)" % (key, kind, size, ttl_text, note)
+        )
+    lines = [
+        "Cleanup plan for the cinder keyspace (pattern %r)." % pattern,
+        "",
+        "Server info:",
+        info.strip() if info else "(no INFO output)",
+        "",
+        "Total keys scanned: %d" % len(keys),
+    ]
+    if expired:
+        lines.append(
+            "%d key(s) expired while scanning and were not classified."
+            % expired
+        )
+    section_text = [
+        ("safe",
+         "Safe to delete (%d) — these expire within the hour, so "
+         "deleting them now changes nothing:"),
+        ("soon",
+         "Expiring soon (%d) — these expire within a day; renew them "
+         "with kv_expire or let them go:"),
+        ("risky",
+         "Risky — confirm before deleting (%d) — these have no "
+         "expiry, so only a human who knows what each key is for can "
+         "say whether deleting it is safe:"),
+        ("keep",
+         "Keep (%d) — long-lived by design, no action:"),
+    ]
+    for category, header in section_text:
+        members = sections[category]
+        lines.extend(["", header % len(members)])
+        if members:
+            lines.extend(members[:MAX_CLEANUP_KEYS])
+            if len(members) > MAX_CLEANUP_KEYS:
+                lines.append("... and %d more" % (len(members) - MAX_CLEANUP_KEYS))
+        else:
+            lines.append("(none)")
+    lines.extend([
+        "",
+        "Produce a concrete cleanup plan, in this order: first the "
+        "safe deletes, with the exact kv_del call for each key; then "
+        "the keys expiring soon, saying for each whether to renew it "
+        "with kv_expire or let it expire, and why; then the risky "
+        "keys, saying what to check before deleting each one — its "
+        "value with kv_get or cinder://key/<key>, its namespace, and "
+        "whether its name suggests temporary data — and which ones, "
+        "if any, you would still delete with kv_del. Challenge the "
+        "classification where the key name or size suggests it is "
+        "wrong: a key that looks like live user data must never be "
+        "deleted on the basis of its TTL alone, and a no-expiry key "
+        "in a temporary namespace is only a candidate until a human "
+        "confirms it. Do not delete anything yourself: list the calls "
+        "for the operator to run.",
+    ])
+    return {
+        "description": _prompt_def("cleanup-plan")["description"],
         "messages": [
             {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
         ],

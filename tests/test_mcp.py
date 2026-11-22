@@ -375,10 +375,10 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_all_three_prompts(self):
+    def test_prompts_list_returns_all_four_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 3)
+        self.assertEqual(len(prompts), 4)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
@@ -388,6 +388,9 @@ class McpTests(unittest.TestCase):
         self.assertEqual(prompts[2]["name"], "ttl-audit")
         self.assertEqual(prompts[2]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[2]["arguments"][0]["required"])
+        self.assertEqual(prompts[3]["name"], "cleanup-plan")
+        self.assertEqual(prompts[3]["arguments"][0]["name"], "pattern")
+        self.assertFalse(prompts[3]["arguments"][0]["required"])
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -589,6 +592,116 @@ class McpTests(unittest.TestCase):
         self.assertIn("- expiring in under 1 hour: 1", text)
         self.assertIn("- no expiry: 0", text)
         self.assertIn("- user:1 (in ", text)
+        self.assertNotIn("cache:x", text)
+
+    def test_prompts_get_cleanup_plan_classification_boundaries(self):
+        from cinder_mcp.prompts import _classify_cleanup, _looks_temporary
+        self.assertEqual(_classify_cleanup("x", -1), "risky")
+        self.assertEqual(_classify_cleanup("x", 1), "safe")
+        self.assertEqual(_classify_cleanup("x", 3599), "safe")
+        self.assertEqual(_classify_cleanup("x", 3600), "soon")
+        self.assertEqual(_classify_cleanup("x", 86399), "soon")
+        self.assertEqual(_classify_cleanup("x", 86400), "keep")
+        self.assertEqual(_classify_cleanup("x", 10 ** 9), "keep")
+        self.assertTrue(_looks_temporary("cache:old"))
+        self.assertTrue(_looks_temporary("session:abc"))
+        self.assertTrue(_looks_temporary("tmp"))
+        self.assertTrue(_looks_temporary("rate:limit"))
+        self.assertFalse(_looks_temporary("mycache:x"))
+        self.assertFalse(_looks_temporary("tempfile"))
+        self.assertFalse(_looks_temporary("user:1"))
+
+    def _section(self, text, header_prefix):
+        """The lines of one cleanup-plan section, by its header prefix."""
+        lines = text.split("\n")
+        start = next(
+            i for i, line in enumerate(lines) if line.startswith(header_prefix)
+        )
+        out = []
+        for line in lines[start + 1:]:
+            if line == "":
+                break
+            out.append(line)
+        return out
+
+    def test_prompts_get_cleanup_plan_empty_keyspace(self):
+        reply = self._call("prompts/get", 1, {"name": "cleanup-plan"})
+        messages = reply["result"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        text = messages[0]["content"]["text"]
+        self.assertIn("Cleanup plan for the cinder keyspace (pattern '*').", text)
+        self.assertIn("Total keys scanned: 0", text)
+        self.assertIn("cinder_version:0.4.0", text)
+        self.assertIn("Safe to delete (0)", text)
+        self.assertIn("Expiring soon (0)", text)
+        self.assertIn("Risky — confirm before deleting (0)", text)
+        self.assertIn("Keep (0)", text)
+        self.assertEqual(text.count("(none)"), 4)
+        self.assertNotIn("expired while scanning", text)
+        self.assertIn("kv_del", text)
+
+    def test_prompts_get_cleanup_plan_classifies_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "soon", "value": "v", "ex": 30},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "today", "value": "v", "ex": 7200},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "far", "value": "v", "ex": 900000},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "cache:old", "value": "v"},
+        })
+        reply = self._call("prompts/get", 6, {"name": "cleanup-plan"})
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 5", text)
+        safe = self._section(text, "Safe to delete (1)")
+        self.assertEqual(len(safe), 1)
+        self.assertTrue(safe[0].startswith("- soon (string, 1 bytes, expires in "))
+        self.assertRegex(safe[0], r"expires in (29|30)s\)$")
+        soon = self._section(text, "Expiring soon (1)")
+        self.assertEqual(len(soon), 1)
+        self.assertTrue(soon[0].startswith("- today (string, 1 bytes, expires in "))
+        risky = self._section(text, "Risky — confirm before deleting (2)")
+        self.assertEqual(len(risky), 2)
+        self.assertIn("- forever (string, 1 bytes, no expiry)", risky)
+        self.assertIn(
+            "- cache:old (string, 1 bytes, no expiry, looks temporary)", risky)
+        keep = self._section(text, "Keep (1)")
+        self.assertEqual(len(keep), 1)
+        self.assertTrue(keep[0].startswith("- far (string, 1 bytes, expires in "))
+        # No key appears in two sections.
+        listed = safe + soon + risky + keep
+        self.assertEqual(len(listed), 5)
+        self.assertIn("Do not delete anything yourself", text)
+
+    def test_prompts_get_cleanup_plan_container_key(self):
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        reply = self._call("prompts/get", 1, {"name": "cleanup-plan"})
+        text = reply["result"]["messages"][0]["content"]["text"]
+        risky = self._section(text, "Risky — confirm before deleting (1)")
+        self.assertEqual(risky, ["- todo (list, 2 elements, no expiry)"])
+
+    def test_prompts_get_cleanup_plan_pattern_filters_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "user:1", "value": "a", "ex": 60},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "cache:x", "value": "c"},
+        })
+        reply = self._call("prompts/get", 3, {
+            "name": "cleanup-plan", "arguments": {"pattern": "user:*"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 1", text)
+        self.assertIn("Safe to delete (1)", text)
+        self.assertIn("Risky — confirm before deleting (0)", text)
+        self.assertIn("- user:1 (string, 1 bytes, expires in ", text)
         self.assertNotIn("cache:x", text)
 
     def test_resources_read_unknown_uri_returns_error(self):

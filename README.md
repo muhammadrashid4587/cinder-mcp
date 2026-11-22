@@ -62,6 +62,7 @@ Fetchable with `resources/list` and `resources/read`.
 | `keyspace-summary` | `pattern` (optional, defaults to `*`) | Samples `INFO`, lists the keys matching the pattern, and asks the model to summarize the keyspace and suggest what to check next: keys worth reading, TTLs worth checking, and keys that look stale |
 | `key-deep-dive` | `key` (required) | Inspects one key in detail — type, TTL, size, a sample of its value (truncated at 200 chars), and the keys sharing its namespace — and asks the model to judge whether the key looks healthy |
 | `ttl-audit` | `pattern` (optional, defaults to `*`) | Scans the keyspace, groups keys by TTL bucket (no expiry, expiring <1h, <1d, <1w, >1w), lists the soonest-expiring keys and the keys with no expiry, and asks the model to flag what the operator should act on |
+| `cleanup-plan` | `pattern` (optional, defaults to `*`) | Inspects the live keyspace (INFO, KEYS, per-key TTL/type/size) and classifies every key as safe to delete (expires <1h), expiring soon (<1d), risky to delete without confirmation (no expiry), or keep (>1d), and asks the model to produce a concrete cleanup plan with exact `kv_del` calls — risky keys need a human to confirm each delete |
 
 Fetchable with `prompts/list` and `prompts/get`.
 
@@ -92,3 +93,4 @@ requests return JSON-RPC errors.
 - ~~Prompt support (`prompts/list`, `prompts/get`)~~ (done, v0.5.0)
 - ~~Per-key deep-dive prompt (`key-deep-dive`: type, TTL, size, sample value, related keys)~~ (done, v0.6.0)
 - ~~TTL audit prompt (`ttl-audit`: TTL buckets, soonest-expiring keys, keys with no expiry)~~ (done, v0.7.0)
+- ~~Cleanup-plan prompt (`cleanup-plan`: per-key TTL/type/size sampling, safe / expiring-soon / risky-confirm / keep classification, concrete plan with exact `kv_del` calls)~~ (done, v0.8.0)
