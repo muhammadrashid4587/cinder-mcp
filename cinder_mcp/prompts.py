@@ -8,7 +8,9 @@ what looks off: keys with no expiry, keys that should not be there,
 and keys worth reading in full. key-deep-dive inspects one key in
 detail — its type, TTL, size, a sample of its value, and the keys
 related to it — and asks the model to judge whether that one key
-looks healthy.
+looks healthy. ttl-audit scans the keyspace, groups every key by how
+soon it expires, and asks the model to flag keys expiring soon and
+keys with no expiry that the operator should act on.
 """
 
 from .resp import RespError
@@ -18,6 +20,16 @@ MAX_SAMPLE_CHARS = 200
 
 # At most this many related keys are listed in the prompt text.
 MAX_RELATED_KEYS = 20
+
+# At most this many soonest-expiring keys are listed in the ttl-audit.
+MAX_SOON_KEYS = 10
+
+# At most this many no-expiry keys are listed in the ttl-audit.
+MAX_NO_EXPIRY_KEYS = 20
+
+# TTL bucket boundaries, in seconds: under 1 hour, under 1 day,
+# under 1 week, over 1 week. Keys with TTL -1 have no expiry.
+BUCKET_BOUNDS = (3600, 86400, 604800)
 
 PROMPTS = [
     {
@@ -49,6 +61,21 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "ttl-audit",
+        "description": (
+            "Audit TTLs across the keyspace: bucket keys by how soon "
+            "they expire, list the soonest-expiring keys and the keys "
+            "with no expiry, and flag what the operator should act on."
+        ),
+        "arguments": [
+            {
+                "name": "pattern",
+                "description": "Glob pattern of keys to include (* and ?). Defaults to all keys.",
+                "required": False,
+            },
+        ],
+    },
 ]
 
 
@@ -67,6 +94,8 @@ def get_prompt(client, name, arguments):
         return _keyspace_summary(client, arguments)
     if name == "key-deep-dive":
         return _key_deep_dive(client, arguments)
+    if name == "ttl-audit":
+        return _ttl_audit(client, arguments)
     raise ValueError("unknown prompt: %s" % name)
 
 
@@ -178,6 +207,108 @@ def _key_deep_dive(client, arguments):
     ])
     return {
         "description": _prompt_def("key-deep-dive")["description"],
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }
+
+
+def _format_ttl(seconds):
+    """Render a TTL in seconds as a short human duration: 45s, 12m,
+    3h 20m, 2d 4h, 3w 1d."""
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+    if seconds < 604800:
+        return "%dd %dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    return "%dw %dd" % (seconds // 604800, (seconds % 604800) // 86400)
+
+
+def _ttl_audit(client, arguments):
+    """Scan the keyspace, group every key by how soon it expires, and
+    list the soonest-expiring keys and the keys with no expiry so the
+    operator can act on them. TTL is probed per key with TTL: -1 means
+    no expiry, -2 means the key expired between the KEYS scan and the
+    TTL probe and is counted separately rather than bucketed."""
+    pattern = arguments.get("pattern", "*")
+    keys = client.command("KEYS", pattern)
+    if keys is None:
+        keys = []
+    buckets = {
+        "no expiry": [],
+        "expiring in under 1 hour": [],
+        "expiring in under 1 day": [],
+        "expiring in under 1 week": [],
+        "expiring in over 1 week": [],
+    }
+    expired = 0
+    soonest = []  # (ttl, key), sorted ascending at the end
+    for key in keys:
+        ttl = client.command("TTL", key)
+        if ttl == -2:
+            expired += 1
+        elif ttl == -1:
+            buckets["no expiry"].append(key)
+        elif ttl < BUCKET_BOUNDS[0]:
+            buckets["expiring in under 1 hour"].append(key)
+            soonest.append((ttl, key))
+        elif ttl < BUCKET_BOUNDS[1]:
+            buckets["expiring in under 1 day"].append(key)
+            soonest.append((ttl, key))
+        elif ttl < BUCKET_BOUNDS[2]:
+            buckets["expiring in under 1 week"].append(key)
+            soonest.append((ttl, key))
+        else:
+            buckets["expiring in over 1 week"].append(key)
+            soonest.append((ttl, key))
+    soonest.sort()
+    no_expiry = sorted(buckets["no expiry"])
+    lines = [
+        "TTL audit of the cinder keyspace (pattern %r)." % pattern,
+        "",
+        "Total keys scanned: %d" % len(keys),
+    ]
+    if expired:
+        lines.append(
+            "%d key(s) expired while scanning and were not bucketed."
+            % expired
+        )
+    lines.extend(["", "TTL buckets:"])
+    for label, members in buckets.items():
+        lines.append("- %s: %d" % (label, len(members)))
+    lines.extend(["", "Soonest expiring keys (%d):" % len(soonest)])
+    if soonest:
+        for ttl, key in soonest[:MAX_SOON_KEYS]:
+            lines.append("- %s (in %s)" % (key, _format_ttl(ttl)))
+        if len(soonest) > MAX_SOON_KEYS:
+            lines.append("... and %d more" % (len(soonest) - MAX_SOON_KEYS))
+    else:
+        lines.append("(none expiring)")
+    lines.extend(["", "Keys with no expiry (%d):" % len(no_expiry)])
+    if no_expiry:
+        for key in no_expiry[:MAX_NO_EXPIRY_KEYS]:
+            lines.append("- %s" % key)
+        if len(no_expiry) > MAX_NO_EXPIRY_KEYS:
+            lines.append("... and %d more" % (len(no_expiry) - MAX_NO_EXPIRY_KEYS))
+    else:
+        lines.append("(none)")
+    lines.extend([
+        "",
+        "Audit these TTLs: which keys expiring within the hour look "
+        "like they should live longer, and should be renewed with "
+        "kv_expire? Which keys with no expiry look like caches, "
+        "sessions, or temporary data that should have an expiry set "
+        "with kv_expire? Are there keys whose TTL looks wrong for "
+        "their namespace — for example a session key expiring in a "
+        "week, or a cache key with no expiry at all? List the "
+        "actions in priority order, with the exact kv_expire or "
+        "kv_del call for each.",
+    ])
+    return {
+        "description": _prompt_def("ttl-audit")["description"],
         "messages": [
             {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
         ],

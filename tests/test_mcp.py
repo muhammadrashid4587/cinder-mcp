@@ -375,16 +375,19 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_both_prompts(self):
+    def test_prompts_list_returns_all_three_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 2)
+        self.assertEqual(len(prompts), 3)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
         self.assertEqual(prompts[1]["name"], "key-deep-dive")
         self.assertEqual(prompts[1]["arguments"][0]["name"], "key")
         self.assertTrue(prompts[1]["arguments"][0]["required"])
+        self.assertEqual(prompts[2]["name"], "ttl-audit")
+        self.assertEqual(prompts[2]["arguments"][0]["name"], "pattern")
+        self.assertFalse(prompts[2]["arguments"][0]["required"])
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -512,6 +515,81 @@ class McpTests(unittest.TestCase):
         self.assertIn("error", reply)
         self.assertEqual(reply["error"]["code"], -32602)
         self.assertIn("requires a key argument", reply["error"]["message"])
+
+    def test_prompts_get_ttl_audit_empty_keyspace(self):
+        reply = self._call("prompts/get", 1, {"name": "ttl-audit"})
+        messages = reply["result"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        text = messages[0]["content"]["text"]
+        self.assertIn("TTL audit of the cinder keyspace (pattern '*').", text)
+        self.assertIn("Total keys scanned: 0", text)
+        self.assertIn("- no expiry: 0", text)
+        self.assertIn("- expiring in under 1 hour: 0", text)
+        self.assertIn("- expiring in under 1 day: 0", text)
+        self.assertIn("- expiring in under 1 week: 0", text)
+        self.assertIn("- expiring in over 1 week: 0", text)
+        self.assertIn("Soonest expiring keys (0):", text)
+        self.assertIn("(none expiring)", text)
+        self.assertIn("Keys with no expiry (0):", text)
+        self.assertIn("(none)", text)
+        self.assertIn("kv_expire", text)
+
+    def test_prompts_get_ttl_audit_buckets_and_soonest(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "soon", "value": "v", "ex": 30},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "today", "value": "v", "ex": 7200},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "week", "value": "v", "ex": 90000},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "far", "value": "v", "ex": 900000},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        reply = self._call("prompts/get", 6, {"name": "ttl-audit"})
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 5", text)
+        self.assertIn("- no expiry: 1", text)
+        self.assertIn("- expiring in under 1 hour: 1", text)
+        self.assertIn("- expiring in under 1 day: 1", text)
+        self.assertIn("- expiring in under 1 week: 1", text)
+        self.assertIn("- expiring in over 1 week: 1", text)
+        self.assertIn("Soonest expiring keys (4):", text)
+        # Soonest first, in ascending TTL order.
+        soonest = text.split("Soonest expiring keys (4):\n")[1].split("\n\n")[0]
+        self.assertEqual(
+            [line.split(" (in ")[0][2:] for line in soonest.split("\n")],
+            ["soon", "today", "week", "far"],
+        )
+        import re
+        soon_line = [l for l in text.split("\n") if l.startswith("- soon (in ")][0]
+        # A second may elapse between SET EX 30 and the TTL probe.
+        self.assertRegex(soon_line, r"^- soon \(in (29|30)s\)$")
+        self.assertIn("Keys with no expiry (1):", text)
+        self.assertIn("- forever", text)
+        self.assertNotIn("expired while scanning", text)
+
+    def test_prompts_get_ttl_audit_pattern_filters_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "user:1", "value": "a", "ex": 60},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "cache:x", "value": "c"},
+        })
+        reply = self._call("prompts/get", 3, {
+            "name": "ttl-audit", "arguments": {"pattern": "user:*"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 1", text)
+        self.assertIn("- expiring in under 1 hour: 1", text)
+        self.assertIn("- no expiry: 0", text)
+        self.assertIn("- user:1 (in ", text)
+        self.assertNotIn("cache:x", text)
 
     def test_resources_read_unknown_uri_returns_error(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://nope"})

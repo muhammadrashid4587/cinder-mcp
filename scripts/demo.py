@@ -104,6 +104,12 @@ def main():
                     print(uri, "->", reply["result"]["contents"][0]["text"])
                 else:
                     print(uri, "-> error", reply["error"]["message"])
+            audit = send(mcp, {
+                "jsonrpc": "2.0", "id": 15, "method": "prompts/get",
+                "params": {"name": "ttl-audit"},
+            })
+            print("ttl-audit ->")
+            print(audit["result"]["messages"][0]["content"]["text"])
             return 0
         finally:
             mcp.stdin.close()

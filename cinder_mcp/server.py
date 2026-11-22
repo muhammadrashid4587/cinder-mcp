@@ -20,7 +20,7 @@ from .resources import RESOURCES, read_resource
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
