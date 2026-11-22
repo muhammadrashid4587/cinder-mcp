@@ -1,9 +1,9 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, INCR, INCRBY, TTL) to prove the MCP layer works: the
-handshake, the tool list, a SET-then-GET round trip, and clean JSON-RPC
-errors when cinder is unreachable or a request is malformed.
+GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE) to prove the MCP layer
+works: the handshake, the tool list, a SET-then-GET round trip, and clean
+JSON-RPC errors when cinder is unreachable or a request is malformed.
 """
 
 import io
@@ -161,6 +161,19 @@ class FakeCinder(threading.Thread):
                         self._reply(conn, ":-1\r\n")
                     else:
                         self._reply(conn, ":%d\r\n" % int(entry[1] - time.time()))
+                elif name == "EXISTS":
+                    n = sum(1 for k in args if self._get(k) is not None)
+                    self._reply(conn, ":%d\r\n" % n)
+                elif name == "EXPIRE" and len(args) == 2:
+                    seconds = int(args[1])
+                    if seconds < 0:
+                        self._reply(conn, "-ERR invalid expire time in 'expire' command\r\n")
+                    elif self._get(args[0]) is None:
+                        self._reply(conn, ":0\r\n")
+                    else:
+                        value, _ = self.store[args[0]]
+                        self.store[args[0]] = (value, time.time() + seconds)
+                        self._reply(conn, ":1\r\n")
                 else:
                     self._reply(conn, "-ERR unknown command\r\n")
         finally:
@@ -195,7 +208,8 @@ class McpTests(unittest.TestCase):
         listed = self._call("tools/list", 2)
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
-            names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_incr", "kv_ttl"]
+            names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_incr", "kv_ttl",
+                    "kv_exists", "kv_expire"]
         )
 
     def test_tools_call_set_then_get(self):
@@ -231,6 +245,32 @@ class McpTests(unittest.TestCase):
             "name": "kv_keys", "arguments": {"pattern": "user:*"},
         })
         self.assertEqual(keys["result"]["content"][0]["text"], '["user:1"]')
+
+    def test_tools_call_exists_and_expire(self):
+        missing = self._call("tools/call", 1, {
+            "name": "kv_exists", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "0")
+        no_expire = self._call("tools/call", 2, {
+            "name": "kv_expire", "arguments": {"key": "ghost", "seconds": 60},
+        })
+        self.assertEqual(no_expire["result"]["content"][0]["text"], "0")
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "temp", "value": "v"},
+        })
+        exists = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "temp"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "1")
+        expired = self._call("tools/call", 5, {
+            "name": "kv_expire", "arguments": {"key": "temp", "seconds": 3600},
+        })
+        self.assertEqual(expired["result"]["content"][0]["text"], "1")
+        ttl = self._call("tools/call", 6, {
+            "name": "kv_ttl", "arguments": {"key": "temp"},
+        })
+        remaining = int(ttl["result"]["content"][0]["text"])
+        self.assertTrue(0 < remaining <= 3600)
 
     def test_unreachable_cinder_returns_clean_jsonrpc_error(self):
         dead = MCPServer(RespClient("127.0.0.1", 1))  # nothing listens here

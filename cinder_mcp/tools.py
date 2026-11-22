@@ -66,6 +66,27 @@ TOOLS = [
             "required": ["key"],
         },
     },
+    {
+        "name": "kv_exists",
+        "description": "Check whether a key exists. Returns 1 if the key exists, 0 otherwise.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_expire",
+        "description": "Set a key to expire after a number of seconds. Returns 1 if the timeout was set, 0 if the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "seconds": {"type": "integer"},
+            },
+            "required": ["key", "seconds"],
+        },
+    },
 ]
 
 
@@ -98,4 +119,10 @@ def call_tool(client, name, args):
         return client.command("INCRBY", _require(args, "key"), by)
     if name == "kv_ttl":
         return client.command("TTL", _require(args, "key"))
+    if name == "kv_exists":
+        return client.command("EXISTS", _require(args, "key"))
+    if name == "kv_expire":
+        return client.command(
+            "EXPIRE", _require(args, "key"), _require(args, "seconds")
+        )
     raise ValueError("unknown tool: %s" % name)

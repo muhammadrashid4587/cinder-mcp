@@ -43,6 +43,8 @@ Wire it into an MCP client as a stdio server with the command
 | `kv_keys` | `KEYS pattern` | Glob `*` and `?`, defaults to `*` |
 | `kv_incr` | `INCR key` / `INCRBY key n` | `by` defaults to 1 |
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
+| `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
+| `kv_expire` | `EXPIRE key seconds` | 1 if the timeout was set, 0 if the key is missing |
 
 ## Demo
 
@@ -67,5 +69,4 @@ requests return JSON-RPC errors.
 ## Roadmap
 
 - Resource (URI) support for reading keys as MCP resources
-- `kv_expire` / `kv_exists` tools
 - Sampling the cinder INFO output as a `cinder://info` resource

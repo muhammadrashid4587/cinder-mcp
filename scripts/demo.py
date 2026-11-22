@@ -76,6 +76,10 @@ def main():
                 ("kv_incr", {"key": "demo:counter"}),
                 ("kv_get", {"key": "demo:counter"}),
                 ("kv_ttl", {"key": "demo:counter"}),
+                ("kv_exists", {"key": "demo:counter"}),
+                ("kv_expire", {"key": "demo:counter", "seconds": 3600}),
+                ("kv_ttl", {"key": "demo:counter"}),
+                ("kv_exists", {"key": "demo:missing"}),
             ], start=3):
                 reply = send(mcp, {
                     "jsonrpc": "2.0", "id": i, "method": "tools/call",

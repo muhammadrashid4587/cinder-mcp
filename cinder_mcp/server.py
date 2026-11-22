@@ -17,7 +17,7 @@ from .resp import ConnectionError, RespClient, RespError
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
