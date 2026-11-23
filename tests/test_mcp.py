@@ -2,11 +2,12 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
-LRANGE, SMEMBERS, HSET, HGET, HGETALL, MULTI, EXEC, DISCARD)
+ZCARD, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
+MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
-Keys in the fake store may also hold a list, set, or dict value so the
-per-key resource's type probing can be exercised.
+Keys in the fake store may also hold a list, set, dict, or sorted-set
+value so the per-key resource's type probing can be exercised.
 """
 
 import hashlib
@@ -40,6 +41,19 @@ def _glob_match(pattern, key):
     while px < len(pattern) and pattern[px] == "*":
         px += 1
     return px == len(pattern)
+
+
+class ZSet:
+    """A sorted set in the fake store: member names to float scores.
+    A plain class, not a dict, so the hash handlers treat it as the
+    wrong type, as real cinder does."""
+
+    def __init__(self):
+        self.members = {}
+
+    def ordered(self):
+        """Members sorted by (score, member), as ZRANGE returns them."""
+        return sorted(self.members, key=lambda m: (self.members[m], m))
 
 
 class FakeCinder(threading.Thread):
@@ -225,6 +239,72 @@ class FakeCinder(threading.Thread):
                         "wrong kind of value\r\n")
             flat = [x for pair in value.items() for x in pair]
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name == "ZADD" and len(args) >= 3 and len(args) % 2 == 1:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            scores = []
+            for i in range(1, len(args), 2):
+                try:
+                    score = float(args[i])
+                except ValueError:
+                    return "-ERR value is not a valid float\r\n"
+                if score != score:
+                    return "-ERR value is not a valid float\r\n"
+                scores.append(score)
+            if value is None:
+                value = ZSet()
+                self.store[args[0]] = (value, None)
+            added = 0
+            for i, score in zip(range(2, len(args), 2), scores):
+                if args[i] not in value.members:
+                    added += 1
+                value.members[args[i]] = score
+            return ":%d\r\n" % added
+        elif name == "ZCARD" and len(args) == 1:
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return ":%d\r\n" % len(value.members)
+        elif name in ("ZRANGE", "ZREVRANGE") and len(args) in (3, 4):
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            withscores = False
+            if len(args) == 4:
+                if args[3].upper() != "WITHSCORES":
+                    return "-ERR syntax error\r\n"
+                withscores = True
+            try:
+                start, stop = int(args[1]), int(args[2])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            ordered = value.ordered()
+            if name == "ZREVRANGE":
+                ordered.reverse()
+            n = len(ordered)
+            if start < 0:
+                start += n
+            if stop < 0:
+                stop += n
+            if start < 0:
+                start = 0
+            if stop >= n:
+                stop = n - 1
+            members = ordered[start:stop + 1] if start <= stop else []
+            flat = []
+            for member in members:
+                flat.append(member)
+                if withscores:
+                    flat.append(repr(value.members[member]))
+            return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
         elif name == "DEL":
             n = sum(1 for k in args if self._get(k) is not None)
             for k in args:
@@ -335,7 +415,8 @@ class McpTests(unittest.TestCase):
         self.assertEqual(
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
                     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
-                    "kv_hset", "kv_hget", "kv_hgetall", "kv_batch"]
+                    "kv_hset", "kv_hget", "kv_hgetall",
+                    "kv_zadd", "kv_zrange", "kv_batch"]
         )
 
     def test_tools_list_advertises_default_budgets(self):
@@ -953,6 +1034,167 @@ class McpTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 2)
         self.assertEqual(summary["results"][0]["result"], 1)
         self.assertEqual(summary["results"][1]["result"], {"x": "9"})
+
+    def test_tools_call_zadd_zrange(self):
+        added = self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10, "bo": 20, "cy": 15}},
+        })
+        self.assertEqual(added["result"]["content"][0]["text"], "3")
+        # Re-adding a member with its current score adds 0;
+        # updating a member's score adds 0 too.
+        same = self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10}},
+        })
+        self.assertEqual(same["result"]["content"][0]["text"], "0")
+        updated = self._call("tools/call", 3, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 25, "dan": 5}},
+        })
+        self.assertEqual(updated["result"]["content"][0]["text"], "1")
+        # Lowest score first: dan 5, cy 15, bo 20, amy 25.
+        ranged = self._call("tools/call", 4, {
+            "name": "kv_zrange",
+            "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(
+            json.loads(ranged["result"]["content"][0]["text"]),
+            ["dan", "cy", "bo", "amy"],
+        )
+        scored = self._call("tools/call", 5, {
+            "name": "kv_zrange",
+            "arguments": {"key": "leaderboard", "start": 1, "stop": 2,
+                          "withscores": True},
+        })
+        self.assertEqual(
+            json.loads(scored["result"]["content"][0]["text"]),
+            [{"member": "cy", "score": 15.0},
+             {"member": "bo", "score": 20.0}],
+        )
+        reversed_ = self._call("tools/call", 6, {
+            "name": "kv_zrange",
+            "arguments": {"key": "leaderboard", "rev": True},
+        })
+        self.assertEqual(
+            json.loads(reversed_["result"]["content"][0]["text"]),
+            ["amy", "bo", "cy", "dan"],
+        )
+        # Negative indices count from the end.
+        tail = self._call("tools/call", 7, {
+            "name": "kv_zrange",
+            "arguments": {"key": "leaderboard", "start": -2, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(tail["result"]["content"][0]["text"]),
+            ["bo", "amy"],
+        )
+        missing = self._call("tools/call", 8, {
+            "name": "kv_zrange", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_zadd_zrange_rejects_bad_arguments(self):
+        cases = [
+            # kv_zadd: empty members, missing members, non-number score.
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {}}},
+            {"name": "kv_zadd", "arguments": {"key": "z"}},
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"m": "high"}}},
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"m": True}}},
+            # kv_zrange: bad start/stop/withscores/rev types.
+            {"name": "kv_zrange",
+             "arguments": {"key": "z", "start": "0"}},
+            {"name": "kv_zrange",
+             "arguments": {"key": "z", "stop": 1.5}},
+            {"name": "kv_zrange",
+             "arguments": {"key": "z", "withscores": "yes"}},
+            {"name": "kv_zrange",
+             "arguments": {"key": "z", "rev": 1}},
+            {"name": "kv_zrange", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zrange_rejects_too_wide_a_range(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrange",
+            "arguments": {"key": "z", "start": 0, "stop": 10000},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # A negative stop over a small set is fine: the window is
+        # the set's size, not the raw index span.
+        narrow = self._call("tools/call", 3, {
+            "name": "kv_zrange",
+            "arguments": {"key": "z", "start": 0, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(narrow["result"]["content"][0]["text"]),
+            ["a", "b", "c"],
+        )
+
+    def test_tools_call_zadd_zrange_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        zadd = self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "plain", "members": {"m": 1}},
+        })
+        self.assertIn("error", zadd)
+        zrange = self._call("tools/call", 3, {
+            "name": "kv_zrange", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", zrange)
+
+    def test_tools_call_zadd_zrange_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2}},
+                {"op": "kv_zrange", "key": "z"},
+                {"op": "kv_zrange", "key": "z", "withscores": True},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], ["a", "b"])
+        self.assertEqual(summary["results"][2]["result"], [
+            {"member": "a", "score": 1.0},
+            {"member": "b", "score": 2.0},
+        ])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zrange", "key": "z2", "rev": True,
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], [
+            {"member": "x", "score": 9.0},
+            {"member": "y", "score": 3.0},
+        ])
 
     def test_resources_list_returns_info_metrics_changes_and_key_template(self):
         listed = self._call("resources/list", 1)

@@ -23,7 +23,7 @@ from .tools import call_tool, tools_with_budgets
 from .watch import KeyspaceWatch
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.22.0"
+SERVER_VERSION = "0.23.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.

@@ -146,8 +146,35 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zadd",
+        "description": "Add members with scores to a sorted set: ZADD key score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it). Cinder's ZADD takes the plain form only — no NX/XX/GT/LT/CH/INCR options, which cinder rejects as a syntax error.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "object"},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
+        "name": "kv_zrange",
+        "description": "Members of a sorted set in an index range, lowest score first: ZRANGE key start stop [WITHSCORES]. Negative indices count from the end, as in Redis. Pass withscores=true for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names, and rev=true to read highest score first (ZREVRANGE). At most 1000 members per call; narrow the range for a larger set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "start": {"type": "integer"},
+                "stop": {"type": "integer"},
+                "withscores": {"type": "boolean"},
+                "rev": {"type": "boolean"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists, kv_expire, kv_hset, kv_hget or kv_hgetall plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists, kv_expire, kv_hset, kv_hget, kv_hgetall, kv_zadd or kv_zrange plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -166,6 +193,11 @@ TOOLS = [
                             "seconds": {"type": "integer"},
                             "field": {"type": "string"},
                             "fields": {"type": "object"},
+                            "members": {"type": "object"},
+                            "start": {"type": "integer"},
+                            "stop": {"type": "integer"},
+                            "withscores": {"type": "boolean"},
+                            "rev": {"type": "boolean"},
                             "pattern": {"type": "string"},
                             "limit": {"type": "integer"},
                             "full": {"type": "boolean"},
@@ -231,6 +263,7 @@ BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
     "kv_hset", "kv_hget", "kv_hgetall",
+    "kv_zadd", "kv_zrange",
 }
 
 MAX_BATCH_OPS = 100
@@ -299,6 +332,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
     "kv_hset", "kv_hget", "kv_hgetall",
+    "kv_zadd", "kv_zrange",
 }
 
 
@@ -325,6 +359,11 @@ def _call_batch_atomic(client, ops):
                 "atomic kv_batch: op cannot run in a transaction: %s"
                 % op_name
             )
+        if op_name == "kv_zrange":
+            # A range with a negative bound needs the set's size to
+            # know how wide it is; check the bound before anything
+            # is queued, like the standalone tool does.
+            _check_zrange_window(client, op)
         argv_list.append(_op_argv(op_name, op))
     replies = client.transaction(argv_list)
     results = []
@@ -344,6 +383,11 @@ def _call_batch_atomic(client, ops):
             # inside the transaction; shape it into a dict like the
             # standalone tool does.
             value = _hgetall_result(reply or [])
+        elif op_name == "kv_zrange":
+            # ZRANGE came back as a flat list inside the transaction;
+            # shape it like the standalone tool does, including the
+            # withscores member/score objects.
+            value = _zrange_result(reply or [], _zrange_args(op)[3])
         else:
             value = reply
         results.append({"op": op_name, "ok": True, "result": value})
@@ -473,6 +517,22 @@ def _op_argv(name, args):
         return ["HGET", _require(args, "key"), _require(args, "field")]
     if name == "kv_hgetall":
         return ["HGETALL", _require(args, "key")]
+    if name == "kv_zadd":
+        return ["ZADD", _require(args, "key")] + _zadd_member_args(args)
+    if name == "kv_zrange":
+        key, start, stop, withscores, rev = _zrange_args(args)
+        # A range both ends of which are non-negative has a known
+        # width; check the bound here. A negative bound needs the
+        # set's size, which the caller checks with _check_zrange_window.
+        if start >= 0 and stop >= 0 and stop - start + 1 > MAX_ZRANGE_MEMBERS:
+            raise ValueError(
+                "kv_zrange returns at most %d members; narrow the range"
+                % MAX_ZRANGE_MEMBERS
+            )
+        cmd = ["ZREVRANGE" if rev else "ZRANGE", key, start, stop]
+        if withscores:
+            cmd.append("WITHSCORES")
+        return cmd
     raise ValueError("unknown or unbatchable op: %s" % name)
 
 
@@ -502,6 +562,123 @@ def _hgetall_result(flat):
     return {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
 
 
+# The most members one kv_zrange call returns; a wider range fails
+# instead of dumping a huge sorted set into one tool result.
+MAX_ZRANGE_MEMBERS = 1000
+
+
+def _format_score(score):
+    """One ZADD score as a RESP argument. Ints and floats both go
+    through; repr round-trips a float exactly, and prints "inf" /
+    "-inf" for infinities, which cinder's score parser accepts.
+    NaN is rejected — cinder rejects it too — as is anything that
+    is not a number."""
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise ValueError("kv_zadd scores must be numbers")
+    if isinstance(score, float) and score != score:
+        raise ValueError("kv_zadd scores must not be NaN")
+    return repr(score)
+
+
+def _zadd_member_args(args):
+    """The score/member pairs for a ZADD, as a flat argv list.
+    `members` must be a non-empty object of string member names to
+    numeric scores; anything else fails the call instead of sending
+    a half-formed ZADD. Pairs are sent in sorted member order so the
+    argv is deterministic."""
+    members = args.get("members")
+    if not isinstance(members, dict) or not members:
+        raise ValueError("kv_zadd members must be a non-empty object")
+    argv = []
+    for member in sorted(members):
+        if not isinstance(member, str):
+            raise ValueError(
+                "kv_zadd members must map string member names to scores"
+            )
+        argv += [_format_score(members[member]), member]
+    return argv
+
+
+def _zrange_args(args):
+    """Validate a kv_zrange call: (key, start, stop, withscores, rev).
+    start defaults to 0 and stop to -1, as in Redis; withscores and
+    rev default to false. Bad types fail the call instead of sending
+    a half-formed ZRANGE."""
+    key = _require(args, "key")
+    start = args.get("start", 0)
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError("kv_zrange start must be an integer")
+    stop = args.get("stop", -1)
+    if isinstance(stop, bool) or not isinstance(stop, int):
+        raise ValueError("kv_zrange stop must be an integer")
+    withscores = args.get("withscores", False)
+    if not isinstance(withscores, bool):
+        raise ValueError("kv_zrange withscores must be true or false")
+    rev = args.get("rev", False)
+    if not isinstance(rev, bool):
+        raise ValueError("kv_zrange rev must be true or false")
+    return key, start, stop, withscores, rev
+
+
+def _zrange_window(start, stop, length):
+    """How many members a [start, stop] range covers in a sorted set
+    of `length` members, resolving negative indices the way Redis
+    does: -1 is the last member. Returns 0 for an empty range."""
+    if start < 0:
+        start += length
+    if stop < 0:
+        stop += length
+    if start < 0:
+        start = 0
+    if stop >= length:
+        stop = length - 1
+    if start > stop or start >= length:
+        return 0
+    return stop - start + 1
+
+
+def _check_zrange_window(client, args):
+    """Fail a kv_zrange call whose range would return more than
+    MAX_ZRANGE_MEMBERS members. A range with a negative bound needs
+    the set's size first, so it reads ZCARD; a range both ends of
+    which are non-negative is checked without a round trip. A missing
+    key has size 0, so the check passes and the range returns []."""
+    key, start, stop, _, _ = _zrange_args(args)
+    if start >= 0 and stop >= 0:
+        window = stop - start + 1
+    else:
+        window = _zrange_window(start, stop, client.command("ZCARD", key) or 0)
+    if window > MAX_ZRANGE_MEMBERS:
+        raise ValueError(
+            "kv_zrange returns at most %d members; narrow the range"
+            % MAX_ZRANGE_MEMBERS
+        )
+
+
+def _zrange_result(flat, withscores):
+    """Shape a flat ZRANGE reply into the tool's return value: a list
+    of member names, or with withscores a list of {"member": ...,
+    "score": ...} objects, the scores parsed as numbers. A missing
+    key replies as an empty list, which becomes []."""
+    flat = flat or []
+    if not withscores:
+        return list(flat)
+    return [
+        {"member": flat[i], "score": float(flat[i + 1])}
+        for i in range(0, len(flat), 2)
+    ]
+
+
+def _call_zrange(client, args):
+    """kv_zrange: bound the range first (see _check_zrange_window),
+    then run ZRANGE or ZREVRANGE and shape the reply."""
+    _check_zrange_window(client, args)
+    return _zrange_result(
+        client.command(*_op_argv("kv_zrange", args)) or [],
+        _zrange_args(args)[3],
+    )
+
+
 def _call_single(client, name, args):
     if name == "kv_keys":
         return _call_keys(client, args)
@@ -511,4 +688,6 @@ def _call_single(client, name, args):
         return _hgetall_result(
             client.command("HGETALL", _require(args, "key")) or []
         )
+    if name == "kv_zrange":
+        return _call_zrange(client, args)
     return client.command(*_op_argv(name, args))
