@@ -2,8 +2,8 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, LLEN, SCARD, HLEN,
-ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, MULTI, EXEC, DISCARD)
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -205,7 +205,37 @@ class FakeCinder(threading.Thread):
         elif name == "HLEN" and len(args) == 1:
             return self._container_len(args[0], dict)
         elif name == "LRANGE" and len(args) == 3:
-            return self._container_items(args[0], list)
+            return self._lrange_items(args[0], int(args[1]), int(args[2]))
+        elif name in ("LPUSH", "RPUSH") and len(args) >= 2:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                value = []
+                self.store[args[0]] = (value, None)
+            # Elements are pushed one at a time in order, as in real
+            # cinder: LPUSH k a b c leaves c at the head.
+            for element in args[1:]:
+                if name == "LPUSH":
+                    value.insert(0, element)
+                else:
+                    value.append(element)
+            return ":%d\r\n" % len(value)
+        elif name in ("LPOP", "RPOP") and len(args) == 1:
+            value = self._get(args[0])
+            if value is None:
+                return self._bulk(None)
+            if not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if not value:
+                return self._bulk(None)
+            element = value.pop(0) if name == "LPOP" else value.pop()
+            if not value:
+                # A list emptied by popping is gone, as in Redis.
+                del self.store[args[0]]
+            return self._bulk(element)
         elif name == "SMEMBERS" and len(args) == 1:
             return self._container_items(args[0], set)
         elif name == "HSET" and len(args) >= 3 and len(args) % 2 == 1:
@@ -617,10 +647,30 @@ class FakeCinder(threading.Thread):
                     "wrong kind of value\r\n")
         return ":%d\r\n" % len(value)
 
+    def _lrange_items(self, key, start, stop):
+        """LRANGE: the list's elements in [start, stop], resolving
+        negative indices the way Redis does. A missing key is an
+        empty list."""
+        value = self._get(key)
+        if value is None:
+            return "*0\r\n"
+        if not isinstance(value, list):
+            return ("-WRONGTYPE Operation against a key holding the "
+                    "wrong kind of value\r\n")
+        n = len(value)
+        if start < 0:
+            start += n
+        if stop < 0:
+            stop += n
+        if start < 0:
+            start = 0
+        if stop >= n:
+            stop = n - 1
+        items = value[start:stop + 1] if start <= stop and start < n else []
+        return "*%d\r\n" % len(items) + "".join(self._bulk(v) for v in items)
+
     def _container_items(self, key, kind):
-        """LRANGE / SMEMBERS: the container's elements as an array.
-        LRANGE args are ignored beyond the key — the fake only ever
-        reads the whole list, which is what the watch fingerprints."""
+        """SMEMBERS: the container's elements as an array."""
         value = self._get(key)
         if value is None:
             return "*0\r\n"
@@ -669,6 +719,8 @@ class McpTests(unittest.TestCase):
                     "kv_zcard",
                     "kv_zscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+                    "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
+                    "kv_lpop", "kv_rpop",
                     "kv_batch"]
         )
 
@@ -1439,6 +1491,179 @@ class McpTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 2)
         self.assertEqual(summary["results"][0]["result"], 1)
         self.assertEqual(summary["results"][1]["result"], {"x": "9"})
+
+    def test_tools_call_list_push_range_len_pop(self):
+        pushed = self._call("tools/call", 1, {
+            "name": "kv_rpush",
+            "arguments": {"key": "queue", "elements": ["a", "b", "c"]},
+        })
+        self.assertEqual(pushed["result"]["content"][0]["text"], "3")
+        # LPUSH pushes one at a time, so the last element lands at
+        # the head.
+        head = self._call("tools/call", 2, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x", "y"]},
+        })
+        self.assertEqual(head["result"]["content"][0]["text"], "5")
+        whole = self._call("tools/call", 3, {
+            "name": "kv_lrange", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(
+            json.loads(whole["result"]["content"][0]["text"]),
+            ["y", "x", "a", "b", "c"],
+        )
+        # Negative indices count from the end, as in Redis.
+        tail = self._call("tools/call", 4, {
+            "name": "kv_lrange",
+            "arguments": {"key": "queue", "start": -2, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(tail["result"]["content"][0]["text"]), ["b", "c"]
+        )
+        middle = self._call("tools/call", 5, {
+            "name": "kv_lrange",
+            "arguments": {"key": "queue", "start": 1, "stop": 2},
+        })
+        self.assertEqual(
+            json.loads(middle["result"]["content"][0]["text"]), ["x", "a"]
+        )
+        length = self._call("tools/call", 6, {
+            "name": "kv_llen", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(length["result"]["content"][0]["text"], "5")
+        first = self._call("tools/call", 7, {
+            "name": "kv_lpop", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(first["result"]["content"][0]["text"], "y")
+        last = self._call("tools/call", 8, {
+            "name": "kv_rpop", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(last["result"]["content"][0]["text"], "c")
+        # Popping the last element deletes the key, as in Redis.
+        small = self._call("tools/call", 9, {
+            "name": "kv_rpush",
+            "arguments": {"key": "one", "elements": ["only"]},
+        })
+        self.assertEqual(small["result"]["content"][0]["text"], "1")
+        popped = self._call("tools/call", 10, {
+            "name": "kv_lpop", "arguments": {"key": "one"},
+        })
+        self.assertEqual(popped["result"]["content"][0]["text"], "only")
+        gone = self._call("tools/call", 11, {
+            "name": "kv_exists", "arguments": {"key": "one"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        # A missing key pops as null, has length 0, ranges as [].
+        missing_pop = self._call("tools/call", 12, {
+            "name": "kv_lpop", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing_pop["result"]["content"][0]["text"], "null")
+        missing_len = self._call("tools/call", 13, {
+            "name": "kv_llen", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing_len["result"]["content"][0]["text"], "0")
+        missing_range = self._call("tools/call", 14, {
+            "name": "kv_lrange", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing_range["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_list_rejects_bad_arguments(self):
+        empty = self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "q", "elements": []},
+        })
+        self.assertIn("error", empty)
+        missing_elements = self._call("tools/call", 2, {
+            "name": "kv_rpush", "arguments": {"key": "q"},
+        })
+        self.assertIn("error", missing_elements)
+        non_string = self._call("tools/call", 3, {
+            "name": "kv_lpush",
+            "arguments": {"key": "q", "elements": ["a", 7]},
+        })
+        self.assertIn("error", non_string)
+        bad_start = self._call("tools/call", 4, {
+            "name": "kv_lrange",
+            "arguments": {"key": "q", "start": "0"},
+        })
+        self.assertIn("error", bad_start)
+        bad_stop = self._call("tools/call", 5, {
+            "name": "kv_lrange",
+            "arguments": {"key": "q", "stop": 1.5},
+        })
+        self.assertIn("error", bad_stop)
+        # A range wider than the cap fails instead of returning a
+        # silently truncated list.
+        too_wide = self._call("tools/call", 6, {
+            "name": "kv_lrange",
+            "arguments": {"key": "q", "start": 0, "stop": 1000},
+        })
+        self.assertIn("error", too_wide)
+
+    def test_tools_call_list_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for tool, arguments in (
+            ("kv_lpush", {"key": "plain", "elements": ["a"]}),
+            ("kv_rpush", {"key": "plain", "elements": ["a"]}),
+            ("kv_lrange", {"key": "plain"}),
+            ("kv_llen", {"key": "plain"}),
+            ("kv_lpop", {"key": "plain"}),
+            ("kv_rpop", {"key": "plain"}),
+        ):
+            reply = self._call("tools/call", 2, {
+                "name": tool, "arguments": arguments,
+            })
+            self.assertIn("error", reply)
+
+    def test_tools_call_list_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_rpush", "key": "q",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_lrange", "key": "q"},
+                {"op": "kv_llen", "key": "q"},
+                {"op": "kv_lpop", "key": "q"},
+                {"op": "kv_rpop", "key": "q"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(
+            summary["results"][1]["result"], ["a", "b", "c"])
+        self.assertEqual(summary["results"][2]["result"], 3)
+        self.assertEqual(summary["results"][3]["result"], "a")
+        self.assertEqual(summary["results"][4]["result"], "c")
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_lpush", "key": "q2", "elements": ["x", "y"]},
+                {"op": "kv_lrange", "key": "q2"},
+                {"op": "kv_llen", "key": "q2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], ["y", "x"])
+        self.assertEqual(summary["results"][2]["result"], 2)
+        # Bad list arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_lpush", "key": "q3", "elements": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "q3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
     def test_tools_call_zadd_zrange(self):
         added = self._call("tools/call", 1, {

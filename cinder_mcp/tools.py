@@ -300,8 +300,72 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_lpush",
+        "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "elements": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "elements"],
+        },
+    },
+    {
+        "name": "kv_rpush",
+        "description": "Push elements onto the tail of a list: RPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are appended in order. Creates the list when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "elements": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "elements"],
+        },
+    },
+    {
+        "name": "kv_lrange",
+        "description": "Elements of a list in an index range: LRANGE key start stop. Negative indices count from the end, as in Redis. start defaults to 0 and stop to -1. At most 1000 elements per call; narrow the range for a longer list.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "start": {"type": "integer"},
+                "stop": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_llen",
+        "description": "The length of a list: LLEN key. Returns 0 when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_lpop",
+        "description": "Remove and return the first element of a list: LPOP key. Returns null when the key does not exist or the list is empty; popping the last element deletes the key, as in Redis. Cinder has no LPOP count argument — one element at a time.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_rpop",
+        "description": "Remove and return the last element of a list: RPOP key. Returns null when the key does not exist or the list is empty; popping the last element deletes the key, as in Redis. Cinder has no RPOP count argument — one element at a time.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem or kv_zincrby plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop or kv_rpop plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -341,6 +405,7 @@ TOOLS = [
                             "limit": {"type": "integer"},
                             "full": {"type": "boolean"},
                             "seed": {"type": "string"},
+                            "elements": {"type": "array", "items": {"type": "string"}},
                             "batch_size": {"type": "integer"},
                             "cursor": {"type": "string"},
                         },
@@ -404,6 +469,7 @@ BATCHABLE_TOOLS = {
     "kv_hset", "kv_hget", "kv_hgetall",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+    "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
 }
 
 MAX_BATCH_OPS = 100
@@ -475,6 +541,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hset", "kv_hget", "kv_hgetall",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+    "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
 }
 
 
@@ -506,6 +573,11 @@ def _call_batch_atomic(client, ops):
             # know how wide it is; check the bound before anything
             # is queued, like the standalone tool does.
             _check_zrange_window(client, op)
+        if op_name == "kv_lrange":
+            # A range with a negative bound needs the list's length
+            # to know how wide it is; check the bound before anything
+            # is queued, like the standalone tool does.
+            _check_lrange_window(client, op)
         # Most ops queue one command; kv_zrevrank queues two (ZRANK
         # then ZCARD), combined from their two EXEC replies below.
         argv_list.extend(_op_argvs(op_name, op))
@@ -555,6 +627,19 @@ def _call_batch_atomic(client, ops):
             # shape it like the standalone tool does, including the
             # withscores member/score objects.
             value = _zrange_result(reply or [], _zrange_args(op)[3])
+        elif op_name == "kv_lrange":
+            # LRANGE came back as a flat list inside the transaction;
+            # a range wider than the cap is recorded as this op's
+            # error, in place, like an EXEC-time failure — the rest
+            # still run.
+            members = list(reply or [])
+            if len(members) > MAX_LRANGE_ELEMENTS:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_lrange returns at most %d elements; "
+                              "narrow the range" % MAX_LRANGE_ELEMENTS})
+                continue
+            value = members
         elif op_name == "kv_zrangebyscore":
             # ZRANGEBYSCORE came back as a flat list inside the
             # transaction; shape it like the standalone tool does,
@@ -751,6 +836,28 @@ def _op_argv(name, args):
     if name == "kv_zincrby":
         key, increment, member = _zincrby_args(args)
         return ["ZINCRBY", key, increment, member]
+    if name == "kv_lpush":
+        return ["LPUSH", _require(args, "key")] + _list_elements_args(args, name)
+    if name == "kv_rpush":
+        return ["RPUSH", _require(args, "key")] + _list_elements_args(args, name)
+    if name == "kv_lrange":
+        key, start, stop = _lrange_args(args)
+        # A range both ends of which are non-negative has a known
+        # width; check the bound here. A negative bound needs the
+        # list's length, which the caller checks with
+        # _check_lrange_window.
+        if start >= 0 and stop >= 0 and stop - start + 1 > MAX_LRANGE_ELEMENTS:
+            raise ValueError(
+                "kv_lrange returns at most %d elements; narrow the range"
+                % MAX_LRANGE_ELEMENTS
+            )
+        return ["LRANGE", key, start, stop]
+    if name == "kv_llen":
+        return ["LLEN", _require(args, "key")]
+    if name == "kv_lpop":
+        return ["LPOP", _require(args, "key")]
+    if name == "kv_rpop":
+        return ["RPOP", _require(args, "key")]
     if name == "kv_zrange":
         key, start, stop, withscores, rev = _zrange_args(args)
         # A range both ends of which are non-negative has a known
@@ -1158,6 +1265,64 @@ def _call_zrevrank(client, args):
     return (client.command("ZCARD", key) or 0) - 1 - rank
 
 
+# The most elements one kv_lrange call returns; a wider range fails
+# instead of dumping a huge list into one tool result.
+MAX_LRANGE_ELEMENTS = 1000
+
+
+def _list_elements_args(args, name):
+    """The element names for an LPUSH/RPUSH, as an argv list.
+    `elements` must be a non-empty list of strings; anything else
+    fails the call instead of sending a half-formed push."""
+    elements = args.get("elements")
+    if not isinstance(elements, list) or not elements:
+        raise ValueError("%s elements must be a non-empty list" % name)
+    for element in elements:
+        if not isinstance(element, str):
+            raise ValueError("%s elements must be strings" % name)
+    return list(elements)
+
+
+def _lrange_args(args):
+    """Validate a kv_lrange call: (key, start, stop). start defaults
+    to 0 and stop to -1, as in Redis. Bad types fail the call instead
+    of sending a half-formed LRANGE."""
+    key = _require(args, "key")
+    start = args.get("start", 0)
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError("kv_lrange start must be an integer")
+    stop = args.get("stop", -1)
+    if isinstance(stop, bool) or not isinstance(stop, int):
+        raise ValueError("kv_lrange stop must be an integer")
+    return key, start, stop
+
+
+def _check_lrange_window(client, args):
+    """Fail a kv_lrange call whose range would return more than
+    MAX_LRANGE_ELEMENTS elements. A range with a negative bound needs
+    the list's length first, so it reads LLEN; a range both ends of
+    which are non-negative is checked without a round trip. A missing
+    key has length 0, so the check passes and the range returns []."""
+    key, start, stop = _lrange_args(args)
+    if start >= 0 and stop >= 0:
+        window = stop - start + 1
+    else:
+        window = _zrange_window(start, stop, client.command("LLEN", key) or 0)
+    if window > MAX_LRANGE_ELEMENTS:
+        raise ValueError(
+            "kv_lrange returns at most %d elements; narrow the range"
+            % MAX_LRANGE_ELEMENTS
+        )
+
+
+def _call_lrange(client, args):
+    """kv_lrange: bound the range first (see _check_lrange_window),
+    then run LRANGE. A missing key replies as an empty list, which
+    becomes []."""
+    _check_lrange_window(client, args)
+    return list(client.command(*_op_argv("kv_lrange", args)) or [])
+
+
 def _call_single(client, name, args):
     if name == "kv_keys":
         return _call_keys(client, args)
@@ -1167,6 +1332,8 @@ def _call_single(client, name, args):
         return _hgetall_result(
             client.command("HGETALL", _require(args, "key")) or []
         )
+    if name == "kv_lrange":
+        return _call_lrange(client, args)
     if name == "kv_zadd":
         return _call_zadd(client, args)
     if name == "kv_zscore":
