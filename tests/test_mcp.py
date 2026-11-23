@@ -2,7 +2,7 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
-ZCARD, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
+ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
 MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -239,29 +239,83 @@ class FakeCinder(threading.Thread):
                         "wrong kind of value\r\n")
             flat = [x for pair in value.items() for x in pair]
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
-        elif name == "ZADD" and len(args) >= 3 and len(args) % 2 == 1:
+        elif name == "ZADD" and len(args) >= 3:
+            # Options come after the key and before the first score,
+            # as in cinder 0.25.0: NX | XX | GT | LT | CH | INCR.
+            opts = set()
+            i = 1
+            while i < len(args) and args[i].upper() in (
+                "NX", "XX", "GT", "LT", "CH", "INCR"
+            ):
+                opts.add(args[i].upper())
+                i += 1
+            if "NX" in opts and "XX" in opts:
+                return "-ERR XX and NX options at the same time are not compatible\r\n"
+            if ("GT" in opts and "LT" in opts) or (
+                "NX" in opts and ("GT" in opts or "LT" in opts)
+            ):
+                return "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n"
+            rest = args[i:]
+            if len(rest) < 2 or len(rest) % 2 != 0:
+                return "-ERR wrong number of arguments for 'zadd' command\r\n"
+            if "INCR" in opts and len(rest) != 2:
+                return "-ERR INCR option supports a single increment-element pair\r\n"
             value = self._get(args[0])
             if value is not None and not isinstance(value, ZSet):
                 return ("-WRONGTYPE Operation against a key holding the "
                         "wrong kind of value\r\n")
             scores = []
-            for i in range(1, len(args), 2):
+            for j in range(0, len(rest), 2):
                 try:
-                    score = float(args[i])
+                    score = float(rest[j])
                 except ValueError:
                     return "-ERR value is not a valid float\r\n"
                 if score != score:
                     return "-ERR value is not a valid float\r\n"
                 scores.append(score)
-            if value is None:
-                value = ZSet()
-                self.store[args[0]] = (value, None)
+            if "INCR" in opts:
+                member = rest[1]
+                cur = value.members.get(member, 0.0) if value else 0.0
+                exists = value is not None and member in value.members
+                if ("NX" in opts and exists) or ("XX" in opts and not exists):
+                    return self._bulk(None)
+                nxt = cur + scores[0]
+                if nxt != nxt:
+                    return "-ERR resulting score is not a number (NaN)\r\n"
+                if exists and (("GT" in opts and nxt <= cur)
+                               or ("LT" in opts and nxt >= cur)):
+                    return self._bulk(None)
+                if value is None:
+                    value = ZSet()
+                    self.store[args[0]] = (value, None)
+                value.members[member] = nxt
+                return self._bulk(repr(nxt))
+            # The set is created lazily below, only when a pair
+            # actually applies: a ZADD whose options skip every pair
+            # leaves no key behind, as in real cinder.
             added = 0
-            for i, score in zip(range(2, len(args), 2), scores):
-                if args[i] not in value.members:
+            updated = 0
+            for j, score in zip(range(1, len(rest), 2), scores):
+                member = rest[j]
+                exists = value is not None and member in value.members
+                if ("NX" in opts and exists) or ("XX" in opts and not exists):
+                    continue
+                if exists and (("GT" in opts and score <= value.members[member])
+                               or ("LT" in opts and score >= value.members[member])):
+                    continue
+                if exists and score == value.members[member]:
+                    # Re-adding with the current score is a no-op:
+                    # not counted, even with CH, as in real cinder.
+                    continue
+                if value is None:
+                    value = ZSet()
+                    self.store[args[0]] = (value, None)
+                if exists:
+                    updated += 1
+                else:
                     added += 1
-                value.members[args[i]] = score
-            return ":%d\r\n" % added
+                value.members[member] = score
+            return ":%d\r\n" % (added + updated if "CH" in opts else added)
         elif name == "ZCARD" and len(args) == 1:
             value = self._get(args[0])
             if value is None:
@@ -270,6 +324,59 @@ class FakeCinder(threading.Thread):
                 return ("-WRONGTYPE Operation against a key holding the "
                         "wrong kind of value\r\n")
             return ":%d\r\n" % len(value.members)
+        elif name == "ZSCORE" and len(args) == 2:
+            value = self._get(args[0])
+            if value is None:
+                return self._bulk(None)
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            score = value.members.get(args[1])
+            return self._bulk(None if score is None else repr(score))
+        elif name == "ZRANK" and len(args) == 2:
+            value = self._get(args[0])
+            if value is None:
+                return self._bulk(None)
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            ordered = value.ordered()
+            if args[1] not in ordered:
+                return self._bulk(None)
+            return ":%d\r\n" % ordered.index(args[1])
+        elif name == "ZREM" and len(args) >= 2:
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            removed = 0
+            for member in args[1:]:
+                if member in value.members:
+                    del value.members[member]
+                    removed += 1
+            return ":%d\r\n" % removed
+        elif name == "ZINCRBY" and len(args) == 3:
+            try:
+                incr = float(args[1])
+            except ValueError:
+                return "-ERR value is not a valid float\r\n"
+            if incr != incr:
+                return "-ERR value is not a valid float\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            cur = value.members.get(args[2], 0.0) if value else 0.0
+            nxt = cur + incr
+            if nxt != nxt:
+                return "-ERR resulting score is not a number (NaN)\r\n"
+            if value is None:
+                value = ZSet()
+                self.store[args[0]] = (value, None)
+            value.members[args[2]] = nxt
+            return self._bulk(repr(nxt))
         elif name in ("ZRANGE", "ZREVRANGE") and len(args) in (3, 4):
             value = self._get(args[0])
             if value is None:
@@ -416,7 +523,8 @@ class McpTests(unittest.TestCase):
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
                     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
                     "kv_hset", "kv_hget", "kv_hgetall",
-                    "kv_zadd", "kv_zrange", "kv_batch"]
+                    "kv_zadd", "kv_zrange", "kv_zcard", "kv_zscore",
+                    "kv_zrank", "kv_zrem", "kv_zincrby", "kv_batch"]
         )
 
     def test_tools_list_advertises_default_budgets(self):
@@ -1195,6 +1303,327 @@ class McpTests(unittest.TestCase):
             {"member": "x", "score": 9.0},
             {"member": "y", "score": 3.0},
         ])
+
+    def test_tools_call_zcard_zscore_zrank_zrem_zincrby(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10, "bo": 20, "cy": 15}},
+        })
+        card = self._call("tools/call", 2, {
+            "name": "kv_zcard", "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(card["result"]["content"][0]["text"], "3")
+        ghost_card = self._call("tools/call", 3, {
+            "name": "kv_zcard", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost_card["result"]["content"][0]["text"], "0")
+        score = self._call("tools/call", 4, {
+            "name": "kv_zscore",
+            "arguments": {"key": "leaderboard", "member": "cy"},
+        })
+        self.assertEqual(score["result"]["content"][0]["text"], "15.0")
+        # A missing member — or a missing key — scores null.
+        missing_member = self._call("tools/call", 5, {
+            "name": "kv_zscore",
+            "arguments": {"key": "leaderboard", "member": "dan"},
+        })
+        self.assertEqual(missing_member["result"]["content"][0]["text"], "null")
+        missing_key = self._call("tools/call", 6, {
+            "name": "kv_zscore",
+            "arguments": {"key": "ghost", "member": "dan"},
+        })
+        self.assertEqual(missing_key["result"]["content"][0]["text"], "null")
+        # Lowest score first: amy 0, cy 1, bo 2.
+        for i, (member, rank) in enumerate(
+            [("amy", "0"), ("cy", "1"), ("bo", "2")]
+        ):
+            ranked = self._call("tools/call", 7 + i, {
+                "name": "kv_zrank",
+                "arguments": {"key": "leaderboard", "member": member},
+            })
+            self.assertEqual(ranked["result"]["content"][0]["text"], rank)
+        ghost_rank = self._call("tools/call", 10, {
+            "name": "kv_zrank",
+            "arguments": {"key": "leaderboard", "member": "dan"},
+        })
+        self.assertEqual(ghost_rank["result"]["content"][0]["text"], "null")
+        # ZINCRBY bumps an existing member and creates a new one.
+        bumped = self._call("tools/call", 11, {
+            "name": "kv_zincrby",
+            "arguments": {"key": "leaderboard", "increment": 5,
+                          "member": "amy"},
+        })
+        self.assertEqual(bumped["result"]["content"][0]["text"], "15.0")
+        created = self._call("tools/call", 12, {
+            "name": "kv_zincrby",
+            "arguments": {"key": "leaderboard", "increment": 7,
+                          "member": "dan"},
+        })
+        self.assertEqual(created["result"]["content"][0]["text"], "7.0")
+        # The bump reorders the ranks: dan 7, amy 15, cy 15, bo 20.
+        reranked = self._call("tools/call", 13, {
+            "name": "kv_zrank",
+            "arguments": {"key": "leaderboard", "member": "amy"},
+        })
+        self.assertEqual(reranked["result"]["content"][0]["text"], "1")
+        # ZREM removes several at once and counts only the ones there.
+        removed = self._call("tools/call", 14, {
+            "name": "kv_zrem",
+            "arguments": {"key": "leaderboard",
+                          "members": ["amy", "dan", "ghost"]},
+        })
+        self.assertEqual(removed["result"]["content"][0]["text"], "2")
+        card_after = self._call("tools/call", 15, {
+            "name": "kv_zcard", "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(card_after["result"]["content"][0]["text"], "2")
+        removed_none = self._call("tools/call", 16, {
+            "name": "kv_zrem",
+            "arguments": {"key": "leaderboard", "members": ["ghost"]},
+        })
+        self.assertEqual(removed_none["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_zset_new_tools_reject_bad_arguments(self):
+        cases = [
+            # Missing required arguments.
+            {"name": "kv_zcard", "arguments": {}},
+            {"name": "kv_zscore", "arguments": {"key": "z"}},
+            {"name": "kv_zscore", "arguments": {"member": "m"}},
+            {"name": "kv_zrank", "arguments": {"key": "z"}},
+            {"name": "kv_zrem", "arguments": {"key": "z"}},
+            {"name": "kv_zincrby", "arguments": {"key": "z", "member": "m"}},
+            {"name": "kv_zincrby",
+             "arguments": {"key": "z", "increment": 1}},
+            # kv_zrem: members must be a non-empty list of strings.
+            {"name": "kv_zrem",
+             "arguments": {"key": "z", "members": []}},
+            {"name": "kv_zrem",
+             "arguments": {"key": "z", "members": "m"}},
+            {"name": "kv_zrem",
+             "arguments": {"key": "z", "members": [1]}},
+            # kv_zincrby: the increment must be a number, never NaN.
+            {"name": "kv_zincrby",
+             "arguments": {"key": "z", "increment": "1", "member": "m"}},
+            {"name": "kv_zincrby",
+             "arguments": {"key": "z", "increment": True, "member": "m"}},
+            {"name": "kv_zincrby",
+             "arguments": {"key": "z", "increment": float("nan"),
+                           "member": "m"}},
+            # kv_zadd options: conflicting flags, a non-boolean flag,
+            # and INCR with more than one member.
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"a": 1},
+                           "nx": True, "xx": True}},
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"a": 1},
+                           "gt": True, "lt": True}},
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"a": 1},
+                           "nx": True, "gt": True}},
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"a": 1},
+                           "nx": "yes"}},
+            {"name": "kv_zadd",
+             "arguments": {"key": "z", "members": {"a": 1, "b": 2},
+                           "incr": True}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zadd_options(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 1, "b": 2}},
+        })
+        # NX adds only members not already present.
+        nx = self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 5, "c": 3},
+                          "nx": True},
+        })
+        self.assertEqual(nx["result"]["content"][0]["text"], "1")
+        score_a = self._call("tools/call", 3, {
+            "name": "kv_zscore", "arguments": {"key": "z", "member": "a"},
+        })
+        self.assertEqual(score_a["result"]["content"][0]["text"], "1.0")
+        # XX updates only members already present.
+        xx = self._call("tools/call", 4, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 5, "d": 4},
+                          "xx": True},
+        })
+        self.assertEqual(xx["result"]["content"][0]["text"], "0")
+        score_a = self._call("tools/call", 5, {
+            "name": "kv_zscore", "arguments": {"key": "z", "member": "a"},
+        })
+        self.assertEqual(score_a["result"]["content"][0]["text"], "5.0")
+        ghost = self._call("tools/call", 6, {
+            "name": "kv_zscore", "arguments": {"key": "z", "member": "d"},
+        })
+        self.assertEqual(ghost["result"]["content"][0]["text"], "null")
+        # GT only moves a score up, LT only moves it down.
+        gt_skip = self._call("tools/call", 7, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 3}, "gt": True},
+        })
+        self.assertEqual(gt_skip["result"]["content"][0]["text"], "0")
+        gt_apply = self._call("tools/call", 8, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 9}, "gt": True},
+        })
+        self.assertEqual(gt_apply["result"]["content"][0]["text"], "0")
+        score_a = self._call("tools/call", 9, {
+            "name": "kv_zscore", "arguments": {"key": "z", "member": "a"},
+        })
+        self.assertEqual(score_a["result"]["content"][0]["text"], "9.0")
+        lt_skip = self._call("tools/call", 10, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 20}, "lt": True},
+        })
+        self.assertEqual(lt_skip["result"]["content"][0]["text"], "0")
+        lt_apply = self._call("tools/call", 11, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 1}, "lt": True},
+        })
+        self.assertEqual(lt_apply["result"]["content"][0]["text"], "0")
+        score_a = self._call("tools/call", 12, {
+            "name": "kv_zscore", "arguments": {"key": "z", "member": "a"},
+        })
+        self.assertEqual(score_a["result"]["content"][0]["text"], "1.0")
+        # CH counts updates as well as additions.
+        ch = self._call("tools/call", 13, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 5, "e": 2},
+                          "ch": True},
+        })
+        self.assertEqual(ch["result"]["content"][0]["text"], "2")
+        plain = self._call("tools/call", 14, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 5, "e": 2}},
+        })
+        self.assertEqual(plain["result"]["content"][0]["text"], "0")
+        # INCR returns the member's new score as a number.
+        incr = self._call("tools/call", 15, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 10},
+                          "incr": True},
+        })
+        self.assertEqual(incr["result"]["content"][0]["text"], "15.0")
+        # INCR with a condition that rejects the update returns null.
+        incr_nx = self._call("tools/call", 16, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": 1},
+                          "incr": True, "nx": True},
+        })
+        self.assertEqual(incr_nx["result"]["content"][0]["text"], "null")
+        incr_xx = self._call("tools/call", 17, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"missing": 1},
+                          "incr": True, "xx": True},
+        })
+        self.assertEqual(incr_xx["result"]["content"][0]["text"], "null")
+        # INCR with GT that the result fails also returns null.
+        incr_gt = self._call("tools/call", 18, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z", "members": {"a": -5},
+                          "incr": True, "gt": True},
+        })
+        self.assertEqual(incr_gt["result"]["content"][0]["text"], "null")
+        score_a = self._call("tools/call", 19, {
+            "name": "kv_zscore", "arguments": {"key": "z", "member": "a"},
+        })
+        self.assertEqual(score_a["result"]["content"][0]["text"], "15.0")
+
+    def test_tools_call_zset_new_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for i, call in enumerate([
+            {"name": "kv_zcard", "arguments": {"key": "plain"}},
+            {"name": "kv_zscore",
+             "arguments": {"key": "plain", "member": "m"}},
+            {"name": "kv_zrank",
+             "arguments": {"key": "plain", "member": "m"}},
+            {"name": "kv_zrem",
+             "arguments": {"key": "plain", "members": ["m"]}},
+            {"name": "kv_zincrby",
+             "arguments": {"key": "plain", "increment": 1, "member": "m"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_zset_new_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2}},
+                {"op": "kv_zcard", "key": "z"},
+                {"op": "kv_zscore", "key": "z", "member": "b"},
+                {"op": "kv_zrank", "key": "z", "member": "a"},
+                {"op": "kv_zincrby", "key": "z", "increment": 5,
+                 "member": "a"},
+                {"op": "kv_zrem", "key": "z", "members": ["b"]},
+                {"op": "kv_zcard", "key": "z"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 7)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 2.0)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        self.assertEqual(summary["results"][4]["result"], 6.0)
+        self.assertEqual(summary["results"][5]["result"], 1)
+        self.assertEqual(summary["results"][6]["result"], 1)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zcard", "key": "z2"},
+                {"op": "kv_zscore", "key": "z2", "member": "x"},
+                {"op": "kv_zrank", "key": "z2", "member": "x"},
+                {"op": "kv_zincrby", "key": "z2", "increment": 1,
+                 "member": "y"},
+                {"op": "kv_zrem", "key": "z2", "members": ["y"]},
+                {"op": "kv_zadd", "key": "z3", "members": {"m": 2},
+                 "incr": True},
+                {"op": "kv_zadd", "key": "z3", "members": {"n": 4},
+                 "nx": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 8)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 9.0)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        self.assertEqual(summary["results"][4]["result"], 4.0)
+        self.assertEqual(summary["results"][5]["result"], 1)
+        self.assertEqual(summary["results"][6]["result"], 2.0)
+        self.assertEqual(summary["results"][7]["result"], 1)
+        # An op that cannot be queued fails an atomic batch up front.
+        bad_atomic = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z4",
+                 "members": {"a": 1}},
+                {"op": "kv_zrem", "key": "z4", "members": []},
+            ]},
+        })
+        self.assertIn("error", bad_atomic)
+        self.assertEqual(bad_atomic["error"]["code"], -32602)
+        # And nothing ran: the set was never created.
+        card = self._call("tools/call", 4, {
+            "name": "kv_zcard", "arguments": {"key": "z4"},
+        })
+        self.assertEqual(card["result"]["content"][0]["text"], "0")
 
     def test_resources_list_returns_info_metrics_changes_and_key_template(self):
         listed = self._call("resources/list", 1)

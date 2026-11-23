@@ -147,12 +147,18 @@ TOOLS = [
     },
     {
         "name": "kv_zadd",
-        "description": "Add members with scores to a sorted set: ZADD key score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it). Cinder's ZADD takes the plain form only — no NX/XX/GT/LT/CH/INCR options, which cinder rejects as a syntax error.",
+        "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "key": {"type": "string"},
                 "members": {"type": "object"},
+                "nx": {"type": "boolean"},
+                "xx": {"type": "boolean"},
+                "gt": {"type": "boolean"},
+                "lt": {"type": "boolean"},
+                "ch": {"type": "boolean"},
+                "incr": {"type": "boolean"},
             },
             "required": ["key", "members"],
         },
@@ -173,8 +179,66 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zcard",
+        "description": "The number of members in a sorted set: ZCARD key. Returns 0 when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_zscore",
+        "description": "The score of one member of a sorted set: ZSCORE key member. Returns null when the key or the member does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member": {"type": "string"},
+            },
+            "required": ["key", "member"],
+        },
+    },
+    {
+        "name": "kv_zrank",
+        "description": "The rank of one member of a sorted set, lowest score first: ZRANK key member. Returns null when the key or the member does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member": {"type": "string"},
+            },
+            "required": ["key", "member"],
+        },
+    },
+    {
+        "name": "kv_zrem",
+        "description": "Remove members from a sorted set: ZREM key member [member ...]. Takes `members` as a list of member names. Returns the number of members actually removed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
+        "name": "kv_zincrby",
+        "description": "Add to the score of one member of a sorted set: ZINCRBY key increment member. Creates the member with the increment as its score when it is not already present. Returns the member's new score as a number.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "increment": {"type": "number"},
+                "member": {"type": "string"},
+            },
+            "required": ["key", "increment", "member"],
+        },
+    },
+    {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists, kv_expire, kv_hset, kv_hget, kv_hgetall, kv_zadd or kv_zrange plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists, kv_expire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zcard, kv_zscore, kv_zrank, kv_zrem or kv_zincrby plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -193,7 +257,15 @@ TOOLS = [
                             "seconds": {"type": "integer"},
                             "field": {"type": "string"},
                             "fields": {"type": "object"},
-                            "members": {"type": "object"},
+                            "members": {"type": ["object", "array"]},
+                            "member": {"type": "string"},
+                            "increment": {"type": "number"},
+                            "nx": {"type": "boolean"},
+                            "xx": {"type": "boolean"},
+                            "gt": {"type": "boolean"},
+                            "lt": {"type": "boolean"},
+                            "ch": {"type": "boolean"},
+                            "incr": {"type": "boolean"},
                             "start": {"type": "integer"},
                             "stop": {"type": "integer"},
                             "withscores": {"type": "boolean"},
@@ -263,7 +335,8 @@ BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
     "kv_hset", "kv_hget", "kv_hgetall",
-    "kv_zadd", "kv_zrange",
+    "kv_zadd", "kv_zrange", "kv_zcard", "kv_zscore", "kv_zrank",
+    "kv_zrem", "kv_zincrby",
 }
 
 MAX_BATCH_OPS = 100
@@ -332,7 +405,8 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
     "kv_hset", "kv_hget", "kv_hgetall",
-    "kv_zadd", "kv_zrange",
+    "kv_zadd", "kv_zrange", "kv_zcard", "kv_zscore", "kv_zrank",
+    "kv_zrem", "kv_zincrby",
 }
 
 
@@ -388,6 +462,19 @@ def _call_batch_atomic(client, ops):
             # shape it like the standalone tool does, including the
             # withscores member/score objects.
             value = _zrange_result(reply or [], _zrange_args(op)[3])
+        elif op_name == "kv_zscore":
+            # ZSCORE came back as a bulk score string (or nil) inside
+            # the transaction; parse it like the standalone tool does.
+            value = None if reply is None else float(reply)
+        elif op_name == "kv_zincrby":
+            # ZINCRBY came back as a bulk score string inside the
+            # transaction; parse it like the standalone tool does.
+            value = float(reply)
+        elif op_name == "kv_zadd" and op.get("incr", False):
+            # ZADD with INCR came back as a bulk score string (or
+            # nil when the conditions rejected the update) instead
+            # of an added count; parse it like the standalone tool.
+            value = None if reply is None else float(reply)
         else:
             value = reply
         results.append({"op": op_name, "ok": True, "result": value})
@@ -518,7 +605,19 @@ def _op_argv(name, args):
     if name == "kv_hgetall":
         return ["HGETALL", _require(args, "key")]
     if name == "kv_zadd":
-        return ["ZADD", _require(args, "key")] + _zadd_member_args(args)
+        return (["ZADD", _require(args, "key")] + _zadd_options(args)
+                + _zadd_member_args(args))
+    if name == "kv_zcard":
+        return ["ZCARD", _require(args, "key")]
+    if name == "kv_zscore":
+        return ["ZSCORE", _require(args, "key"), _require(args, "member")]
+    if name == "kv_zrank":
+        return ["ZRANK", _require(args, "key"), _require(args, "member")]
+    if name == "kv_zrem":
+        return ["ZREM", _require(args, "key")] + _zrem_member_args(args)
+    if name == "kv_zincrby":
+        key, increment, member = _zincrby_args(args)
+        return ["ZINCRBY", key, increment, member]
     if name == "kv_zrange":
         key, start, stop, withscores, rev = _zrange_args(args)
         # A range both ends of which are non-negative has a known
@@ -580,6 +679,37 @@ def _format_score(score):
     return repr(score)
 
 
+def _zadd_options(args):
+    """The ZADD option flags for a kv_zadd call, as argv tokens in
+    cinder's order (NX | XX | GT | LT | CH | INCR, after the key and
+    before the first score). Each flag must be a boolean when
+    present. The combinations cinder rejects — NX with XX, GT or LT
+    with NX, GT with LT — fail here as invalid params instead of as
+    a server error, and INCR needs exactly one member, as in Redis.
+    CH is ignored when INCR is set: cinder's INCR reply is the new
+    score either way."""
+    flags = {}
+    opts = []
+    for name in ("nx", "xx", "gt", "lt", "ch", "incr"):
+        value = args.get(name, False)
+        if not isinstance(value, bool):
+            raise ValueError("kv_zadd %s must be true or false" % name)
+        flags[name] = value
+        if value:
+            opts.append(name.upper())
+    if flags["nx"] and flags["xx"]:
+        raise ValueError("kv_zadd nx and xx cannot be used together")
+    if flags["gt"] and flags["lt"]:
+        raise ValueError("kv_zadd gt and lt cannot be used together")
+    if flags["nx"] and (flags["gt"] or flags["lt"]):
+        raise ValueError("kv_zadd nx cannot be used with gt or lt")
+    if flags["incr"]:
+        members = args.get("members")
+        if isinstance(members, dict) and len(members) != 1:
+            raise ValueError("kv_zadd incr takes exactly one member")
+    return opts
+
+
 def _zadd_member_args(args):
     """The score/member pairs for a ZADD, as a flat argv list.
     `members` must be a non-empty object of string member names to
@@ -597,6 +727,34 @@ def _zadd_member_args(args):
             )
         argv += [_format_score(members[member]), member]
     return argv
+
+
+def _zrem_member_args(args):
+    """The member names for a ZREM, as an argv list. `members` must
+    be a non-empty list of strings; anything else fails the call
+    instead of sending a half-formed ZREM."""
+    members = args.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("kv_zrem members must be a non-empty list")
+    for member in members:
+        if not isinstance(member, str):
+            raise ValueError("kv_zrem members must be strings")
+    return list(members)
+
+
+def _zincrby_args(args):
+    """Validate a kv_zincrby call: (key, increment, member). The
+    increment must be a number (NaN is rejected — cinder rejects
+    it too); it is formatted with repr so a float round-trips
+    exactly, like a ZADD score."""
+    key = _require(args, "key")
+    increment = _require(args, "increment")
+    member = _require(args, "member")
+    if isinstance(increment, bool) or not isinstance(increment, (int, float)):
+        raise ValueError("kv_zincrby increment must be a number")
+    if isinstance(increment, float) and increment != increment:
+        raise ValueError("kv_zincrby increment must not be NaN")
+    return key, repr(increment), member
 
 
 def _zrange_args(args):
@@ -669,6 +827,30 @@ def _zrange_result(flat, withscores):
     ]
 
 
+def _call_zadd(client, args):
+    """kv_zadd: plain form returns the number of newly added members
+    (or added+updated with ch); with incr=true it returns the new
+    score of the single member as a number, or null when the
+    conditions rejected the update."""
+    reply = client.command(*_op_argv("kv_zadd", args))
+    if args.get("incr", False):
+        return None if reply is None else float(reply)
+    return reply
+
+
+def _call_zscore(client, args):
+    """kv_zscore: the member's score as a number, or null when the
+    key or the member does not exist (cinder replies nil)."""
+    reply = client.command(*_op_argv("kv_zscore", args))
+    return None if reply is None else float(reply)
+
+
+def _call_zincrby(client, args):
+    """kv_zincrby: the member's new score as a number. Cinder
+    replies with the score as a bulk string."""
+    return float(client.command(*_op_argv("kv_zincrby", args)))
+
+
 def _call_zrange(client, args):
     """kv_zrange: bound the range first (see _check_zrange_window),
     then run ZRANGE or ZREVRANGE and shape the reply."""
@@ -688,6 +870,12 @@ def _call_single(client, name, args):
         return _hgetall_result(
             client.command("HGETALL", _require(args, "key")) or []
         )
+    if name == "kv_zadd":
+        return _call_zadd(client, args)
+    if name == "kv_zscore":
+        return _call_zscore(client, args)
+    if name == "kv_zincrby":
+        return _call_zincrby(client, args)
     if name == "kv_zrange":
         return _call_zrange(client, args)
     return client.command(*_op_argv(name, args))
