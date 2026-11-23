@@ -27,7 +27,14 @@ asks the model for a go/no-go per risky op. ttl-renewal plans
 renewing the TTLs of keys that are expiring soon or have no expiry:
 it reads live TTLs, flags keys that are already expired or missing,
 and proposes one kv_expire renewal per key up to a safety cap,
-without ever printing a value.
+without ever printing a value. key-migration plans moving keys
+matching a pattern to a new prefix: it audits each key's type, size,
+and TTL, checks whether the target name already exists and with
+what type, and lays out the ordered copy steps — read the value,
+write it under the target name, re-apply the TTL with kv_expire,
+verify, then delete the source with kv_del — without ever printing
+a value. Cinder has no RENAME or COPY command, so a migration is a
+read plus a write, not one atomic move, and the prompt says so.
 """
 
 import bisect
@@ -83,6 +90,24 @@ MAX_RENEWAL_MAX_KEYS = 100
 # At most this many keys are listed in the ttl-renewal report's
 # already-fine and missing-or-expired sections.
 MAX_RENEWAL_LISTED = 10
+
+# Default safety cap on how many ready keys a key-migration plan
+# covers: the plan lists the ready keys, soonest in key order, and
+# counts the rest as not covered, so the prompt text stays bounded
+# however large the keyspace is.
+DEFAULT_MIGRATION_MAX_KEYS = 20
+
+# The largest max_keys a key-migration plan accepts. The cap is a
+# safety bound on a plan an operator runs by hand, so it stays
+# small enough to read; narrow the pattern instead of raising it.
+MAX_MIGRATION_MAX_KEYS = 100
+
+# At most this many keys are listed in the key-migration report's
+# overwrite, conflict, self-mapping, and missing-or-expired
+# sections. Those sections are warnings, not the plan itself, so
+# they are bounded separately from the max_keys cap and the rest
+# are counted.
+MAX_MIGRATION_FLAGGED_LISTED = 10
 
 # Ops a write plan may contain that actually write. Read ops in a
 # plan are not audited: they change nothing, so there is nothing
@@ -256,6 +281,40 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "key-migration",
+        "description": (
+            "Plan migrating keys matching a pattern to a new prefix: "
+            "audit each key's type, size, and TTL, flag target "
+            "names that already exist, and lay out the ordered "
+            "copy steps with the exact kv_del calls for the source "
+            "keys, up to a safety cap."
+        ),
+        "arguments": [
+            {
+                "name": "pattern",
+                "description": "Glob pattern of keys to migrate (* and ?). Defaults to all keys.",
+                "required": False,
+            },
+            {
+                "name": "target_prefix",
+                "description": (
+                    "The prefix migrated keys get, e.g. 'v2:': a key "
+                    "'old:user:1' matching pattern 'old:*' migrates "
+                    "to 'v2:user:1'."
+                ),
+                "required": True,
+            },
+            {
+                "name": "max_keys",
+                "description": (
+                    "Safety cap: at most this many ready keys are "
+                    "covered by the plan. Defaults to 20, at most 100."
+                ),
+                "required": False,
+            },
+        ],
+    },
 ]
 
 
@@ -284,6 +343,8 @@ def get_prompt(client, name, arguments):
         return _write_safety(client, arguments)
     if name == "ttl-renewal":
         return _ttl_renewal(client, arguments)
+    if name == "key-migration":
+        return _key_migration(client, arguments)
     raise ValueError("unknown prompt: %s" % name)
 
 
@@ -1319,6 +1380,269 @@ def _ttl_renewal(client, arguments):
     ])
     return {
         "description": _prompt_def("ttl-renewal")["description"],
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }
+
+
+def _literal_prefix(pattern):
+    """The literal text of a glob pattern before its first wildcard:
+    "old:*" -> "old:", "*" -> "". Every key matching the pattern
+    starts with it, so it is the part the target prefix replaces
+    when a migrated key's target name is computed."""
+    for index, char in enumerate(pattern):
+        if char in "*?":
+            return pattern[:index]
+    return pattern
+
+
+def _key_migration(client, arguments):
+    """Plan migrating keys matching a pattern to a new prefix. Each
+    source key is audited live — type, size, TTL — and its target
+    name is the target prefix plus the part of the key after the
+    pattern's literal prefix, so "old:user:1" under pattern "old:*"
+    migrates to "v2:user:1" for target prefix "v2:". The target name
+    is probed too: a free target means the key is ready, a target
+    holding the same type would be overwritten, and a target
+    holding a different type is a conflict that must be resolved
+    first. A key whose target name is itself (the pattern and the
+    target prefix agree, e.g. pattern "old:*" with prefix "old:")
+    is flagged rather than migrated. Keys that expire while
+    scanning are counted as missing, not migrated. The plan covers
+    at most max_keys ready keys, in key order; overwrite, conflict,
+    self-mapping, and missing keys are warnings, so each of those
+    sections lists only its first 10 plus a count of the rest.
+    Values are never read and never printed: only TTLs, types, and
+    sizes are probed. One honest limit: cinder has no RENAME or
+    COPY command, so a migration is a read plus a write, not one
+    atomic move — the plan's copy step is read the value, write it
+    under the target name, re-apply the TTL, verify, then delete
+    the source, and a key can change between the read and the
+    write, so the source is only deleted after the target is
+    verified. The TTL printed for a key is the one observed during
+    the audit and it ticks down, so the plan says to re-check it
+    with kv_ttl just before copying and use the fresh value in
+    kv_expire."""
+    pattern = arguments.get("pattern", "*")
+    target_prefix = arguments.get("target_prefix")
+    if not target_prefix or not isinstance(target_prefix, str):
+        raise ValueError("key-migration requires a target_prefix argument")
+    if "*" in target_prefix or "?" in target_prefix:
+        raise ValueError(
+            "key-migration target_prefix must be a literal prefix, "
+            "got: %r" % (target_prefix,)
+        )
+    max_keys = _parse_positive_int(
+        arguments.get("max_keys"), "max_keys", DEFAULT_MIGRATION_MAX_KEYS
+    )
+    if max_keys > MAX_MIGRATION_MAX_KEYS:
+        raise ValueError(
+            "max_keys must be at most %d, got: %d"
+            % (MAX_MIGRATION_MAX_KEYS, max_keys)
+        )
+    literal = _literal_prefix(pattern)
+    ready = []  # (key, line), sorted by key at render time
+    overwrite = []  # bounded (key, line)
+    overwrite_count = 0
+    conflict = []  # bounded (key, line)
+    conflict_count = 0
+    self_mapped = []  # bounded (key, line)
+    self_count = 0
+    missing = []  # bounded sorted keys
+    missing_count = 0
+    total = 0
+    for batch in iter_keys(client, pattern, PROMPT_SCAN_BATCH_SIZE):
+        for key in batch:
+            total += 1
+            ttl = client.command("TTL", key)
+            if ttl == -2:
+                missing_count += 1
+                _bounded_insert(
+                    missing, key, MAX_MIGRATION_FLAGGED_LISTED
+                )
+                continue
+            try:
+                kind, size_value, size, _sample = _inspect_key(client, key)
+            except ValueError:
+                # The key vanished between the TTL probe and the type probe.
+                missing_count += 1
+                _bounded_insert(
+                    missing, key, MAX_MIGRATION_FLAGGED_LISTED
+                )
+                continue
+            target = target_prefix + key[len(literal):]
+            if ttl == -1:
+                ttl_text = "no expiry"
+            else:
+                ttl_text = "expires in %s" % _format_ttl(ttl)
+            large = (
+                (kind == "string" and size_value >= HEALTH_BIG_STRING_BYTES)
+                or (kind != "string"
+                    and size_value >= HEALTH_BIG_CONTAINER_ELEMENTS)
+            )
+            source_text = "%s, %s, %s" % (kind, size, ttl_text)
+            if large:
+                source_text += ", large — copy one at a time"
+            if target == key:
+                self_count += 1
+                _bounded_insert(
+                    self_mapped,
+                    (key, "- %s → %s (%s; the target is the key itself)"
+                     % (key, target, source_text)),
+                    MAX_MIGRATION_FLAGGED_LISTED,
+                )
+                continue
+            ready_line = (
+                "- %s → %s (%s; delete the source with kv_del %r "
+                "after verifying the copy)"
+                % (key, target, source_text, key)
+            )
+            if client.command("EXISTS", target) == 0:
+                ready.append((key, ready_line))
+                continue
+            target_ttl = client.command("TTL", target)
+            if target_ttl == -2:
+                # The target expired between EXISTS and TTL: it is
+                # effectively free now.
+                ready.append((key, ready_line))
+                continue
+            try:
+                target_kind, _t_size, target_size, _s = _inspect_key(
+                    client, target
+                )
+            except ValueError:
+                # The target vanished between EXISTS and the type probe.
+                ready.append((key, ready_line))
+                continue
+            if target_ttl == -1:
+                target_ttl_text = "no expiry"
+            else:
+                target_ttl_text = (
+                    "expires in %s" % _format_ttl(target_ttl)
+                )
+            target_text = "%s, %s, %s" % (
+                target_kind, target_size, target_ttl_text
+            )
+            flagged_line = (
+                "- %s → %s (source: %s; target exists: %s)"
+                % (key, target, source_text, target_text)
+            )
+            if target_kind == kind:
+                overwrite_count += 1
+                _bounded_insert(
+                    overwrite, (key, flagged_line),
+                    MAX_MIGRATION_FLAGGED_LISTED,
+                )
+            else:
+                conflict_count += 1
+                _bounded_insert(
+                    conflict, (key, flagged_line),
+                    MAX_MIGRATION_FLAGGED_LISTED,
+                )
+    ready.sort()
+    plan_ready = ready[:max_keys]
+    not_covered = len(ready) - len(plan_ready)
+    lines = [
+        "Key migration plan (pattern %r → prefix %r)."
+        % (pattern, target_prefix),
+        "",
+        "Total keys scanned: %d" % total,
+        "Plan covers %d ready key(s); %d more ready keys are outside "
+        "the cap of %d." % (len(plan_ready), not_covered, max_keys),
+    ]
+    lines.extend([
+        "",
+        "Ready (%d) — the target name is free, safe to migrate:"
+        % len(plan_ready),
+    ])
+    if plan_ready:
+        lines.extend(line for _key, line in plan_ready)
+        if not_covered:
+            lines.append(
+                "... and %d more ready keys not covered by the cap"
+                % not_covered
+            )
+    else:
+        lines.append("(none)")
+    flagged_sections = [
+        (
+            overwrite, overwrite_count,
+            "Overwrite (%d) — the target exists with the same type; "
+            "migrating would destroy its current contents:",
+            "overwrite",
+        ),
+        (
+            conflict, conflict_count,
+            "Conflict (%d) — the target exists with a different type; "
+            "do not migrate until resolved:",
+            "conflict",
+        ),
+        (
+            self_mapped, self_count,
+            "Maps onto itself (%d) — the target name equals the source "
+            "key; check the pattern and target prefix:",
+            "self-mapping",
+        ),
+    ]
+    for members, count, header, label in flagged_sections:
+        lines.extend(["", header % count])
+        if members:
+            lines.extend(line for _key, line in members)
+            if count > MAX_MIGRATION_FLAGGED_LISTED:
+                lines.append(
+                    "... and %d more %s keys" % (
+                        count - MAX_MIGRATION_FLAGGED_LISTED, label
+                    )
+                )
+        else:
+            lines.append("(none)")
+    lines.extend([
+        "",
+        "Missing or expired (%d) — gone while scanning, skip:"
+        % missing_count,
+    ])
+    if missing:
+        lines.extend("- %s" % key for key in missing)
+        if missing_count > MAX_MIGRATION_FLAGGED_LISTED:
+            lines.append(
+                "... and %d more" % (
+                    missing_count - MAX_MIGRATION_FLAGGED_LISTED
+                )
+            )
+    else:
+        lines.append("(none)")
+    lines.extend([
+        "",
+        "Produce the migration steps for the ready keys, in the "
+        "order listed above, one key at a time: first read the "
+        "value — kv_get or cinder://key/<key> for a string, "
+        "cinder://key/<key> for a container — and write it under "
+        "the target name; then re-check the source TTL with kv_ttl "
+        "and re-apply the fresh value on the target with kv_expire, "
+        "since the TTL printed above has ticked down since the "
+        "audit; then verify the target with kv_exists and kv_ttl; "
+        "only then delete the source with the kv_del call listed "
+        "above. The kv_expire and kv_del steps for already-verified "
+        "copies can run as one kv_batch call. For each overwrite "
+        "key, say what to check before migrating it — read the "
+        "target's value, decide which copy wins, and back the loser "
+        "up — and for each conflict key, say what has to change "
+        "before it can migrate at all. Copy large keys one at a "
+        "time, in a quiet window. Do not print any value anywhere. "
+        "Cinder has no RENAME or COPY command, so a migration is a "
+        "read plus a write, not one atomic move: a key can change "
+        "between the read and the write, so verify the target "
+        "before deleting the source, and do not migrate keys that "
+        "are being written concurrently. This plan renames keys "
+        "within this cinder instance; moving keys to another server "
+        "needs the same steps run against that server, and this "
+        "server cannot check whether the target names exist there. "
+        "Do not run anything yourself: nothing in this plan has "
+        "changed the keyspace yet.",
+    ])
+    return {
+        "description": _prompt_def("key-migration")["description"],
         "messages": [
             {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
         ],

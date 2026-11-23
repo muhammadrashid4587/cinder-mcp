@@ -122,6 +122,7 @@ Fetchable with `resources/list` and `resources/read`.
 | `keyspace-health` | `pattern` (optional, defaults to `*`) | One-view health report: total keys, type breakdown, keys with no expiry, soonest-expiring keys, largest string keys (by bytes) and largest container keys (by element count), and a short list of recommended actions derived from the data. Scanned in bounded batches of 100 keys; each list keeps only its first 10 keys plus a count of the rest, so the prompt stays bounded on a huge keyspace |
 | `write-safety` | `plan` (required) | Audits a proposed write plan against the live keyspace before anything runs: `plan` is a JSON array of kv_batch-shaped ops (at most 50 audited). Each write op is probed live and given a verdict — safe, caution, or risky — flagging overwrites of keys that never expire, overwrites of large keys, SETs that would destroy a list, set, or hash, INCRs that would fail on a non-integer or a container, and EXPIREs with a bad timeout, and asks for a go/no-go per risky op plus the exact safe subset as one kv_batch call. Read ops in the plan are not audited; values are never printed. One honest limit: cinder keeps no per-key access counts, so a hot key cannot be told from a cold one — the audit flags size, permanence, and type instead of hotness |
 | `ttl-renewal` | `pattern` (optional, defaults to `*`), `keys` (optional, JSON array of exact key names, overrides `pattern`), `target_ttl` (optional, seconds, defaults to 86400), `max_keys` (optional, safety cap, defaults to 20, at most 100) | Plans TTL renewals: reads live TTLs, proposes one `kv_expire` renewal per key expiring sooner than the target TTL (soonest first) and a first expiry at the target TTL for keys with no expiry, flags keys already expired or missing and never proposes renewing them, and covers at most `max_keys` keys in total — the rest are counted as not covered. Values are never read or printed. One honest limit: renewals run as `kv_expire` (EXPIRE, whole seconds); there is no PEXPIRE tool, so sub-second precision is not available |
+| `key-migration` | `pattern` (optional, defaults to `*`), `target_prefix` (required), `max_keys` (optional, safety cap, defaults to 20, at most 100) | Plans migrating keys to a new prefix: audits each key's type, size, and TTL, checks whether the target name already exists and with what type, and lays out the ordered copy steps with the exact `kv_del` call for each source key — ready keys (free target), overwrite keys (target exists, same type), conflicts (target exists, different type), keys that map onto themselves, and keys that expired mid-scan. Values are never read or printed. One honest limit: cinder has no RENAME or COPY, so a migration is a read plus a write, not one atomic move — the plan says to verify the target before deleting the source, and to re-check the TTL with `kv_ttl` just before copying since the audited TTL ticks down |
 
 Fetchable with `prompts/list` and `prompts/get`.
 
@@ -147,14 +148,15 @@ requests return JSON-RPC errors.
 
 ## Streaming the keyspace
 
-`ttl-audit`, `cleanup-plan`, and `keyspace-health` scan the keyspace in bounded batches
+`ttl-audit`, `cleanup-plan`, `keyspace-health`, `ttl-renewal`, and
+`key-migration` scan the keyspace in bounded batches
 of 100 keys (`cinder_mcp/scan.py`), and `kv_keys_scan` exposes the
 same walk as a paged tool. The per-key work and the prompt text stay
 bounded: the prompts keep only counts plus the 10 soonest-expiring
 keys, the first 20 no-expiry keys, and the first 20 keys per cleanup
 section, with "... and N more" for the rest. The results are
 identical to the old load-everything scan at any batch size — the
-tests run the three scanning prompts at batch sizes 1, 2, 7 and 100 over the same
+tests run the scanning prompts at batch sizes 1, 2, 7 and 100 over the same
 keyspace and compare the full prompt text.
 
 One honest limitation: cinder has no `SCAN` command yet, so the
@@ -185,6 +187,7 @@ prompts.
 - ~~Keyspace-health prompt (`keyspace-health`): one-view health report — total keys, type breakdown, keys without TTL, soonest-expiring keys, largest string keys by bytes and largest containers by element count, plus a short list of recommended actions derived from the data, all scanned in bounded batches~~ (done, v0.18.0)
 - ~~Write-safety prompt (`write-safety`): audits a proposed write plan (a JSON list of kv_batch-shaped ops) against the live keyspace before it runs — overwrites of keys that never expire, overwrites of large keys, SETs that would destroy a container, INCRs that would fail, EXPIREs with a bad timeout — with a safe / caution / risky verdict per op and the exact safe subset as one kv_batch call; at most 50 ops audited, values never printed~~ (done, v0.19.0)
 - ~~TTL renewal prompt (`ttl-renewal`): plans renewing the TTLs of keys expiring sooner than a configurable target TTL (default 1 day) and giving a first expiry to keys with no expiry — live TTLs, soonest first, keys already expired or missing flagged and never proposed for renewal, at most `max_keys` keys covered (default 20, at most 100), values never read or printed~~ (done, v0.20.0)
+- ~~Key-migration prompt (`key-migration`): plans migrating keys matching a pattern to a new prefix — live type/size/TTL audit per key, target-name collision check (same-type overwrite vs different-type conflict vs maps-onto-itself), ordered copy steps with the exact `kv_del` call per source key, at most `max_keys` ready keys covered (default 20, at most 100), values never read or printed; honest limit stated in the prompt: cinder has no RENAME or COPY, so a migration is a read plus a write, not one atomic move~~ (done, v0.21.0)
 
 ## Next
 

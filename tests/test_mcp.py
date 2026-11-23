@@ -901,10 +901,10 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_all_seven_prompts(self):
+    def test_prompts_list_returns_all_eight_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 7)
+        self.assertEqual(len(prompts), 8)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
@@ -931,6 +931,14 @@ class McpTests(unittest.TestCase):
         self.assertTrue(
             all(not a["required"] for a in prompts[6]["arguments"])
         )
+        self.assertEqual(prompts[7]["name"], "key-migration")
+        self.assertEqual(
+            [a["name"] for a in prompts[7]["arguments"]],
+            ["pattern", "target_prefix", "max_keys"],
+        )
+        self.assertFalse(prompts[7]["arguments"][0]["required"])
+        self.assertTrue(prompts[7]["arguments"][1]["required"])
+        self.assertFalse(prompts[7]["arguments"][2]["required"])
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -1810,6 +1818,202 @@ class McpTests(unittest.TestCase):
         for size in (1, 2, 7):
             self.assertEqual(
                 self._renewal_text(batch_size=size), baseline,
+                "batch_size=%d" % size,
+            )
+
+    def _migration_text(self, arguments=None, batch_size=None):
+        return self._prompt_text("key-migration", arguments, batch_size)
+
+    def test_prompts_get_key_migration_empty_keyspace(self):
+        text = self._migration_text({"target_prefix": "new:"})
+        self.assertIn(
+            "Key migration plan (pattern '*' → prefix 'new:').", text)
+        self.assertIn("Total keys scanned: 0", text)
+        self.assertIn("Plan covers 0 ready key(s); 0 more ready keys", text)
+        self.assertIn("Ready (0)", text)
+        self.assertIn("Overwrite (0)", text)
+        self.assertIn("Conflict (0)", text)
+        self.assertIn("Maps onto itself (0)", text)
+        self.assertIn("Missing or expired (0)", text)
+        self.assertEqual(text.count("(none)"), 5)
+        self.assertIn("kv_del", text)
+        self.assertIn("no RENAME or COPY command", text)
+
+    def test_prompts_get_key_migration_classifies_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {
+                "key": "old:a", "value": "v", "ex": 3570},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {
+                "key": "old:big", "value": "x" * 2000},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "old:keep", "value": "v"},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "new:keep", "value": "w"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "old:clash", "value": "v"},
+        })
+        self.fake.store["new:clash"] = (["x"], None)
+        self.fake.store["old:todo"] = (["buy milk", "ship it"], None)
+        text = self._migration_text(
+            {"pattern": "old:*", "target_prefix": "new:"})
+        self.assertIn("Total keys scanned: 5", text)
+        self.assertIn("Plan covers 3 ready key(s); 0 more ready keys", text)
+        ready = self._section(text, "Ready (3)")
+        self.assertEqual(len(ready), 3)
+        self.assertIn(
+            "- old:a → new:a (string, 1 bytes, expires in 59m; delete "
+            "the source with kv_del 'old:a' after verifying the copy)",
+            ready)
+        self.assertIn(
+            "- old:big → new:big (string, 2000 bytes, no expiry, large "
+            "— copy one at a time; delete the source with kv_del "
+            "'old:big' after verifying the copy)",
+            ready)
+        self.assertIn(
+            "- old:todo → new:todo (list, 2 elements, no expiry; delete "
+            "the source with kv_del 'old:todo' after verifying the "
+            "copy)",
+            ready)
+        overwrite = self._section(text, "Overwrite (1)")
+        self.assertEqual(overwrite, [
+            "- old:keep → new:keep (source: string, 1 bytes, no expiry; "
+            "target exists: string, 1 bytes, no expiry)",
+        ])
+        conflict = self._section(text, "Conflict (1)")
+        self.assertEqual(conflict, [
+            "- old:clash → new:clash (source: string, 1 bytes, no "
+            "expiry; target exists: list, 1 elements, no expiry)",
+        ])
+        self.assertIn("Maps onto itself (0)", text)
+        self.assertIn("Missing or expired (0)", text)
+        # No key appears in two sections.
+        listed = ready + overwrite + conflict
+        self.assertEqual(len(listed), 5)
+        self.assertIn("Do not run anything yourself", text)
+        self.assertIn("re-check the source TTL with kv_ttl", text)
+
+    def test_prompts_get_key_migration_self_mapping(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "same:1", "value": "v"},
+        })
+        text = self._migration_text(
+            {"pattern": "same:*", "target_prefix": "same:"})
+        self.assertIn("Total keys scanned: 1", text)
+        self.assertIn("Plan covers 0 ready key(s)", text)
+        self_mapped = self._section(text, "Maps onto itself (1)")
+        self.assertEqual(self_mapped, [
+            "- same:1 → same:1 (string, 1 bytes, no expiry; the target "
+            "is the key itself)",
+        ])
+
+    def test_prompts_get_key_migration_rejects_bad_arguments(self):
+        for arguments in (
+            {},
+            {"target_prefix": ""},
+            {"target_prefix": "new:*"},
+            {"target_prefix": "new:?"},
+            {"target_prefix": "new:", "max_keys": "many"},
+            {"target_prefix": "new:", "max_keys": "0"},
+            {"target_prefix": "new:", "max_keys": "101"},
+        ):
+            reply = self._call("prompts/get", 1, {
+                "name": "key-migration", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_prompts_get_key_migration_max_keys_caps_the_plan(self):
+        for i in range(5):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "old:%d" % i, "value": "v"},
+            })
+        text = self._migration_text(
+            {"pattern": "old:*", "target_prefix": "new:", "max_keys": "2"})
+        self.assertIn("Plan covers 2 ready key(s); 3 more ready keys", text)
+        ready = self._section(text, "Ready (2)")
+        self.assertEqual(
+            [line.split(" ")[1] for line in ready[:2]],
+            ["old:0", "old:1"],
+        )
+        self.assertIn(
+            "... and 3 more ready keys not covered by the cap", ready)
+
+    def test_prompts_get_key_migration_never_prints_values(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "old:secret", "value": "hunter2-dont-print"},
+        })
+        text = self._migration_text(
+            {"pattern": "old:*", "target_prefix": "new:"})
+        self.assertNotIn("hunter2-dont-print", text)
+        self.assertIn("- old:secret → new:secret (string, 18 bytes", text)
+
+    def test_prompts_get_key_migration_reports_key_expired_mid_scan(self):
+        # A stub client whose KEYS reply includes a key that is
+        # already gone by the TTL probe: the real fake server can
+        # only expire a key between the two calls by timing, so the
+        # prompt is called directly with the expiry faked.
+        from cinder_mcp import prompts
+
+        class StubClient:
+            def command(self, *args):
+                if args[0] == "KEYS":
+                    return ["gone", "ok"]
+                if args[0] == "TTL":
+                    return -2 if args[1] == "gone" else -1
+                if args[0] == "GET":
+                    return "v"
+                if args[0] == "EXISTS":
+                    return 0
+                raise AssertionError(args)
+
+        result = prompts.get_prompt(
+            StubClient(), "key-migration", {"target_prefix": "new:"})
+        text = result["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 2", text)
+        self.assertIn("Plan covers 1 ready key(s)", text)
+        missing = self._section(text, "Missing or expired (1)")
+        self.assertEqual(missing, ["- gone"])
+        ready = self._section(text, "Ready (1)")
+        self.assertEqual(len(ready), 1)
+        self.assertTrue(ready[0].startswith("- ok → new:ok (string, 1 bytes"))
+
+    def test_prompts_key_migration_same_result_at_any_batch_size(self):
+        # TTLs sit mid-rendering-unit, so a second of clock drift
+        # between runs cannot reorder or reword anything.
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "perm:%03d" % i, "value": "v"},
+            })
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "exp:%03d" % i, "value": "v",
+                              "ex": 100000 + i * 1000},
+            })
+        for i in range(10):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "soon:%03d" % i, "value": "v",
+                              "ex": 1930 + i * 10},
+            })
+        baseline = self._migration_text(
+            {"target_prefix": "new:"}, batch_size=100)
+        self.assertIn("Total keys scanned: 70", baseline)
+        self.assertIn("Plan covers 20 ready key(s); 50 more ready keys",
+                      baseline)
+        for size in (1, 2, 7):
+            self.assertEqual(
+                self._migration_text({"target_prefix": "new:"},
+                                     batch_size=size),
+                baseline,
                 "batch_size=%d" % size,
             )
 
