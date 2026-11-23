@@ -90,6 +90,33 @@ TOOLS = [
 ]
 
 
+def _format_ms(ms):
+    """A budget threshold as short text: 100, not 100.0; 0.002 as-is."""
+    return str(int(ms)) if float(ms).is_integer() else "%.3f" % ms
+
+
+def tools_with_budgets(metrics):
+    """The tool list for tools/list, with each tool's latency budget
+    advertised in its description, so a client sees the budget before
+    calling instead of discovering it from a warning. Budgets come
+    from the given metrics object, so per-tool env overrides are
+    honoured. The TOOLS definitions themselves are not mutated."""
+    listed = []
+    for tool in TOOLS:
+        warn_ms, slow_ms = metrics.budget_for(tool["name"])
+        advertised = dict(tool)
+        advertised["description"] = (
+            "%s Latency budget: warn >%sms, slow >%sms."
+            % (
+                tool["description"],
+                _format_ms(warn_ms),
+                _format_ms(slow_ms),
+            )
+        )
+        listed.append(advertised)
+    return listed
+
+
 def _require(args, field):
     if field not in args or args[field] is None:
         raise ValueError("missing required argument: %s" % field)

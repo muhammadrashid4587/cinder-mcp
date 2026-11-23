@@ -19,10 +19,10 @@ from .metrics import DEFAULT_SLOW_MS, DEFAULT_WARN_MS, ToolMetrics
 from .resp import ConnectionError, RespClient, RespError
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, read_resource
-from .tools import TOOLS, call_tool
+from .tools import call_tool, tools_with_budgets
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -52,7 +52,9 @@ class MCPServer:
             elif method == "ping":
                 response = self._result(msg_id, {})
             elif method == "tools/list":
-                response = self._result(msg_id, {"tools": TOOLS})
+                response = self._result(
+                    msg_id, {"tools": tools_with_budgets(self.metrics)}
+                )
             elif method == "tools/call":
                 response = self._result(msg_id, self._tools_call(params))
             elif method == "resources/list":

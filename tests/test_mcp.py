@@ -245,6 +245,42 @@ class McpTests(unittest.TestCase):
                     "kv_exists", "kv_expire"]
         )
 
+    def test_tools_list_advertises_default_budgets(self):
+        listed = self._call("tools/list", 2)
+        for tool in listed["result"]["tools"]:
+            self.assertTrue(
+                tool["description"].endswith(
+                    " Latency budget: warn >100ms, slow >500ms."
+                ),
+                tool["name"],
+            )
+        # tools/list must not rewrite the shared TOOLS definitions.
+        from cinder_mcp.tools import TOOLS
+        self.assertNotIn("Latency budget", TOOLS[0]["description"])
+
+    def test_tools_list_advertises_per_tool_overrides(self):
+        from cinder_mcp.metrics import ToolMetrics
+        server = MCPServer(
+            RespClient("127.0.0.1", self.fake.port),
+            metrics=ToolMetrics(
+                budgets={"kv_keys": {"warn_ms": 250, "slow_ms": 1000}}
+            ),
+        )
+        listed = server.handle_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        by_name = {t["name"]: t for t in listed["result"]["tools"]}
+        self.assertTrue(
+            by_name["kv_keys"]["description"].endswith(
+                " Latency budget: warn >250ms, slow >1000ms."
+            )
+        )
+        self.assertTrue(
+            by_name["kv_get"]["description"].endswith(
+                " Latency budget: warn >100ms, slow >500ms."
+            )
+        )
+
     def test_tools_call_set_then_get(self):
         set_reply = self._call("tools/call", 1, {
             "name": "kv_set", "arguments": {"key": "hello", "value": "world"},
