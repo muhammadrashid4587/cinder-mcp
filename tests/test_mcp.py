@@ -305,14 +305,16 @@ class McpTests(unittest.TestCase):
         remaining = int(ttl["result"]["content"][0]["text"])
         self.assertTrue(0 < remaining <= 3600)
 
-    def test_resources_list_returns_info_and_key_template(self):
+    def test_resources_list_returns_info_metrics_and_key_template(self):
         listed = self._call("resources/list", 1)
         resources = listed["result"]["resources"]
-        self.assertEqual(len(resources), 2)
+        self.assertEqual(len(resources), 3)
         self.assertEqual(resources[0]["uri"], "cinder://info")
         self.assertEqual(resources[0]["mimeType"], "text/plain")
-        self.assertEqual(resources[1]["uriTemplate"], "cinder://key/{key}")
+        self.assertEqual(resources[1]["uri"], "cinder://metrics")
         self.assertEqual(resources[1]["mimeType"], "application/json")
+        self.assertEqual(resources[2]["uriTemplate"], "cinder://key/{key}")
+        self.assertEqual(resources[2]["mimeType"], "application/json")
 
     def test_resources_read_key_string_returns_value_and_type(self):
         self._call("tools/call", 1, {
@@ -704,6 +706,83 @@ class McpTests(unittest.TestCase):
         self.assertIn("- user:1 (string, 1 bytes, expires in ", text)
         self.assertNotIn("cache:x", text)
 
+    def test_metrics_resource_records_tool_calls(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "b", "value": "2"},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_get", "arguments": {"key": "a"},
+        })
+        reply = self._call("resources/read", 4, {"uri": "cinder://metrics"})
+        contents = reply["result"]["contents"]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0]["uri"], "cinder://metrics")
+        self.assertEqual(contents[0]["mimeType"], "application/json")
+        data = json.loads(contents[0]["text"])
+        self.assertEqual(data["total_calls"], 3)
+        self.assertEqual(data["total_errors"], 0)
+        self.assertEqual(data["tools"]["kv_set"]["calls"], 2)
+        self.assertEqual(data["tools"]["kv_set"]["errors"], 0)
+        self.assertEqual(data["tools"]["kv_get"]["calls"], 1)
+        for stats in data["tools"].values():
+            self.assertGreaterEqual(stats["mean_ms"], 0)
+            self.assertGreaterEqual(stats["p50_ms"], 0)
+            self.assertGreaterEqual(stats["p95_ms"], 0)
+            self.assertGreaterEqual(stats["p95_ms"], stats["p50_ms"])
+
+    def test_metrics_resource_counts_failed_calls(self):
+        # Unknown tool: invalid params, recorded as an error.
+        reply = self._call("tools/call", 1, {"name": "nope"})
+        self.assertIn("error", reply)
+        # A cinder-side error (negative EXPIRE) also counts as an error.
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "temp", "value": "v"},
+        })
+        reply = self._call("tools/call", 3, {
+            "name": "kv_expire", "arguments": {"key": "temp", "seconds": -5},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        data = json.loads(
+            self._call("resources/read", 4, {"uri": "cinder://metrics"})
+            ["result"]["contents"][0]["text"]
+        )
+        self.assertEqual(data["total_calls"], 3)
+        self.assertEqual(data["total_errors"], 2)
+        self.assertEqual(data["tools"]["nope"]["calls"], 1)
+        self.assertEqual(data["tools"]["nope"]["errors"], 1)
+        self.assertGreaterEqual(data["tools"]["nope"]["mean_ms"], 0)
+        self.assertEqual(data["tools"]["kv_expire"]["calls"], 1)
+        self.assertEqual(data["tools"]["kv_expire"]["errors"], 1)
+        self.assertEqual(data["tools"]["kv_set"]["errors"], 0)
+
+    def test_metrics_resource_empty_session(self):
+        data = json.loads(
+            self._call("resources/read", 1, {"uri": "cinder://metrics"})
+            ["result"]["contents"][0]["text"]
+        )
+        self.assertEqual(data, {"tools": {}, "total_calls": 0, "total_errors": 0})
+
+    def test_info_resource_includes_metrics_section(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        reply = self._call("resources/read", 2, {"uri": "cinder://info"})
+        text = reply["result"]["contents"][0]["text"]
+        self.assertIn("cinder_version:0.4.0", text)
+        self.assertIn("# Tool metrics (cinder-mcp, this session)", text)
+        self.assertIn("tool:kv_set calls:1 errors:0", text)
+        self.assertRegex(text, r"mean_ms:\d+\.\d{3} p50_ms:\d+\.\d{3} p95_ms:\d+\.\d{3}")
+
+    def test_info_resource_empty_session_reports_no_calls(self):
+        reply = self._call("resources/read", 1, {"uri": "cinder://info"})
+        text = reply["result"]["contents"][0]["text"]
+        self.assertIn("# Tool metrics (cinder-mcp, this session)", text)
+        self.assertIn("(no tool calls yet)", text)
+
     def test_resources_read_unknown_uri_returns_error(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://nope"})
         self.assertIn("error", reply)
@@ -733,6 +812,59 @@ class McpTests(unittest.TestCase):
         out = io.StringIO()
         serve(self.server, io.StringIO("{not json\n"), out)
         self.assertEqual(json.loads(out.getvalue())["error"]["code"], -32700)
+
+
+class MetricsTests(unittest.TestCase):
+    def test_percentiles_use_nearest_rank(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        for ms in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+            metrics.record("kv_get", ms)
+        stats = metrics.snapshot()["tools"]["kv_get"]
+        self.assertEqual(stats["calls"], 10)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual(stats["mean_ms"], 5.5)
+        self.assertEqual(stats["p50_ms"], 5)   # 5th of 10
+        self.assertEqual(stats["p95_ms"], 10)  # 10th of 10
+
+    def test_single_sample_percentiles_equal_the_sample(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        metrics.record("kv_set", 2.5)
+        stats = metrics.snapshot()["tools"]["kv_set"]
+        self.assertEqual(stats["mean_ms"], 2.5)
+        self.assertEqual(stats["p50_ms"], 2.5)
+        self.assertEqual(stats["p95_ms"], 2.5)
+
+    def test_errors_do_not_count_as_calls_lost(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        metrics.record("kv_get", 1.0, ok=True)
+        metrics.record("kv_get", 3.0, ok=False)
+        snapshot = metrics.snapshot()
+        self.assertEqual(snapshot["total_calls"], 2)
+        self.assertEqual(snapshot["total_errors"], 1)
+        self.assertEqual(snapshot["tools"]["kv_get"]["errors"], 1)
+        self.assertEqual(snapshot["tools"]["kv_get"]["mean_ms"], 2.0)
+
+    def test_samples_capped_per_tool(self):
+        from cinder_mcp.metrics import MAX_SAMPLES_PER_TOOL, ToolMetrics
+        metrics = ToolMetrics()
+        for i in range(MAX_SAMPLES_PER_TOOL + 5):
+            metrics.record("kv_get", float(i))
+        entry = metrics._tools["kv_get"]
+        self.assertEqual(len(entry["latencies_ms"]), MAX_SAMPLES_PER_TOOL)
+        # Oldest samples dropped: the smallest kept latency is 5.
+        self.assertEqual(min(entry["latencies_ms"]), 5.0)
+        self.assertEqual(entry["calls"], MAX_SAMPLES_PER_TOOL + 5)
+
+    def test_empty_snapshot(self):
+        from cinder_mcp.metrics import ToolMetrics
+        self.assertEqual(
+            ToolMetrics().snapshot(),
+            {"tools": {}, "total_calls": 0, "total_errors": 0},
+        )
+        self.assertIn("(no tool calls yet)", ToolMetrics().render_text())
 
 
 if __name__ == "__main__":

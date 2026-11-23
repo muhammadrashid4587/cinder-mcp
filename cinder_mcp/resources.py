@@ -14,9 +14,11 @@ the type. A missing key is a not-found error, not an empty resource.
 import json
 from urllib.parse import unquote
 
+from .metrics import ToolMetrics
 from .resp import RespError
 
 INFO_URI = "cinder://info"
+METRICS_URI = "cinder://metrics"
 KEY_URI_PREFIX = "cinder://key/"
 
 RESOURCES = [
@@ -25,9 +27,19 @@ RESOURCES = [
         "name": "Server info",
         "description": (
             "Cinder server info: version, uptime, commands processed, "
-            "key count, and AOF fsync policy."
+            "key count, and AOF fsync policy. Appends this server's "
+            "per-tool latency metrics for the current session."
         ),
         "mimeType": "text/plain",
+    },
+    {
+        "uri": METRICS_URI,
+        "name": "Tool metrics",
+        "description": (
+            "Per-tool call counts, error counts and mean/p50/p95 "
+            "latency in milliseconds for this server session, as JSON."
+        ),
+        "mimeType": "application/json",
     },
     {
         "uriTemplate": KEY_URI_PREFIX + "{key}",
@@ -41,14 +53,25 @@ RESOURCES = [
 ]
 
 
-def read_resource(client, uri):
+def read_resource(client, uri, metrics=None):
     """Read one resource from cinder. Returns a content dict with uri,
     mimeType and text, as the MCP spec requires for resources/read."""
     if uri == INFO_URI:
         text = client.command("INFO")
         if text is None:
             raise ValueError("cinder returned no INFO output")
+        if metrics is None:
+            metrics = ToolMetrics()
+        text = text.rstrip("\r\n") + "\r\n" + metrics.render_text() + "\r\n"
         return {"uri": uri, "mimeType": "text/plain", "text": text}
+    if uri == METRICS_URI:
+        if metrics is None:
+            metrics = ToolMetrics()
+        return {
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": json.dumps(metrics.snapshot()),
+        }
     if uri.startswith(KEY_URI_PREFIX):
         return _read_key_resource(client, uri)
     raise ValueError("unknown resource: %s" % uri)

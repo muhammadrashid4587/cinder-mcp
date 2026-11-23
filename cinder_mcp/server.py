@@ -13,14 +13,16 @@ import argparse
 import json
 import os
 import sys
+import time
 
+from .metrics import ToolMetrics
 from .resp import ConnectionError, RespClient, RespError
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, read_resource
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -28,8 +30,9 @@ PROTOCOL_VERSION = "2024-11-05"
 
 
 class MCPServer:
-    def __init__(self, client):
+    def __init__(self, client, metrics=None):
         self.client = client
+        self.metrics = metrics if metrics is not None else ToolMetrics()
 
     def handle_message(self, message):
         """Handle one decoded JSON-RPC message. Returns the response dict,
@@ -82,14 +85,20 @@ class MCPServer:
         name = params.get("name")
         if not isinstance(name, str):
             raise ValueError("tools/call requires a tool name")
-        result = call_tool(self.client, name, params.get("arguments") or {})
+        started = time.monotonic()
+        try:
+            result = call_tool(self.client, name, params.get("arguments") or {})
+        except Exception:
+            self.metrics.record(name, (time.monotonic() - started) * 1000, ok=False)
+            raise
+        self.metrics.record(name, (time.monotonic() - started) * 1000, ok=True)
         return {"content": [{"type": "text", "text": _render(result)}]}
 
     def _resources_read(self, params):
         uri = params.get("uri")
         if not isinstance(uri, str):
             raise ValueError("resources/read requires a resource uri")
-        return {"contents": [read_resource(self.client, uri)]}
+        return {"contents": [read_resource(self.client, uri, self.metrics)]}
 
     def _prompts_get(self, params):
         name = params.get("name")

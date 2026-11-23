@@ -50,7 +50,8 @@ Wire it into an MCP client as a stdio server with the command
 
 | URI | Cinder command | Notes |
 | --- | --- | --- |
-| `cinder://info` | `INFO` | Server version, uptime, commands processed, key count |
+| `cinder://info` | `INFO` | Server version, uptime, commands processed, key count, plus this server's per-tool latency metrics for the current session |
+| `cinder://metrics` | — | Per-tool call counts, error counts and mean/p50/p95 latency in milliseconds for this server session, as JSON. Metrics are recorded in memory by the server itself (every `tools/call`, success or failure); nothing is stored in cinder. |
 | `cinder://key/<key>` | `EXISTS` + `GET` / `LLEN` / `SCARD` / `HLEN` | Value and type as JSON; not-found error for missing keys. Non-string values report their type and length instead of a value (cinder has no `TYPE` command, so the type is probed) |
 
 Fetchable with `resources/list` and `resources/read`.
@@ -94,3 +95,8 @@ requests return JSON-RPC errors.
 - ~~Per-key deep-dive prompt (`key-deep-dive`: type, TTL, size, sample value, related keys)~~ (done, v0.6.0)
 - ~~TTL audit prompt (`ttl-audit`: TTL buckets, soonest-expiring keys, keys with no expiry)~~ (done, v0.7.0)
 - ~~Cleanup-plan prompt (`cleanup-plan`: per-key TTL/type/size sampling, safe / expiring-soon / risky-confirm / keep classification, concrete plan with exact `kv_del` calls)~~ (done, v0.8.0)
+- ~~Per-tool latency metrics (call count, mean/p50/p95 latency, error count in memory; exposed in `cinder://info` and as a `cinder://metrics` resource)~~ (done, v0.9.0)
+
+## Next
+
+- Latency budgets: per-tool warn/slow thresholds on `cinder://metrics`, so a slow tool is flagged instead of just measured
