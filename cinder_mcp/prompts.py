@@ -1224,8 +1224,9 @@ def _ttl_renewal(client, arguments):
     covered, so the prompt text stays bounded however large the
     keyspace is. Values are never read and never printed: only
     TTLs are probed. One honest limit: renewals run as kv_expire
-    (EXPIRE, whole seconds) — there is no PEXPIRE tool, so
-    sub-second precision is not available."""
+    (EXPIRE, whole seconds); kv_pexpire exists for sub-second
+    precision when a key needs it, but this plan stays in whole
+    seconds."""
     pattern = arguments.get("pattern", "*")
     target_ttl = _parse_positive_int(
         arguments.get("target_ttl"), "target_ttl",
@@ -1373,8 +1374,9 @@ def _ttl_renewal(client, arguments):
         "because it has none — and leave out any key you would not "
         "renew. Do not renew the missing or expired keys: they are "
         "gone, and kv_expire on them would be a no-op. Renewals "
-        "run as kv_expire (EXPIRE, whole seconds); there is no "
-        "PEXPIRE tool, so sub-second precision is not available. "
+        "run as kv_expire (EXPIRE, whole seconds); kv_pexpire "
+        "exists for sub-second precision when a key needs it, but "
+        "this plan stays in whole seconds. "
         "Do not run anything yourself: nothing in this plan has "
         "changed the keyspace yet.",
     ])

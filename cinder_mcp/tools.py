@@ -92,6 +92,15 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_pttl",
+        "description": "Milliseconds until a key expires. -1 means no expiry, -2 means the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_exists",
         "description": "Check whether a key exists. Returns 1 if the key exists, 0 otherwise.",
         "inputSchema": {
@@ -110,6 +119,18 @@ TOOLS = [
                 "seconds": {"type": "integer"},
             },
             "required": ["key", "seconds"],
+        },
+    },
+    {
+        "name": "kv_pexpire",
+        "description": "Set a key to expire after a number of milliseconds. Returns 1 if the timeout was set, 0 if the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "milliseconds": {"type": "integer"},
+            },
+            "required": ["key", "milliseconds"],
         },
     },
     {
@@ -280,7 +301,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists, kv_expire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem or kv_zincrby plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem or kv_zincrby plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -379,7 +400,7 @@ def call_tool(client, name, args):
 # the summary).
 BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
-    "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+    "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
     "kv_hset", "kv_hget", "kv_hgetall",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
@@ -450,7 +471,7 @@ def _call_batch(client, args):
 # not kv_batch itself.
 ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
-    "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+    "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
     "kv_hset", "kv_hget", "kv_hgetall",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
@@ -694,10 +715,22 @@ def _op_argv(name, args):
         return ["INCRBY", _require(args, "key"), by]
     if name == "kv_ttl":
         return ["TTL", _require(args, "key")]
+    if name == "kv_pttl":
+        return ["PTTL", _require(args, "key")]
     if name == "kv_exists":
         return ["EXISTS", _require(args, "key")]
     if name == "kv_expire":
         return ["EXPIRE", _require(args, "key"), _require(args, "seconds")]
+    if name == "kv_pexpire":
+        milliseconds = _require(args, "milliseconds")
+        if isinstance(milliseconds, bool) or not isinstance(milliseconds, int):
+            raise ValueError("kv_pexpire milliseconds must be an integer")
+        if milliseconds < 0:
+            raise ValueError(
+                "kv_pexpire milliseconds must be 0 or more, got %d"
+                % milliseconds
+            )
+        return ["PEXPIRE", _require(args, "key"), milliseconds]
     if name == "kv_hset":
         return ["HSET", _require(args, "key")] + _hset_field_args(args)
     if name == "kv_hget":

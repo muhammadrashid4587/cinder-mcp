@@ -1,7 +1,7 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
+GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, LLEN, SCARD, HLEN,
 ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
@@ -561,6 +561,14 @@ class FakeCinder(threading.Thread):
             elif entry[1] is None:
                 return ":-1\r\n"
             return ":%d\r\n" % int(entry[1] - time.time())
+        elif name == "PTTL" and len(args) == 1:
+            entry = self.store.get(args[0])
+            if entry is None or (entry[1] is not None and entry[1] <= time.time()):
+                self.store.pop(args[0], None)
+                return ":-2\r\n"
+            elif entry[1] is None:
+                return ":-1\r\n"
+            return ":%d\r\n" % int((entry[1] - time.time()) * 1000)
         elif name == "EXISTS":
             n = sum(1 for k in args if self._get(k) is not None)
             return ":%d\r\n" % n
@@ -575,6 +583,18 @@ class FakeCinder(threading.Thread):
                 return ":0\r\n"
             value, _ = self.store[args[0]]
             self.store[args[0]] = (value, time.time() + seconds)
+            return ":1\r\n"
+        elif name == "PEXPIRE" and len(args) == 2:
+            try:
+                milliseconds = int(args[1])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            if milliseconds < 0:
+                return "-ERR invalid expire time in 'expire' command\r\n"
+            elif self._get(args[0]) is None:
+                return ":0\r\n"
+            value, _ = self.store[args[0]]
+            self.store[args[0]] = (value, time.time() + milliseconds / 1000.0)
             return ":1\r\n"
         elif name == "INFO":
             info = (
@@ -642,7 +662,8 @@ class McpTests(unittest.TestCase):
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
-                    "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+                    "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire",
+                    "kv_pexpire",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
                     "kv_zcard",
@@ -1236,6 +1257,84 @@ class McpTests(unittest.TestCase):
         })
         remaining = int(ttl["result"]["content"][0]["text"])
         self.assertTrue(0 < remaining <= 3600)
+
+    def test_tools_call_pexpire_and_pttl(self):
+        missing_pttl = self._call("tools/call", 1, {
+            "name": "kv_pttl", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing_pttl["result"]["content"][0]["text"], "-2")
+        missing_pexpire = self._call("tools/call", 2, {
+            "name": "kv_pexpire",
+            "arguments": {"key": "ghost", "milliseconds": 60000},
+        })
+        self.assertEqual(missing_pexpire["result"]["content"][0]["text"], "0")
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "temp", "value": "v"},
+        })
+        no_expiry = self._call("tools/call", 4, {
+            "name": "kv_pttl", "arguments": {"key": "temp"},
+        })
+        self.assertEqual(no_expiry["result"]["content"][0]["text"], "-1")
+        set_expiry = self._call("tools/call", 5, {
+            "name": "kv_pexpire",
+            "arguments": {"key": "temp", "milliseconds": 60000},
+        })
+        self.assertEqual(set_expiry["result"]["content"][0]["text"], "1")
+        pttl = self._call("tools/call", 6, {
+            "name": "kv_pttl", "arguments": {"key": "temp"},
+        })
+        remaining = int(pttl["result"]["content"][0]["text"])
+        self.assertTrue(0 < remaining <= 60000)
+
+    def test_tools_call_pexpire_rejects_bad_arguments(self):
+        for bad in ({"key": "temp"},
+                    {"key": "temp", "milliseconds": -5},
+                    {"key": "temp", "milliseconds": "60000"},
+                    {"key": "temp", "milliseconds": True},
+                    {"milliseconds": 60000}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_pexpire", "arguments": bad,
+            })
+            self.assertIn("error", reply)
+        missing_key = self._call("tools/call", 2, {
+            "name": "kv_pttl", "arguments": {},
+        })
+        self.assertIn("error", missing_key)
+
+    def test_tools_call_pexpire_pttl_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_set", "key": "b:temp", "value": "v"},
+                {"op": "kv_pexpire", "key": "b:temp", "milliseconds": 60000},
+                {"op": "kv_pttl", "key": "b:temp"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertTrue(0 < summary["results"][2]["result"] <= 60000)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pexpire", "key": "b:temp", "milliseconds": 30000},
+                {"op": "kv_pttl", "key": "b:temp"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertTrue(0 < summary["results"][1]["result"] <= 30000)
+        # A bad milliseconds value fails an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pexpire", "key": "b:temp", "milliseconds": -5},
+            ]},
+        })
+        self.assertIn("error", bad)
 
     def test_tools_call_hash_set_get_getall(self):
         added = self._call("tools/call", 1, {
@@ -3097,7 +3196,7 @@ class McpTests(unittest.TestCase):
         self.assertTrue(already[0].startswith("- far (expires in 2d 7h)"))
         self.assertIn("Missing or expired (0)", text)
         self.assertIn("Do not renew the missing or expired keys", text)
-        self.assertIn("no PEXPIRE tool", text)
+        self.assertIn("kv_pexpire exists for sub-second precision", text)
 
     def test_prompts_get_ttl_renewal_target_ttl_argument(self):
         self._call("tools/call", 1, {
