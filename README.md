@@ -54,6 +54,12 @@ listing the tools currently over each threshold. A misconfigured
 budget (non-numeric, non-positive, or slow at or below warn) fails
 the server at startup instead of running with nonsense thresholds.
 
+A single call that crosses its own budget is also flagged inline, in
+the moment: the `tools/call` result carries a `warning` field with
+the level (`warn` or `slow`), the tool, the measured latency and the
+threshold it crossed, so the client sees it without polling
+`cinder://metrics`. Calls within budget carry no `warning` field.
+
 ## Tools
 
 | Tool | Cinder command | Notes |
@@ -118,7 +124,8 @@ requests return JSON-RPC errors.
 - ~~Cleanup-plan prompt (`cleanup-plan`: per-key TTL/type/size sampling, safe / expiring-soon / risky-confirm / keep classification, concrete plan with exact `kv_del` calls)~~ (done, v0.8.0)
 - ~~Per-tool latency metrics (call count, mean/p50/p95 latency, error count in memory; exposed in `cinder://info` and as a `cinder://metrics` resource)~~ (done, v0.9.0)
 - ~~Latency budgets: per-tool warn/slow thresholds on `cinder://metrics`, so a slow tool is flagged instead of just measured~~ (done, v0.10.0)
+- ~~Slow-tool warning in `tools/call`: a `warning` field in the tool result when a call crosses its warn or slow latency budget, so the agent sees it in the moment instead of only in `cinder://metrics`~~ (done, v0.11.0)
 
 ## Next
 
-- Slow-tool warning in `tools/call`: include a warning in the tool result when a call crosses its slow budget, so the agent sees it in the moment instead of only in `cinder://metrics`
+- Advertise budgets in `tools/list`: include each tool's warn/slow latency budget in its tool description, so clients know the budgets up front instead of discovering them from a warning

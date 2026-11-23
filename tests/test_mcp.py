@@ -259,6 +259,48 @@ class McpTests(unittest.TestCase):
         })
         self.assertEqual(missing["result"]["content"][0]["text"], "null")
 
+    def test_tools_call_fast_call_has_no_warning(self):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        self.assertEqual(reply["result"]["content"][0]["text"], "OK")
+        self.assertNotIn("warning", reply["result"])
+
+    def test_tools_call_slow_call_includes_warning(self):
+        # Tiny budgets, so any real round trip breaches slow.
+        from cinder_mcp.metrics import ToolMetrics
+        server = MCPServer(
+            RespClient("127.0.0.1", self.fake.port),
+            metrics=ToolMetrics(default_warn_ms=0.001, default_slow_ms=0.002),
+        )
+        reply = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                       "params": {"name": "kv_set", "arguments": {"key": "a", "value": "1"}}})
+        self.assertEqual(reply["result"]["content"][0]["text"], "OK")
+        warning = reply["result"]["warning"]
+        self.assertEqual(warning["level"], "slow")
+        self.assertEqual(warning["tool"], "kv_set")
+        self.assertEqual(warning["threshold_ms"], 0.002)
+        self.assertGreater(warning["latency_ms"], 0.002)
+        self.assertIn("kv_set took", warning["message"])
+        self.assertIn("slow budget of 0.002 ms", warning["message"])
+
+    def test_tools_call_warn_call_includes_warn_warning(self):
+        # Warn threshold crossed but slow threshold effectively unreachable.
+        from cinder_mcp.metrics import ToolMetrics
+        server = MCPServer(
+            RespClient("127.0.0.1", self.fake.port),
+            metrics=ToolMetrics(default_warn_ms=0.001, default_slow_ms=10 ** 9),
+        )
+        reply = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                       "params": {"name": "kv_get", "arguments": {"key": "x"}}})
+        self.assertEqual(reply["result"]["content"][0]["text"], "null")
+        warning = reply["result"]["warning"]
+        self.assertEqual(warning["level"], "warn")
+        self.assertEqual(warning["tool"], "kv_get")
+        self.assertEqual(warning["threshold_ms"], 0.001)
+        self.assertGreater(warning["latency_ms"], 0.001)
+        self.assertIn("warn budget of 0.001 ms", warning["message"])
+
     def test_tools_call_incr_ttl_and_keys(self):
         self._call("tools/call", 1, {
             "name": "kv_incr", "arguments": {"key": "n", "by": 5},
@@ -901,6 +943,38 @@ class MetricsTests(unittest.TestCase):
 
 
 class BudgetTests(unittest.TestCase):
+    def test_classify_returns_warning_levels(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        # Within budget: no warning.
+        self.assertIsNone(metrics.classify("kv_get", 50.0))
+        # Exactly at the warn threshold: not over, so no warning.
+        self.assertIsNone(metrics.classify("kv_get", 100.0))
+        # Over warn, under slow.
+        warn = metrics.classify("kv_get", 150.0)
+        self.assertEqual(warn, {
+            "level": "warn",
+            "tool": "kv_get",
+            "latency_ms": 150.0,
+            "threshold_ms": 100.0,
+            "message": "kv_get took 150.000 ms, over its warn budget of 100.000 ms",
+        })
+        # Over slow.
+        slow = metrics.classify("kv_get", 600.0)
+        self.assertEqual(slow["level"], "slow")
+        self.assertEqual(slow["threshold_ms"], 500.0)
+        self.assertEqual(
+            slow["message"],
+            "kv_get took 600.000 ms, over its slow budget of 500.000 ms",
+        )
+        # Per-tool override thresholds apply.
+        metrics.set_budget("kv_keys", 10, 20)
+        self.assertEqual(
+            metrics.classify("kv_keys", 15.0)["level"], "warn")
+        self.assertEqual(
+            metrics.classify("kv_keys", 25.0)["level"], "slow")
+        self.assertIsNone(metrics.classify("kv_keys", 5.0))
+
     def test_default_budget_in_snapshot(self):
         from cinder_mcp.metrics import ToolMetrics
         metrics = ToolMetrics()

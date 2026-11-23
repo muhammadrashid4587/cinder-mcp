@@ -114,6 +114,31 @@ class ToolMetrics:
             return STATUS_WARN
         return STATUS_OK
 
+    def classify(self, name, latency_ms):
+        """The latency warning for one completed call, or None.
+
+        A call over the slow threshold is "slow", over warn (but not
+        slow) is "warn"; a call at or under warn gets no warning. The
+        warning carries the level, the tool, the measured latency and
+        the threshold it crossed, so a tools/call result can surface
+        it inline instead of only in cinder://metrics.
+        """
+        warn_ms, slow_ms = self.budget_for(name)
+        if latency_ms > slow_ms:
+            level, threshold = STATUS_SLOW, slow_ms
+        elif latency_ms > warn_ms:
+            level, threshold = STATUS_WARN, warn_ms
+        else:
+            return None
+        return {
+            "level": level,
+            "tool": name,
+            "latency_ms": round(latency_ms, 3),
+            "threshold_ms": round(threshold, 3),
+            "message": "%s took %.3f ms, over its %s budget of %.3f ms"
+            % (name, latency_ms, level, threshold),
+        }
+
     def snapshot(self):
         """Per-tool stats as plain data: calls, errors, mean/p50/p95 ms,
         the tool's latency budget, its warn/slow status, and how many

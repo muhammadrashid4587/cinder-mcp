@@ -22,7 +22,7 @@ from .resources import RESOURCES, read_resource
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.10.0"
+SERVER_VERSION = "0.11.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -91,8 +91,15 @@ class MCPServer:
         except Exception:
             self.metrics.record(name, (time.monotonic() - started) * 1000, ok=False)
             raise
-        self.metrics.record(name, (time.monotonic() - started) * 1000, ok=True)
-        return {"content": [{"type": "text", "text": _render(result)}]}
+        latency_ms = (time.monotonic() - started) * 1000
+        self.metrics.record(name, latency_ms, ok=True)
+        response = {"content": [{"type": "text", "text": _render(result)}]}
+        # A call that crossed its latency budget says so inline, in the
+        # moment, instead of only showing up later in cinder://metrics.
+        warning = self.metrics.classify(name, latency_ms)
+        if warning is not None:
+            response["warning"] = warning
+        return response
 
     def _resources_read(self, params):
         uri = params.get("uri")
