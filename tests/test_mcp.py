@@ -3,7 +3,7 @@
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
 ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
-MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -412,6 +412,91 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     flat.append(repr(value.members[member]))
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name in ("ZRANGEBYSCORE", "ZREVRANGEBYSCORE") and len(args) >= 3:
+            # ZREVRANGEBYSCORE takes its bounds max-first, as in
+            # cinder; the bound parsing, WITHSCORES and LIMIT handling
+            # are otherwise the same as ZRANGEBYSCORE.
+            reverse = name == "ZREVRANGEBYSCORE"
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+
+            def parse_bound(text):
+                # Returns (score, exclusive), or None when the bound
+                # is not a number: an optional leading '(' makes it
+                # exclusive, the rest is a plain double ("-inf",
+                # "+inf", "inf" included), NaN rejected.
+                excl = False
+                if text.startswith("("):
+                    excl = True
+                    text = text[1:]
+                if not text:
+                    return None
+                try:
+                    score = float(text)
+                except ValueError:
+                    return None
+                if score != score:
+                    return None
+                return score, excl
+
+            if reverse:
+                parsed_max = parse_bound(args[1])
+                parsed_min = parse_bound(args[2])
+            else:
+                parsed_min = parse_bound(args[1])
+                parsed_max = parse_bound(args[2])
+            if parsed_min is None or parsed_max is None:
+                return "-ERR value is not a valid float\r\n"
+            lo, lo_excl = parsed_min
+            hi, hi_excl = parsed_max
+            withscores = False
+            offset, count = 0, -1
+            i = 3
+            seen_limit = False
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "WITHSCORES":
+                    withscores = True
+                    i += 1
+                elif opt == "LIMIT":
+                    if seen_limit or i + 2 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        offset, count = int(args[i + 1]), int(args[i + 2])
+                    except ValueError:
+                        return "-ERR syntax error\r\n"
+                    if offset < 0:
+                        return "-ERR syntax error\r\n"
+                    seen_limit = True
+                    i += 3
+                else:
+                    return "-ERR syntax error\r\n"
+            ordered = value.ordered()
+            if reverse:
+                ordered.reverse()
+            matches = [
+                m for m in ordered
+                if (value.members[m] > lo if lo_excl
+                    else value.members[m] >= lo)
+                and (value.members[m] < hi if hi_excl
+                     else value.members[m] <= hi)
+            ]
+            if offset >= len(matches):
+                matches = []
+            else:
+                matches = matches[offset:]
+                if count >= 0:
+                    matches = matches[:count]
+            flat = []
+            for member in matches:
+                flat.append(member)
+                if withscores:
+                    flat.append(repr(value.members[member]))
+            return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
         elif name == "DEL":
             n = sum(1 for k in args if self._get(k) is not None)
             for k in args:
@@ -523,7 +608,8 @@ class McpTests(unittest.TestCase):
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
                     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
                     "kv_hset", "kv_hget", "kv_hgetall",
-                    "kv_zadd", "kv_zrange", "kv_zcard", "kv_zscore",
+                    "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcard",
+                    "kv_zscore",
                     "kv_zrank", "kv_zrem", "kv_zincrby", "kv_batch"]
         )
 
@@ -1303,6 +1389,222 @@ class McpTests(unittest.TestCase):
             {"member": "x", "score": 9.0},
             {"member": "y", "score": 3.0},
         ])
+
+    def test_tools_call_zrangebyscore(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10, "bo": 20, "cy": 15,
+                                      "dan": 5, "eve": 20}},
+        })
+        # No bounds: the whole set, lowest score first (ties by
+        # member name: bo before eve at 20).
+        whole = self._call("tools/call", 2, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(
+            json.loads(whole["result"]["content"][0]["text"]),
+            ["dan", "amy", "cy", "bo", "eve"],
+        )
+        # Numeric bounds are inclusive by default.
+        bounded = self._call("tools/call", 3, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "min": 10, "max": 20},
+        })
+        self.assertEqual(
+            json.loads(bounded["result"]["content"][0]["text"]),
+            ["amy", "cy", "bo", "eve"],
+        )
+        # A leading '(' makes a bound exclusive.
+        exclusive = self._call("tools/call", 4, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "min": "(10",
+                          "max": "(20"},
+        })
+        self.assertEqual(
+            json.loads(exclusive["result"]["content"][0]["text"]),
+            ["cy"],
+        )
+        # -inf / +inf as strings mean no bound on that side.
+        open_ended = self._call("tools/call", 5, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "min": "-inf",
+                          "max": "15"},
+        })
+        self.assertEqual(
+            json.loads(open_ended["result"]["content"][0]["text"]),
+            ["dan", "amy", "cy"],
+        )
+        # withscores returns member/score objects.
+        scored = self._call("tools/call", 6, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "min": 15,
+                          "withscores": True},
+        })
+        self.assertEqual(
+            json.loads(scored["result"]["content"][0]["text"]),
+            [{"member": "cy", "score": 15.0},
+             {"member": "bo", "score": 20.0},
+             {"member": "eve", "score": 20.0}],
+        )
+        # rev reads highest score first; bounds are still min, max.
+        reversed_ = self._call("tools/call", 7, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "rev": True,
+                          "max": 15},
+        })
+        self.assertEqual(
+            json.loads(reversed_["result"]["content"][0]["text"]),
+            ["cy", "amy", "dan"],
+        )
+        # LIMIT pages through the matches.
+        page = self._call("tools/call", 8, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "offset": 1,
+                          "count": 2},
+        })
+        self.assertEqual(
+            json.loads(page["result"]["content"][0]["text"]),
+            ["amy", "cy"],
+        )
+        # A range with no matches, and a missing key, both return [].
+        empty = self._call("tools/call", 9, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "leaderboard", "min": 100},
+        })
+        self.assertEqual(empty["result"]["content"][0]["text"], "[]")
+        missing = self._call("tools/call", 10, {
+            "name": "kv_zrangebyscore", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_zrangebyscore_rejects_bad_arguments(self):
+        cases = [
+            # Bad bounds: not a number, empty exclusive, NaN, bool.
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "min": "high"}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "min": "("}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "min": "nan"}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "min": float("nan")}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "max": True}},
+            # Bad flags and paging: wrong types, negative offset,
+            # count below -1, count over the 1000-member cap.
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "withscores": "yes"}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "rev": 1}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "offset": -1}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "offset": "1"}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "count": 1.5}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "count": -2}},
+            {"name": "kv_zrangebyscore",
+             "arguments": {"key": "z", "count": 1001}},
+            {"name": "kv_zrangebyscore", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zrangebyscore_rejects_too_wide_a_range(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "big",
+                          "members": {"m%04d" % i: i
+                                      for i in range(1001)}},
+        })
+        # No limit over 1001 matches fails instead of truncating.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrangebyscore", "arguments": {"key": "big"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # The same range with an explicit count inside the cap works.
+        page = self._call("tools/call", 3, {
+            "name": "kv_zrangebyscore",
+            "arguments": {"key": "big", "count": 1000},
+        })
+        self.assertEqual(
+            len(json.loads(page["result"]["content"][0]["text"])), 1000,
+        )
+
+    def test_tools_call_zrangebyscore_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrangebyscore", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+
+    def test_tools_call_zrangebyscore_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zrangebyscore", "key": "z",
+                 "min": 2},
+                {"op": "kv_zrangebyscore", "key": "z",
+                 "min": "(1", "max": 3, "withscores": True},
+                {"op": "kv_zrangebyscore", "key": "z",
+                 "offset": 1, "count": 1},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], ["b", "c"])
+        self.assertEqual(summary["results"][2]["result"], [
+            {"member": "b", "score": 2.0},
+            {"member": "c", "score": 3.0},
+        ])
+        self.assertEqual(summary["results"][3]["result"], ["b"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zrangebyscore", "key": "z2", "rev": True,
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], [
+            {"member": "x", "score": 9.0},
+            {"member": "y", "score": 3.0},
+        ])
+        # A too-wide range inside an atomic batch is recorded as
+        # that op's error in place, while the rest still run.
+        wide = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "big",
+                 "members": {"m%04d" % i: i for i in range(1001)}},
+                {"op": "kv_zrangebyscore", "key": "big"},
+                {"op": "kv_zcard", "key": "big"},
+            ]},
+        })
+        summary = json.loads(wide["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], 1001)
+        self.assertFalse(summary["results"][1]["ok"])
+        self.assertIn("1000", summary["results"][1]["error"])
+        self.assertEqual(summary["results"][2]["result"], 1001)
 
     def test_tools_call_zcard_zscore_zrank_zrem_zincrby(self):
         self._call("tools/call", 1, {
