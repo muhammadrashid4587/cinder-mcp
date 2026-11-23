@@ -78,6 +78,9 @@ threshold it crossed, so the client sees it without polling
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
 | `kv_expire` | `EXPIRE key seconds` | 1 if the timeout was set, 0 if the key is missing |
+| `kv_hset` | `HSET key field value [field value ...]` | `fields` is an object of field names to values; returns the number of fields newly added (updating an existing field counts 0) |
+| `kv_hget` | `HGET key field` | Returns `null` when the key or the field is missing |
+| `kv_hgetall` | `HGETALL key` | Every field as an object of field names to values; `{}` when the key is missing |
 | `kv_batch` | several kv ops in one call | Runs the `ops` list in order and returns one summary: per-op result or error plus `ok` / `failed` counts. A failed op is recorded and the batch keeps going; at most 100 ops. Pass `atomic: true` to run the ops as one `MULTI`/`EXEC` transaction instead, with no other client interleaved; an op that cannot be queued (unknown name, `kv_keys_scan`, a missing argument) fails the whole call before anything runs |
 
 ## Atomic batches
@@ -188,6 +191,7 @@ prompts.
 - ~~Write-safety prompt (`write-safety`): audits a proposed write plan (a JSON list of kv_batch-shaped ops) against the live keyspace before it runs — overwrites of keys that never expire, overwrites of large keys, SETs that would destroy a container, INCRs that would fail, EXPIREs with a bad timeout — with a safe / caution / risky verdict per op and the exact safe subset as one kv_batch call; at most 50 ops audited, values never printed~~ (done, v0.19.0)
 - ~~TTL renewal prompt (`ttl-renewal`): plans renewing the TTLs of keys expiring sooner than a configurable target TTL (default 1 day) and giving a first expiry to keys with no expiry — live TTLs, soonest first, keys already expired or missing flagged and never proposed for renewal, at most `max_keys` keys covered (default 20, at most 100), values never read or printed~~ (done, v0.20.0)
 - ~~Key-migration prompt (`key-migration`): plans migrating keys matching a pattern to a new prefix — live type/size/TTL audit per key, target-name collision check (same-type overwrite vs different-type conflict vs maps-onto-itself), ordered copy steps with the exact `kv_del` call per source key, at most `max_keys` ready keys covered (default 20, at most 100), values never read or printed; honest limit stated in the prompt: cinder has no RENAME or COPY, so a migration is a read plus a write, not one atomic move~~ (done, v0.21.0)
+- ~~Hash tools (`kv_hset`, `kv_hget`, `kv_hgetall`): expose cinder's HSET/HGET/HGETALL so agents can work with hashes — `kv_hset` takes a `fields` object and returns the number of newly added fields, `kv_hget` returns null for a missing key or field, `kv_hgetall` returns the whole hash as an object (`{}` when missing); all three are batchable, plain and atomic~~ (done, v0.22.0)
 
 ## Next
 

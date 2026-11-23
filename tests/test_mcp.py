@@ -2,7 +2,7 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
-LRANGE, SMEMBERS, HGETALL, MULTI, EXEC, DISCARD)
+LRANGE, SMEMBERS, HSET, HGET, HGETALL, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, or dict value so the
@@ -194,6 +194,28 @@ class FakeCinder(threading.Thread):
             return self._container_items(args[0], list)
         elif name == "SMEMBERS" and len(args) == 1:
             return self._container_items(args[0], set)
+        elif name == "HSET" and len(args) >= 3 and len(args) % 2 == 1:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                value = {}
+                self.store[args[0]] = (value, None)
+            added = 0
+            for i in range(1, len(args), 2):
+                if args[i] not in value:
+                    added += 1
+                value[args[i]] = args[i + 1]
+            return ":%d\r\n" % added
+        elif name == "HGET" and len(args) == 2:
+            value = self._get(args[0])
+            if value is None:
+                return self._bulk(None)
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return self._bulk(value.get(args[1]))
         elif name == "HGETALL" and len(args) == 1:
             value = self._get(args[0])
             if value is None:
@@ -312,7 +334,8 @@ class McpTests(unittest.TestCase):
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
-                    "kv_incr", "kv_ttl", "kv_exists", "kv_expire", "kv_batch"]
+                    "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+                    "kv_hset", "kv_hget", "kv_hgetall", "kv_batch"]
         )
 
     def test_tools_list_advertises_default_budgets(self):
@@ -826,6 +849,110 @@ class McpTests(unittest.TestCase):
         })
         remaining = int(ttl["result"]["content"][0]["text"])
         self.assertTrue(0 < remaining <= 3600)
+
+    def test_tools_call_hash_set_get_getall(self):
+        added = self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "user:1",
+                          "fields": {"name": "mo", "city": "philly"}},
+        })
+        self.assertEqual(added["result"]["content"][0]["text"], "2")
+        # Setting a new field adds 1; updating an existing one adds 0.
+        updated = self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "user:1",
+                          "fields": {"city": "jeddah", "age": "24"}},
+        })
+        self.assertEqual(updated["result"]["content"][0]["text"], "1")
+        field = self._call("tools/call", 3, {
+            "name": "kv_hget",
+            "arguments": {"key": "user:1", "field": "city"},
+        })
+        self.assertEqual(field["result"]["content"][0]["text"], "jeddah")
+        missing_field = self._call("tools/call", 4, {
+            "name": "kv_hget",
+            "arguments": {"key": "user:1", "field": "nope"},
+        })
+        self.assertEqual(missing_field["result"]["content"][0]["text"], "null")
+        missing_key = self._call("tools/call", 5, {
+            "name": "kv_hget", "arguments": {"key": "ghost", "field": "x"},
+        })
+        self.assertEqual(missing_key["result"]["content"][0]["text"], "null")
+        all_fields = self._call("tools/call", 6, {
+            "name": "kv_hgetall", "arguments": {"key": "user:1"},
+        })
+        self.assertEqual(
+            json.loads(all_fields["result"]["content"][0]["text"]),
+            {"name": "mo", "city": "jeddah", "age": "24"},
+        )
+        empty = self._call("tools/call", 7, {
+            "name": "kv_hgetall", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(empty["result"]["content"][0]["text"], "{}")
+
+    def test_tools_call_hash_rejects_bad_arguments(self):
+        empty_fields = self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {}},
+        })
+        self.assertIn("error", empty_fields)
+        missing_fields = self._call("tools/call", 2, {
+            "name": "kv_hset", "arguments": {"key": "h"},
+        })
+        self.assertIn("error", missing_fields)
+        non_string_value = self._call("tools/call", 3, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"f": 7}},
+        })
+        self.assertIn("error", non_string_value)
+
+    def test_tools_call_hash_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        hset = self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "plain", "fields": {"f": "v"}},
+        })
+        self.assertIn("error", hset)
+        hget = self._call("tools/call", 3, {
+            "name": "kv_hget",
+            "arguments": {"key": "plain", "field": "f"},
+        })
+        self.assertIn("error", hget)
+        hgetall = self._call("tools/call", 4, {
+            "name": "kv_hgetall", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", hgetall)
+
+    def test_tools_call_hash_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_hset", "key": "h",
+                 "fields": {"a": "1", "b": "2"}},
+                {"op": "kv_hget", "key": "h", "field": "a"},
+                {"op": "kv_hgetall", "key": "h"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], "1")
+        self.assertEqual(summary["results"][2]["result"], {"a": "1", "b": "2"})
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h2",
+                 "fields": {"x": "9"}},
+                {"op": "kv_hgetall", "key": "h2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertEqual(summary["results"][1]["result"], {"x": "9"})
 
     def test_resources_list_returns_info_metrics_changes_and_key_template(self):
         listed = self._call("resources/list", 1)

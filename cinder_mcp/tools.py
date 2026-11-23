@@ -113,8 +113,41 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_hset",
+        "description": "Set fields on a hash: HSET key field value [field value ...]. Takes `fields` as an object mapping field names to values. Returns the number of fields that were newly added (updating an existing field returns 0 for it).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "fields": {"type": "object"},
+            },
+            "required": ["key", "fields"],
+        },
+    },
+    {
+        "name": "kv_hget",
+        "description": "Get one field of a hash. Returns null when the key or the field does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "field": {"type": "string"},
+            },
+            "required": ["key", "field"],
+        },
+    },
+    {
+        "name": "kv_hgetall",
+        "description": "Get every field of a hash as an object mapping field names to values. Returns an empty object when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists or kv_expire plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists, kv_expire, kv_hset, kv_hget or kv_hgetall plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -131,6 +164,8 @@ TOOLS = [
                             "px": {"type": "integer"},
                             "by": {"type": "integer"},
                             "seconds": {"type": "integer"},
+                            "field": {"type": "string"},
+                            "fields": {"type": "object"},
                             "pattern": {"type": "string"},
                             "limit": {"type": "integer"},
                             "full": {"type": "boolean"},
@@ -195,6 +230,7 @@ def call_tool(client, name, args):
 BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+    "kv_hset", "kv_hget", "kv_hgetall",
 }
 
 MAX_BATCH_OPS = 100
@@ -262,6 +298,7 @@ def _call_batch(client, args):
 ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+    "kv_hset", "kv_hget", "kv_hgetall",
 }
 
 
@@ -302,6 +339,11 @@ def _call_batch_atomic(client, ops):
             # KEYS came back as a raw list inside the transaction;
             # apply the same sampling the standalone tool does.
             value = _keys_result(reply or [], op)
+        elif op_name == "kv_hgetall":
+            # HGETALL came back as a flat [field, value, ...] list
+            # inside the transaction; shape it into a dict like the
+            # standalone tool does.
+            value = _hgetall_result(reply or [])
         else:
             value = reply
         results.append({"op": op_name, "ok": True, "result": value})
@@ -425,7 +467,39 @@ def _op_argv(name, args):
         return ["EXISTS", _require(args, "key")]
     if name == "kv_expire":
         return ["EXPIRE", _require(args, "key"), _require(args, "seconds")]
+    if name == "kv_hset":
+        return ["HSET", _require(args, "key")] + _hset_field_args(args)
+    if name == "kv_hget":
+        return ["HGET", _require(args, "key"), _require(args, "field")]
+    if name == "kv_hgetall":
+        return ["HGETALL", _require(args, "key")]
     raise ValueError("unknown or unbatchable op: %s" % name)
+
+
+def _hset_field_args(args):
+    """The field/value pairs for an HSET, as a flat argv list.
+    `fields` must be a non-empty object of string field names to
+    string values; anything else fails the call instead of sending
+    a half-formed HSET. Pairs are sent in sorted field order so the
+    argv is deterministic."""
+    fields = args.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("kv_hset fields must be a non-empty object")
+    argv = []
+    for field in sorted(fields):
+        value = fields[field]
+        if not isinstance(field, str) or not isinstance(value, str):
+            raise ValueError(
+                "kv_hset fields must map string field names to string values"
+            )
+        argv += [field, value]
+    return argv
+
+
+def _hgetall_result(flat):
+    """Shape a flat HGETALL reply [field, value, ...] into a dict.
+    A missing key replies as an empty list, which becomes {}."""
+    return {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
 
 
 def _call_single(client, name, args):
@@ -433,4 +507,8 @@ def _call_single(client, name, args):
         return _call_keys(client, args)
     if name == "kv_keys_scan":
         return _call_keys_scan(client, args)
+    if name == "kv_hgetall":
+        return _hgetall_result(
+            client.command("HGETALL", _require(args, "key")) or []
+        )
     return client.command(*_op_argv(name, args))
