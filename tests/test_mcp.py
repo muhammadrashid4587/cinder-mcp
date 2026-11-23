@@ -242,7 +242,7 @@ class McpTests(unittest.TestCase):
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_incr", "kv_ttl",
-                    "kv_exists", "kv_expire"]
+                    "kv_exists", "kv_expire", "kv_batch"]
         )
 
     def test_tools_list_advertises_default_budgets(self):
@@ -294,6 +294,75 @@ class McpTests(unittest.TestCase):
             "name": "kv_get", "arguments": {"key": "nope"},
         })
         self.assertEqual(missing["result"]["content"][0]["text"], "null")
+
+    def test_tools_call_batch_set_get_incr(self):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_set", "key": "b:count", "value": "10"},
+                {"op": "kv_incr", "key": "b:count", "by": 5},
+                {"op": "kv_get", "key": "b:count"},
+                {"op": "kv_get", "key": "b:missing"},
+            ]},
+        })
+        summary = json.loads(reply["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(
+            [r["result"] for r in summary["results"]],
+            ["OK", 15, "15", None],
+        )
+        self.assertEqual(
+            [r["op"] for r in summary["results"]],
+            ["kv_set", "kv_incr", "kv_get", "kv_get"],
+        )
+        self.assertTrue(all(r["ok"] for r in summary["results"]))
+
+    def test_tools_call_batch_keeps_going_past_a_failed_op(self):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_set", "key": "b:one", "value": "1"},
+                # EXPIRE with a negative time is rejected by cinder.
+                {"op": "kv_expire", "key": "b:one", "seconds": -5},
+                {"op": "kv_get", "key": "b:one"},
+                # Unknown op name: recorded, not fatal.
+                {"op": "kv_nope", "key": "b:one"},
+                # Missing required argument: recorded, not fatal.
+                {"op": "kv_get"},
+            ]},
+        })
+        summary = json.loads(reply["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 3)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertFalse(summary["results"][1]["ok"])
+        self.assertIn("expire", summary["results"][1]["error"].lower())
+        self.assertEqual(summary["results"][2]["result"], "1")
+        self.assertIn("kv_nope", summary["results"][3]["error"])
+        self.assertIn("missing required argument", summary["results"][4]["error"])
+
+    def test_tools_call_batch_rejects_bad_batches(self):
+        for bad in ({}, {"ops": "not-a-list"}, {"ops": []},
+                    {"ops": [{"op": "kv_get"}] * 101}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_batch", "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_tools_call_batch_rejects_nesting(self):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_batch", "ops": [{"op": "kv_get", "key": "x"}]},
+                {"op": "kv_get", "key": "x"},
+            ]},
+        })
+        summary = json.loads(reply["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertIn("unbatchable", summary["results"][0]["error"])
 
     def test_tools_call_fast_call_has_no_warning(self):
         reply = self._call("tools/call", 1, {

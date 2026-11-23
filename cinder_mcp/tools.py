@@ -87,6 +87,33 @@ TOOLS = [
             "required": ["key", "seconds"],
         },
     },
+    {
+        "name": "kv_batch",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists or kv_expire plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. Not atomic: cinder has no MULTI yet, so a batch is a convenience round-trip saver, not a transaction. At most 100 ops per call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ops": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string"},
+                            "key": {"type": "string"},
+                            "value": {"type": "string"},
+                            "ex": {"type": "integer"},
+                            "px": {"type": "integer"},
+                            "by": {"type": "integer"},
+                            "seconds": {"type": "integer"},
+                            "pattern": {"type": "string"},
+                        },
+                        "required": ["op"],
+                    },
+                },
+            },
+            "required": ["ops"],
+        },
+    },
 ]
 
 
@@ -126,6 +153,72 @@ def _require(args, field):
 def call_tool(client, name, args):
     """Run one tool against cinder. Returns a plain value for the result text."""
     args = args or {}
+    if name == "kv_batch":
+        return _call_batch(client, args)
+    return _call_single(client, name, args)
+
+
+# Ops a batch may contain: the single-key tools, not kv_batch itself
+# (no nesting — a batch inside a batch buys nothing and complicates
+# the summary).
+BATCHABLE_TOOLS = {
+    "kv_get", "kv_set", "kv_del", "kv_keys",
+    "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+}
+
+MAX_BATCH_OPS = 100
+
+
+def _call_batch(client, args):
+    """Run several kv ops in order and return one summary.
+
+    Ops run sequentially against cinder; a failed op is recorded in
+    place and the batch keeps going, so one bad op never discards
+    the rest. The summary is {"results": [...], "ok": n, "failed": m}
+    where each result is {"op": ..., "ok": true, "result": ...} or
+    {"op": ..., "ok": false, "error": ...}. Not atomic: cinder has
+    no MULTI yet, so this is a round-trip saver, not a transaction.
+    Batch-level problems (ops missing, not a list, empty, over the
+    cap) raise ValueError and fail the whole call."""
+    ops = args.get("ops")
+    if not isinstance(ops, list):
+        raise ValueError("kv_batch requires ops to be a list")
+    if not ops:
+        raise ValueError("kv_batch requires at least one op")
+    if len(ops) > MAX_BATCH_OPS:
+        raise ValueError(
+            "kv_batch accepts at most %d ops, got %d" % (MAX_BATCH_OPS, len(ops))
+        )
+    results = []
+    ok_count = 0
+    for op in ops:
+        if not isinstance(op, dict) or not isinstance(op.get("op"), str):
+            results.append(
+                {"op": None, "ok": False, "error": "each op needs an op name"}
+            )
+            continue
+        op_name = op["op"]
+        if op_name not in BATCHABLE_TOOLS:
+            results.append(
+                {"op": op_name, "ok": False,
+                 "error": "unknown or unbatchable op: %s" % op_name}
+            )
+            continue
+        try:
+            value = _call_single(client, op_name, op)
+        except Exception as exc:
+            results.append({"op": op_name, "ok": False, "error": str(exc)})
+            continue
+        results.append({"op": op_name, "ok": True, "result": value})
+        ok_count += 1
+    return {
+        "results": results,
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+    }
+
+
+def _call_single(client, name, args):
     if name == "kv_get":
         return client.command("GET", _require(args, "key"))
     if name == "kv_set":

@@ -77,6 +77,7 @@ threshold it crossed, so the client sees it without polling
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
 | `kv_expire` | `EXPIRE key seconds` | 1 if the timeout was set, 0 if the key is missing |
+| `kv_batch` | several kv ops in one call | Runs the `ops` list in order and returns one summary: per-op result or error plus `ok` / `failed` counts. A failed op is recorded and the batch keeps going; at most 100 ops. Not atomic — cinder has no `MULTI` yet, so this saves round trips, it is not a transaction. |
 
 ## Resources
 
@@ -131,3 +132,9 @@ requests return JSON-RPC errors.
 - ~~Latency budgets: per-tool warn/slow thresholds on `cinder://metrics`, so a slow tool is flagged instead of just measured~~ (done, v0.10.0)
 - ~~Slow-tool warning in `tools/call`: a `warning` field in the tool result when a call crosses its warn or slow latency budget, so the agent sees it in the moment instead of only in `cinder://metrics`~~ (done, v0.11.0)
 - ~~Advertise budgets in `tools/list`: include each tool's warn/slow latency budget in its tool description, so clients know the budgets up front instead of discovering them from a warning~~ (done, v0.12.0)
+- ~~Batch tool (`kv_batch`): run several kv ops in one call, in order, with a per-op result/error summary and ok/failed counts; a failed op is recorded and the batch keeps going; at most 100 ops; explicitly not atomic until cinder has MULTI~~ (done, v0.13.0)
+
+## Next
+
+- Keyspace watch: a `cinder://changes` resource that reports keys changed since a checkpoint, so an agent can poll for what moved instead of re-listing the whole keyspace.
+- Sampling support for long key listings, so `kv_keys` over a huge keyspace can return a bounded sample instead of every key.
