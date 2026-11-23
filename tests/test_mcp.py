@@ -9,6 +9,7 @@ Keys in the fake store may also hold a list, set, or dict value so the
 per-key resource's type probing can be exercised.
 """
 
+import hashlib
 import io
 import json
 import socket
@@ -452,7 +453,110 @@ class McpTests(unittest.TestCase):
         keys = self._call("tools/call", 5, {
             "name": "kv_keys", "arguments": {"pattern": "user:*"},
         })
-        self.assertEqual(keys["result"]["content"][0]["text"], '["user:1"]')
+        self.assertEqual(
+            json.loads(keys["result"]["content"][0]["text"]),
+            {"keys": ["user:1"], "total": 1, "returned": 1, "sampled": False},
+        )
+
+    def _seed_keys(self, count, prefix="key"):
+        for i in range(count):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "%s:%03d" % (prefix, i), "value": "v"},
+            })
+
+    def _keys_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_keys", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_keys_small_keyspace_returns_everything_unsampled(self):
+        self._seed_keys(3)
+        data = self._keys_result({})
+        self.assertEqual(data, {
+            "keys": ["key:000", "key:001", "key:002"],
+            "total": 3, "returned": 3, "sampled": False,
+        })
+
+    def test_kv_keys_large_keyspace_returns_bounded_deterministic_sample(self):
+        self._seed_keys(150)
+        data = self._keys_result({})
+        self.assertEqual(data["total"], 150)
+        self.assertEqual(data["returned"], 100)
+        self.assertTrue(data["sampled"])
+        self.assertEqual(len(data["keys"]), 100)
+        self.assertEqual(data["keys"], sorted(data["keys"]))
+        # Same call again: the identical sample, not a fresh draw.
+        again = self._keys_result({})
+        self.assertEqual(again, data)
+        # The sample is the SHA-256-seeded one, not the first 100 keys.
+        all_keys = ["key:%03d" % i for i in range(150)]
+        expected = sorted(
+            sorted(
+                all_keys,
+                key=lambda k: hashlib.sha256((":%s" % k).encode()).hexdigest(),
+            )[:100]
+        )
+        self.assertEqual(data["keys"], expected)
+        self.assertNotEqual(data["keys"], all_keys[:100])
+
+    def test_kv_keys_explicit_limit_bounds_the_sample(self):
+        self._seed_keys(150)
+        data = self._keys_result({"limit": 10})
+        self.assertEqual(data["total"], 150)
+        self.assertEqual(data["returned"], 10)
+        self.assertTrue(data["sampled"])
+        self.assertEqual(len(data["keys"]), 10)
+
+    def test_kv_keys_full_opt_in_returns_the_whole_keyspace(self):
+        self._seed_keys(150)
+        data = self._keys_result({"full": True})
+        self.assertEqual(data["total"], 150)
+        self.assertEqual(data["returned"], 150)
+        self.assertFalse(data["sampled"])
+        self.assertEqual(
+            data["keys"], ["key:%03d" % i for i in range(150)])
+        # full wins over a small limit.
+        data = self._keys_result({"full": True, "limit": 5})
+        self.assertEqual(data["returned"], 150)
+        self.assertFalse(data["sampled"])
+
+    def test_kv_keys_seed_changes_the_sample(self):
+        self._seed_keys(150)
+        default = self._keys_result({"limit": 5})
+        other = self._keys_result({"limit": 5, "seed": "audit"})
+        self.assertNotEqual(other["keys"], default["keys"])
+        # Same seed again: the same sample.
+        self.assertEqual(
+            self._keys_result({"limit": 5, "seed": "audit"}), other)
+
+    def test_kv_keys_rejects_bad_arguments(self):
+        self._seed_keys(2)
+        for bad in ({"limit": 0}, {"limit": -1}, {"limit": 10001},
+                    {"limit": "ten"}, {"limit": True},
+                    {"full": "yes"}, {"seed": 7}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_keys", "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_keys_in_batch_returns_the_sampled_form(self):
+        self._seed_keys(3)
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_keys", "pattern": "key:*"},
+            ]},
+        })
+        summary = json.loads(reply["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"], {
+            "keys": ["key:000", "key:001", "key:002"],
+            "total": 3, "returned": 3, "sampled": False,
+        })
 
     def test_tools_call_exists_and_expire(self):
         missing = self._call("tools/call", 1, {

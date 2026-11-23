@@ -4,6 +4,8 @@ Each tool maps to one cinder command. The schemas are plain JSON Schema
 fragments, as the MCP spec requires for tools/list.
 """
 
+import hashlib
+
 TOOLS = [
     {
         "name": "kv_get",
@@ -39,10 +41,15 @@ TOOLS = [
     },
     {
         "name": "kv_keys",
-        "description": "List keys matching a glob pattern (* and ?). Defaults to all keys.",
+        "description": "List keys matching a glob pattern (* and ?). Defaults to all keys. Returns {\"keys\": [...], \"total\": n, \"returned\": m, \"sampled\": bool}: at most `limit` keys (default 100) are returned, and when the keyspace is larger than that the returned keys are a deterministic sample seeded by `seed`, so the same call always returns the same sample. Pass full=true to get the whole list instead.",
         "inputSchema": {
             "type": "object",
-            "properties": {"pattern": {"type": "string"}},
+            "properties": {
+                "pattern": {"type": "string"},
+                "limit": {"type": "integer"},
+                "full": {"type": "boolean"},
+                "seed": {"type": "string"},
+            },
         },
     },
     {
@@ -106,6 +113,9 @@ TOOLS = [
                             "by": {"type": "integer"},
                             "seconds": {"type": "integer"},
                             "pattern": {"type": "string"},
+                            "limit": {"type": "integer"},
+                            "full": {"type": "boolean"},
+                            "seed": {"type": "string"},
                         },
                         "required": ["op"],
                     },
@@ -218,6 +228,68 @@ def _call_batch(client, args):
     }
 
 
+# The default cap on keys kv_keys returns; larger keyspaces are sampled.
+DEFAULT_KEY_LIMIT = 100
+
+# The largest limit a caller may ask for; above this, ask for the full
+# list explicitly with full=true instead of pretending a sample is one.
+MAX_KEY_LIMIT = 10000
+
+
+def sample_keys(keys, limit, seed=""):
+    """A deterministic sample of `keys`: order them by the SHA-256 of
+    "seed:key" and take the first `limit`, then sort the sample
+    alphabetically so it reads in key order. The same keyspace and seed
+    always yield the same sample; a different seed yields a different
+    one. Nothing is random here — no RNG, no wall clock — so the sample
+    is stable across calls, restarts, and machines."""
+    ranked = sorted(
+        keys,
+        key=lambda k: hashlib.sha256(("%s:%s" % (seed, k)).encode()).hexdigest(),
+    )
+    return sorted(ranked[:limit])
+
+
+def _call_keys(client, args):
+    """kv_keys: KEYS, then bound the listing. Returns {"keys": [...],
+    "total": n, "returned": m, "sampled": bool} where total is the size
+    of the matching keyspace, returned is how many keys came back, and
+    sampled says whether the list was cut down to a sample. Small
+    keyspaces come back whole (sampled false); a keyspace larger than
+    `limit` (default 100) comes back as a deterministic seeded sample;
+    full=true returns the whole list whatever its size. Bad limit/full/
+    seed values fail the call instead of silently ignoring the caller."""
+    full = args.get("full", False)
+    if not isinstance(full, bool):
+        raise ValueError("kv_keys full must be true or false")
+    limit = args.get("limit", DEFAULT_KEY_LIMIT)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("kv_keys limit must be an integer")
+    if limit < 1 or limit > MAX_KEY_LIMIT:
+        raise ValueError(
+            "kv_keys limit must be between 1 and %d" % MAX_KEY_LIMIT
+        )
+    seed = args.get("seed", "")
+    if not isinstance(seed, str):
+        raise ValueError("kv_keys seed must be a string")
+    keys = client.command("KEYS", args.get("pattern", "*")) or []
+    total = len(keys)
+    if full or total <= limit:
+        return {
+            "keys": sorted(keys),
+            "total": total,
+            "returned": total,
+            "sampled": False,
+        }
+    sampled = sample_keys(keys, limit, seed)
+    return {
+        "keys": sampled,
+        "total": total,
+        "returned": len(sampled),
+        "sampled": True,
+    }
+
+
 def _call_single(client, name, args):
     if name == "kv_get":
         return client.command("GET", _require(args, "key"))
@@ -231,7 +303,7 @@ def _call_single(client, name, args):
     if name == "kv_del":
         return client.command("DEL", _require(args, "key"))
     if name == "kv_keys":
-        return client.command("KEYS", args.get("pattern", "*"))
+        return _call_keys(client, args)
     if name == "kv_incr":
         by = args.get("by", 1)
         if by == 1:

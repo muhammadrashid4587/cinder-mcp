@@ -72,7 +72,7 @@ threshold it crossed, so the client sees it without polling
 | `kv_get` | `GET key` | Returns `null` when the key is missing |
 | `kv_set` | `SET key value [EX s \| PX ms]` | Optional `ex` / `px` TTL |
 | `kv_del` | `DEL key` | 1 if the key existed, 0 otherwise |
-| `kv_keys` | `KEYS pattern` | Glob `*` and `?`, defaults to `*` |
+| `kv_keys` | `KEYS pattern` | Glob `*` and `?`, defaults to `*`. Returns `{"keys": [...], "total": n, "returned": m, "sampled": bool}`: at most `limit` keys (default 100); a larger keyspace returns a deterministic sample seeded by `seed`, and `full: true` returns the whole list |
 | `kv_incr` | `INCR key` / `INCRBY key n` | `by` defaults to 1 |
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
@@ -135,7 +135,8 @@ requests return JSON-RPC errors.
 - ~~Advertise budgets in `tools/list`: include each tool's warn/slow latency budget in its tool description, so clients know the budgets up front instead of discovering them from a warning~~ (done, v0.12.0)
 - ~~Batch tool (`kv_batch`): run several kv ops in one call, in order, with a per-op result/error summary and ok/failed counts; a failed op is recorded and the batch keeps going; at most 100 ops; explicitly not atomic until cinder has MULTI~~ (done, v0.13.0)
 - ~~Keyspace watch: a `cinder://changes` resource that reports keys changed since a checkpoint, so an agent can poll for what moved instead of re-listing the whole keyspace~~ (done, v0.14.0)
+- ~~Sampling support for long key listings, so `kv_keys` over a huge keyspace returns a bounded deterministic sample (default cap 100 keys, `limit` / `seed` / `full` parameters) plus `total` / `returned` / `sampled` counts instead of every key~~ (done, v0.15.0)
 
 ## Next
 
-- Sampling support for long key listings, so `kv_keys` over a huge keyspace can return a bounded sample instead of every key.
+- Streaming the keyspace for prompts, so `ttl-audit` and `cleanup-plan` can scan a huge keyspace without loading every key into memory at once.
