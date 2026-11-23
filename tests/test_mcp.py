@@ -1,7 +1,8 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN)
+GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
+LRANGE, SMEMBERS, HGETALL)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, or dict value so the
@@ -149,6 +150,20 @@ class FakeCinder(threading.Thread):
                     self._reply(conn, self._container_len(args[0], set))
                 elif name == "HLEN" and len(args) == 1:
                     self._reply(conn, self._container_len(args[0], dict))
+                elif name == "LRANGE" and len(args) == 3:
+                    self._reply(conn, self._container_items(args[0], list))
+                elif name == "SMEMBERS" and len(args) == 1:
+                    self._reply(conn, self._container_items(args[0], set))
+                elif name == "HGETALL" and len(args) == 1:
+                    value = self._get(args[0])
+                    if value is None:
+                        self._reply(conn, "*0\r\n")
+                    elif not isinstance(value, dict):
+                        self._reply(conn, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                    else:
+                        flat = [x for pair in value.items() for x in pair]
+                        out = "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+                        self._reply(conn, out)
                 elif name == "DEL":
                     n = sum(1 for k in args if self._get(k) is not None)
                     for k in args:
@@ -209,6 +224,19 @@ class FakeCinder(threading.Thread):
             return ("-WRONGTYPE Operation against a key holding the "
                     "wrong kind of value\r\n")
         return ":%d\r\n" % len(value)
+
+    def _container_items(self, key, kind):
+        """LRANGE / SMEMBERS: the container's elements as an array.
+        LRANGE args are ignored beyond the key — the fake only ever
+        reads the whole list, which is what the watch fingerprints."""
+        value = self._get(key)
+        if value is None:
+            return "*0\r\n"
+        if not isinstance(value, kind):
+            return ("-WRONGTYPE Operation against a key holding the "
+                    "wrong kind of value\r\n")
+        items = sorted(value) if kind is set else list(value)
+        return "*%d\r\n" % len(items) + "".join(self._bulk(v) for v in items)
 
     def _incr(self, key, by):
         current = self._get(key)
@@ -452,16 +480,18 @@ class McpTests(unittest.TestCase):
         remaining = int(ttl["result"]["content"][0]["text"])
         self.assertTrue(0 < remaining <= 3600)
 
-    def test_resources_list_returns_info_metrics_and_key_template(self):
+    def test_resources_list_returns_info_metrics_changes_and_key_template(self):
         listed = self._call("resources/list", 1)
         resources = listed["result"]["resources"]
-        self.assertEqual(len(resources), 3)
+        self.assertEqual(len(resources), 4)
         self.assertEqual(resources[0]["uri"], "cinder://info")
         self.assertEqual(resources[0]["mimeType"], "text/plain")
         self.assertEqual(resources[1]["uri"], "cinder://metrics")
         self.assertEqual(resources[1]["mimeType"], "application/json")
-        self.assertEqual(resources[2]["uriTemplate"], "cinder://key/{key}")
+        self.assertEqual(resources[2]["uri"], "cinder://changes")
         self.assertEqual(resources[2]["mimeType"], "application/json")
+        self.assertEqual(resources[3]["uriTemplate"], "cinder://key/{key}")
+        self.assertEqual(resources[3]["mimeType"], "application/json")
 
     def test_resources_read_key_string_returns_value_and_type(self):
         self._call("tools/call", 1, {
@@ -959,6 +989,148 @@ class McpTests(unittest.TestCase):
         self.assertIn("status:slow", info)
         self.assertIn(
             "# Latency budget breaches: warn: (none); slow: kv_set", info)
+
+    def _changes(self, uri="cinder://changes"):
+        reply = self._call("resources/read", 1, {"uri": uri})
+        self.assertNotIn("error", reply, uri)
+        contents = reply["result"]["contents"]
+        self.assertEqual(len(contents), 1)
+        self.assertEqual(contents[0]["uri"], uri)
+        self.assertEqual(contents[0]["mimeType"], "application/json")
+        return json.loads(contents[0]["text"])
+
+    def test_resources_read_changes_baselines_empty_keyspace(self):
+        data = self._changes()
+        self.assertEqual(data, {
+            "checkpoint": 1, "since": None,
+            "added": [], "changed": [], "removed": [], "total_keys": 0,
+        })
+
+    def test_resources_read_changes_baseline_lists_all_keys_as_added(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "b", "value": "2"},
+        })
+        data = self._changes()
+        self.assertEqual(data["checkpoint"], 1)
+        self.assertIsNone(data["since"])
+        self.assertEqual(data["added"], ["a", "b"])
+        self.assertEqual(data["changed"], [])
+        self.assertEqual(data["removed"], [])
+        self.assertEqual(data["total_keys"], 2)
+
+    def test_resources_read_changes_reports_added_changed_removed(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "b", "value": "2"},
+        })
+        first = self._changes()
+        self.assertEqual(first["checkpoint"], 1)
+        # Change a, delete b, add c.
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "9"},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_del", "arguments": {"key": "b"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "c", "value": "3"},
+        })
+        data = self._changes("cinder://changes?since=1")
+        self.assertEqual(data, {
+            "checkpoint": 2, "since": 1,
+            "added": ["c"], "changed": ["a"], "removed": ["b"],
+            "total_keys": 2,
+        })
+
+    def test_resources_read_changes_empty_poll_when_nothing_moved(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        self._changes()
+        data = self._changes("cinder://changes?since=1")
+        self.assertEqual(data["added"], [])
+        self.assertEqual(data["changed"], [])
+        self.assertEqual(data["removed"], [])
+        self.assertEqual(data["total_keys"], 1)
+        self.assertEqual(data["checkpoint"], 2)
+        # Same checkpoint again: the same (empty) diff, not an error.
+        again = self._changes("cinder://changes?since=1")
+        self.assertEqual(again["added"], [])
+        self.assertEqual(again["changed"], [])
+        self.assertEqual(again["removed"], [])
+        self.assertEqual(again["checkpoint"], 3)
+
+    def test_resources_read_changes_unknown_checkpoint_errors(self):
+        self._changes()
+        reply = self._call("resources/read", 1,
+                           {"uri": "cinder://changes?since=99"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("unknown checkpoint: 99", reply["error"]["message"])
+        self.assertIn("re-baseline", reply["error"]["message"])
+
+    def test_resources_read_changes_bad_since_errors(self):
+        for bad in ("cinder://changes?since=abc",
+                    "cinder://changes?since=0",
+                    "cinder://changes?since=-3"):
+            reply = self._call("resources/read", 1, {"uri": bad})
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_resources_read_changes_detects_container_member_change(self):
+        # Same length, different member: content hashing must catch it.
+        self.fake.store["todo"] = (["buy milk"], None)
+        self.fake.store["tags"] = ({"a", "b"}, None)
+        self._changes()
+        self.fake.store["todo"] = (["ship it"], None)
+        self.fake.store["tags"] = ({"a", "c"}, None)
+        data = self._changes("cinder://changes?since=1")
+        self.assertEqual(data["added"], [])
+        self.assertEqual(data["changed"], ["tags", "todo"])
+        self.assertEqual(data["removed"], [])
+
+    def test_resources_read_changes_reports_expired_key_as_removed(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "temp", "value": "v", "ex": 1},
+        })
+        self._changes()
+        time.sleep(1.2)
+        data = self._changes("cinder://changes?since=1")
+        self.assertEqual(data["removed"], ["temp"])
+        self.assertEqual(data["total_keys"], 0)
+
+    def test_resources_read_changes_ttl_only_change_is_not_a_change(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "a", "value": "1"},
+        })
+        self._changes()
+        self._call("tools/call", 2, {
+            "name": "kv_expire", "arguments": {"key": "a", "seconds": 3600},
+        })
+        data = self._changes("cinder://changes?since=1")
+        self.assertEqual(data["added"], [])
+        self.assertEqual(data["changed"], [])
+        self.assertEqual(data["removed"], [])
+
+    def test_resources_read_changes_forgets_old_checkpoints(self):
+        from cinder_mcp.watch import MAX_CHECKPOINTS
+        for _ in range(MAX_CHECKPOINTS + 1):
+            self._changes()
+        reply = self._call("resources/read", 1,
+                           {"uri": "cinder://changes?since=1"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("unknown checkpoint: 1", reply["error"]["message"])
+        # The newest checkpoint still works.
+        data = self._changes(
+            "cinder://changes?since=%d" % (MAX_CHECKPOINTS + 1))
+        self.assertEqual(data["added"], [])
 
     def test_resources_read_unknown_uri_returns_error(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://nope"})

@@ -12,13 +12,15 @@ the type. A missing key is a not-found error, not an empty resource.
 """
 
 import json
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .metrics import ToolMetrics
 from .resp import RespError
+from .watch import KeyspaceWatch
 
 INFO_URI = "cinder://info"
 METRICS_URI = "cinder://metrics"
+CHANGES_URI = "cinder://changes"
 KEY_URI_PREFIX = "cinder://key/"
 
 RESOURCES = [
@@ -44,6 +46,21 @@ RESOURCES = [
         "mimeType": "application/json",
     },
     {
+        "uri": CHANGES_URI,
+        "name": "Keyspace changes",
+        "description": (
+            "Keys added, changed or removed since a checkpoint, as "
+            "JSON. The first read (no since query) reports every "
+            "current key as added and returns a checkpoint; poll "
+            "again as cinder://changes?since=<checkpoint> to get only "
+            "what moved. Checkpoints older than the last 16 reads "
+            "are forgotten — then re-read without since to re-baseline. "
+            "A key whose TTL changed but whose value did not is not "
+            "reported as changed."
+        ),
+        "mimeType": "application/json",
+    },
+    {
         "uriTemplate": KEY_URI_PREFIX + "{key}",
         "name": "Key value",
         "description": (
@@ -55,9 +72,12 @@ RESOURCES = [
 ]
 
 
-def read_resource(client, uri, metrics=None):
+def read_resource(client, uri, metrics=None, watch=None):
     """Read one resource from cinder. Returns a content dict with uri,
-    mimeType and text, as the MCP spec requires for resources/read."""
+    mimeType and text, as the MCP spec requires for resources/read.
+    The watch is the server's per-session KeyspaceWatch; a fresh one
+    is created when none is given, so a bare read still works but
+    only ever baselines."""
     if uri == INFO_URI:
         text = client.command("INFO")
         if text is None:
@@ -74,9 +94,33 @@ def read_resource(client, uri, metrics=None):
             "mimeType": "application/json",
             "text": json.dumps(metrics.snapshot()),
         }
+    if uri == CHANGES_URI or uri.startswith(CHANGES_URI + "?"):
+        if watch is None:
+            watch = KeyspaceWatch()
+        return {
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": json.dumps(watch.read(client, _changes_since(uri))),
+        }
     if uri.startswith(KEY_URI_PREFIX):
         return _read_key_resource(client, uri)
     raise ValueError("unknown resource: %s" % uri)
+
+
+def _changes_since(uri):
+    """The checkpoint from a cinder://changes?since=<n> URI, or None
+    for a plain cinder://changes read (baseline)."""
+    query = urlparse(uri).query
+    raw = parse_qs(query).get("since")
+    if not raw:
+        return None
+    try:
+        since = int(raw[0])
+    except ValueError:
+        raise ValueError("cinder://changes since must be a number: %s" % raw[0])
+    if since < 1:
+        raise ValueError("cinder://changes since must be at least 1")
+    return since
 
 
 def _read_key_resource(client, uri):

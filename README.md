@@ -85,6 +85,7 @@ threshold it crossed, so the client sees it without polling
 | --- | --- | --- |
 | `cinder://info` | `INFO` | Server version, uptime, commands processed, key count, plus this server's per-tool latency metrics for the current session and a summary of which tools are over their latency budgets |
 | `cinder://metrics` | — | Per-tool call counts, error counts and mean/p50/p95 latency in milliseconds for this server session, as JSON, with each tool's warn/slow latency budget, its warn/slow/ok status, per-threshold breach counts, and a `budget_breaches` summary. Metrics are recorded in memory by the server itself (every `tools/call`, success or failure); nothing is stored in cinder. |
+| `cinder://changes` | `KEYS` + per-key value fingerprints | Keys added, changed or removed since a checkpoint, as JSON, so an agent can poll for what moved instead of re-listing the whole keyspace. The first read reports every current key as added and returns a `checkpoint`; poll again as `cinder://changes?since=<checkpoint>` for only the delta. Checkpoints older than the last 16 reads are forgotten (re-read without `since` to re-baseline). A key whose TTL changed but whose value did not is not reported as changed. |
 | `cinder://key/<key>` | `EXISTS` + `GET` / `LLEN` / `SCARD` / `HLEN` | Value and type as JSON; not-found error for missing keys. Non-string values report their type and length instead of a value (cinder has no `TYPE` command, so the type is probed) |
 
 Fetchable with `resources/list` and `resources/read`.
@@ -133,8 +134,8 @@ requests return JSON-RPC errors.
 - ~~Slow-tool warning in `tools/call`: a `warning` field in the tool result when a call crosses its warn or slow latency budget, so the agent sees it in the moment instead of only in `cinder://metrics`~~ (done, v0.11.0)
 - ~~Advertise budgets in `tools/list`: include each tool's warn/slow latency budget in its tool description, so clients know the budgets up front instead of discovering them from a warning~~ (done, v0.12.0)
 - ~~Batch tool (`kv_batch`): run several kv ops in one call, in order, with a per-op result/error summary and ok/failed counts; a failed op is recorded and the batch keeps going; at most 100 ops; explicitly not atomic until cinder has MULTI~~ (done, v0.13.0)
+- ~~Keyspace watch: a `cinder://changes` resource that reports keys changed since a checkpoint, so an agent can poll for what moved instead of re-listing the whole keyspace~~ (done, v0.14.0)
 
 ## Next
 
-- Keyspace watch: a `cinder://changes` resource that reports keys changed since a checkpoint, so an agent can poll for what moved instead of re-listing the whole keyspace.
 - Sampling support for long key listings, so `kv_keys` over a huge keyspace can return a bounded sample instead of every key.

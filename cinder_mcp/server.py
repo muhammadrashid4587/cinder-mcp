@@ -20,9 +20,10 @@ from .resp import ConnectionError, RespClient, RespError
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, read_resource
 from .tools import call_tool, tools_with_budgets
+from .watch import KeyspaceWatch
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.13.0"
+SERVER_VERSION = "0.14.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -30,9 +31,12 @@ PROTOCOL_VERSION = "2024-11-05"
 
 
 class MCPServer:
-    def __init__(self, client, metrics=None):
+    def __init__(self, client, metrics=None, watch=None):
         self.client = client
         self.metrics = metrics if metrics is not None else ToolMetrics()
+        # Per-session keyspace snapshots for cinder://changes; a
+        # fresh server starts with no checkpoint.
+        self.watch = watch if watch is not None else KeyspaceWatch()
 
     def handle_message(self, message):
         """Handle one decoded JSON-RPC message. Returns the response dict,
@@ -107,7 +111,7 @@ class MCPServer:
         uri = params.get("uri")
         if not isinstance(uri, str):
             raise ValueError("resources/read requires a resource uri")
-        return {"contents": [read_resource(self.client, uri, self.metrics)]}
+        return {"contents": [read_resource(self.client, uri, self.metrics, self.watch)]}
 
     def _prompts_get(self, params):
         name = params.get("name")
