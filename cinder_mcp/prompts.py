@@ -496,7 +496,7 @@ def _ttl_audit(client, arguments):
     soon it expires, and list the soonest-expiring keys and the keys
     with no expiry so the operator can act on them. TTL is probed
     per key with TTL: -1 means no expiry, -2 means the key expired
-    between the KEYS scan and the TTL probe and is counted
+    between the SCAN and the TTL probe and is counted
     separately rather than bucketed. The scan is streamed: keys are
     processed batch by batch and only counts plus the bounded
     soonest / no-expiry lists are kept, so the prompt text stays
@@ -623,7 +623,7 @@ def _cleanup_plan(client, arguments):
     per-key TTL, type, and size probe — classify every key as safe
     to delete, expiring soon, risky to delete without confirmation,
     or keep, and ask the model to turn that into a concrete cleanup
-    plan. Keys that expire between the KEYS scan and the TTL probe
+    plan. Keys that expire between the SCAN and the TTL probe
     (TTL -2) are counted separately rather than classified. Keys
     that vanish between the TTL probe and the type probe are skipped
     the same way. The scan is streamed: each section keeps only its
@@ -748,7 +748,7 @@ def _keyspace_health(client, arguments):
     large the keyspace is. "Largest" is measured where it is cheap:
     string keys by byte length and containers by element count,
     reported separately because bytes and element counts are not
-    comparable. Keys that expire between the KEYS scan and the
+    comparable. Keys that expire between the SCAN and the
     probes are counted separately rather than reported. The
     recommended actions are derived from the data, not invented:
     no-expiry keys get a kv_expire suggestion (temporary-looking

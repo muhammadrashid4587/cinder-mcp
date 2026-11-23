@@ -1,7 +1,7 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
+GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
 ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
@@ -507,6 +507,42 @@ class FakeCinder(threading.Thread):
             keys = [k for k in list(self.store) if self._get(k) is not None
                     and _glob_match(pattern, k)]
             return "*%d\r\n" % len(keys) + "".join(self._bulk(k) for k in keys)
+        elif name == "SCAN":
+            # Cinder's cursor is a decimal index into the sorted
+            # matching keys; "0" starts (and ends) the walk. COUNT
+            # is honored exactly here — real cinder may return a
+            # few keys over when one hash bucket holds several
+            # matches, which the server-side tests do not depend on.
+            if not args or not args[0].isdigit():
+                return "-ERR invalid cursor\r\n"
+            cursor = int(args[0])
+            pattern = "*"
+            count = 10
+            i = 1
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "MATCH" and i + 1 < len(args):
+                    pattern = args[i + 1]
+                    i += 2
+                elif opt == "COUNT" and i + 1 < len(args):
+                    try:
+                        count = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR value is not an integer or out "
+                                "of range\r\n")
+                    i += 2
+                else:
+                    return "-ERR syntax error\r\n"
+            keys = sorted(k for k in list(self.store)
+                          if self._get(k) is not None
+                          and _glob_match(pattern, k))
+            page = keys[cursor:cursor + count]
+            nxt = cursor + len(page)
+            if nxt >= len(keys):
+                nxt = 0
+            return ("*2\r\n" + self._bulk(str(nxt))
+                    + "*%d\r\n" % len(page)
+                    + "".join(self._bulk(k) for k in page))
         elif name == "INCR" and len(args) == 1:
             try:
                 return ":%d\r\n" % self._incr(args[0], 1)
@@ -1016,18 +1052,24 @@ class McpTests(unittest.TestCase):
             if data["done"]:
                 self.assertEqual(data["cursor"], "")
                 break
+            # The cursor is cinder's opaque decimal cursor: pass it
+            # back verbatim, never read a key out of it.
             self.assertNotEqual(data["cursor"], "")
+            self.assertTrue(data["cursor"].isdigit(), data["cursor"])
             cursor = data["cursor"]
         self.assertEqual(pages, 3)
         self.assertEqual(seen, ["key:%03d" % i for i in range(250)])
-        # A cursor resumes mid-keyspace: past key:099 comes key:100.
-        data = self._scan_result({"batch_size": 5, "cursor": "key:099"})
+        # A cursor returned by one page resumes the walk: the first
+        # five keys come back, then the next five after it.
+        first = self._scan_result({"batch_size": 5})
         self.assertEqual(
-            data["keys"],
-            ["key:%03d" % i for i in range(100, 105)],
-        )
-        self.assertEqual(data["cursor"], "key:104")
-        self.assertFalse(data["done"])
+            first["keys"], ["key:%03d" % i for i in range(5)])
+        self.assertFalse(first["done"])
+        second = self._scan_result(
+            {"batch_size": 5, "cursor": first["cursor"]})
+        self.assertEqual(
+            second["keys"], ["key:%03d" % i for i in range(5, 10)])
+        self.assertFalse(second["done"])
         # The pattern filters, and a small keyspace finishes in one page.
         data = self._scan_result({"pattern": "key:00*"})
         self.assertEqual(
@@ -1043,7 +1085,8 @@ class McpTests(unittest.TestCase):
         self._seed_keys(2)
         for bad in ({"batch_size": 0}, {"batch_size": -1},
                     {"batch_size": 1001}, {"batch_size": "ten"},
-                    {"batch_size": True}, {"cursor": 7}):
+                    {"batch_size": True}, {"cursor": 7},
+                    {"cursor": "key:099"}, {"cursor": "abc"}):
             reply = self._call("tools/call", 1, {
                 "name": "kv_keys_scan", "arguments": bad,
             })
@@ -1062,7 +1105,7 @@ class McpTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 1)
         self.assertEqual(summary["results"][0]["result"], {
             "keys": ["key:000", "key:001"],
-            "cursor": "key:001",
+            "cursor": "2",
             "done": False,
             "batch_size": 2,
         })
@@ -1071,13 +1114,25 @@ class McpTests(unittest.TestCase):
         from cinder_mcp.scan import iter_keys
 
         class StubClient:
+            """Speaks cinder's SCAN: the cursor is a decimal index
+            into the sorted matching keys, COUNT caps the page.
+            KEYS is refused outright — iter_keys must not call it."""
+
             def __init__(self, keys):
-                self.keys = keys
+                self.keys = sorted(keys)
 
             def command(self, *args):
                 if args[0] == "KEYS":
-                    return list(self.keys)
-                raise AssertionError(args)
+                    raise AssertionError("iter_keys must use SCAN, not KEYS")
+                assert args[0] == "SCAN", args
+                cursor = int(args[1])
+                pattern = args[args.index("MATCH") + 1]
+                count = int(args[args.index("COUNT") + 1])
+                matches = [k for k in self.keys
+                           if _glob_match(pattern, k)]
+                page = matches[cursor:cursor + count]
+                nxt = cursor + len(page)
+                return [str(0 if nxt >= len(matches) else nxt), page]
 
         keys = ["key:%03d" % i for i in range(250)]
         batches = list(iter_keys(StubClient(keys), "key:*", batch_size=100))
@@ -1087,6 +1142,46 @@ class McpTests(unittest.TestCase):
         self.assertEqual(list(iter_keys(StubClient(keys), batch_size=1000)), [keys])
         # An empty keyspace yields no batches at all.
         self.assertEqual(list(iter_keys(StubClient([]))), [])
+
+    def test_iter_keys_dedupes_a_key_scan_returns_twice(self):
+        from cinder_mcp.scan import iter_keys
+
+        class ScriptedClient:
+            """SCAN returns key "e" on both pages, as a table resize
+            mid-walk can: iter_keys must yield it exactly once."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def command(self, *args):
+                assert args[0] == "SCAN", args
+                self.calls += 1
+                if self.calls == 1:
+                    return ["5", ["a", "b", "c", "d", "e"]]
+                return ["0", ["e", "f", "g"]]
+
+        batches = list(iter_keys(ScriptedClient(), "*", batch_size=100))
+        self.assertEqual(batches, [["a", "b", "c", "d", "e", "f", "g"]])
+
+    def test_iter_keys_continues_past_an_empty_scan_page(self):
+        from cinder_mcp.scan import iter_keys
+
+        class ScriptedClient:
+            """One SCAN call returns no keys with a live cursor: the
+            walk continues instead of stopping or looping forever."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def command(self, *args):
+                assert args[0] == "SCAN", args
+                self.calls += 1
+                if self.calls == 1:
+                    return ["3", []]
+                return ["0", ["x", "y"]]
+
+        batches = list(iter_keys(ScriptedClient(), "*", batch_size=100))
+        self.assertEqual(batches, [["x", "y"]])
 
     def test_iter_keys_rejects_bad_batch_size(self):
         from cinder_mcp.scan import iter_keys
@@ -1098,6 +1193,21 @@ class McpTests(unittest.TestCase):
         for bad in (0, -1, 1001, "ten", True):
             with self.assertRaises(ValueError, msg=bad):
                 list(iter_keys(StubClient(), batch_size=bad))
+
+    def test_scan_batch_rejects_a_malformed_scan_reply(self):
+        from cinder_mcp.scan import scan_batch
+
+        class BadReplyClient:
+            def __init__(self, reply):
+                self.reply = reply
+
+            def command(self, *args):
+                return self.reply
+
+        for bad in (["not-a-cursor", []], ["0", "not-a-list"],
+                    ["0"], "keys", None):
+            with self.assertRaises(ValueError, msg=bad):
+                scan_batch(BadReplyClient(bad))
 
     def test_tools_call_exists_and_expire(self):
         missing = self._call("tools/call", 1, {
@@ -3055,7 +3165,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("- old:secret → new:secret (string, 18 bytes", text)
 
     def test_prompts_get_key_migration_reports_key_expired_mid_scan(self):
-        # A stub client whose KEYS reply includes a key that is
+        # A stub client whose SCAN reply includes a key that is
         # already gone by the TTL probe: the real fake server can
         # only expire a key between the two calls by timing, so the
         # prompt is called directly with the expiry faked.
@@ -3063,8 +3173,8 @@ class McpTests(unittest.TestCase):
 
         class StubClient:
             def command(self, *args):
-                if args[0] == "KEYS":
-                    return ["gone", "ok"]
+                if args[0] == "SCAN":
+                    return ["0", ["gone", "ok"]]
                 if args[0] == "TTL":
                     return -2 if args[1] == "gone" else -1
                 if args[0] == "GET":

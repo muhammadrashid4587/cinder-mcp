@@ -60,7 +60,7 @@ TOOLS = [
     },
     {
         "name": "kv_keys_scan",
-        "description": "Walk the keys matching a glob pattern (* and ?) one bounded page at a time, SCAN-style. Returns {\"keys\": [...], \"cursor\": str, \"done\": bool, \"batch_size\": n}: at most `batch_size` keys per page (default 100). Pass the returned `cursor` back to fetch the next page; pass \"\" (or omit it) to start. When `done` is true the cursor is \"\" and the walk is finished. Pages are in sorted key order; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window, the same caveats real SCAN has.",
+        "description": "Walk the keys matching a glob pattern (* and ?) one bounded page at a time with cinder's real SCAN. Returns {\"keys\": [...], \"cursor\": str, \"done\": bool, \"batch_size\": n}: about `batch_size` keys per page (default 100) — COUNT is a hint to cinder, so a page can run a few keys over when several matches share one hash bucket. Pass the returned `cursor` back to fetch the next page; pass \"\" (or omit it) to start. When `done` is true the cursor is \"\" and the walk is finished. The cursor is opaque: pass it back verbatim, do not read meaning into it. Pages are in SCAN order, not sorted; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window, and a key can come back twice if the table resizes mid-walk, the same caveats real SCAN has.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -420,8 +420,9 @@ def _call_batch(client, args):
 
 
 # Ops an atomic batch may contain: the single-command tools, not
-# kv_keys_scan — its cursor walk re-runs KEYS between pages, which
-# cannot happen inside a transaction — and not kv_batch itself.
+# kv_keys_scan — its cursor walk needs several round trips, one
+# SCAN per page, which cannot happen inside a transaction — and
+# not kv_batch itself.
 ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
@@ -589,10 +590,10 @@ def _call_keys(client, args):
 
 
 def _call_keys_scan(client, args):
-    """kv_keys_scan: one bounded page of the keyspace. Returns
-    {"keys": [...], "cursor": str, "done": bool, "batch_size": n}.
-    Bad batch_size/cursor values fail the call instead of silently
-    ignoring the caller."""
+    """kv_keys_scan: one bounded page of the keyspace from one real
+    SCAN call. Returns {"keys": [...], "cursor": str, "done": bool,
+    "batch_size": n}. Bad batch_size/cursor values fail the call
+    instead of silently ignoring the caller."""
     return scan_batch(
         client,
         args.get("pattern", "*"),

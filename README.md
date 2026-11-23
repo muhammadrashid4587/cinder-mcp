@@ -73,7 +73,7 @@ threshold it crossed, so the client sees it without polling
 | `kv_set` | `SET key value [EX s \| PX ms]` | Optional `ex` / `px` TTL |
 | `kv_del` | `DEL key` | 1 if the key existed, 0 otherwise |
 | `kv_keys` | `KEYS pattern` | Glob `*` and `?`, defaults to `*`. Returns `{"keys": [...], "total": n, "returned": m, "sampled": bool}`: at most `limit` keys (default 100); a larger keyspace returns a deterministic sample seeded by `seed`, and `full: true` returns the whole list |
-| `kv_keys_scan` | `KEYS pattern` | Walk the matching keys one bounded page at a time, SCAN-style. Returns `{"keys": [...], "cursor": str, "done": bool, "batch_size": n}`: at most `batch_size` keys per page (default 100, max 1000). Pass the returned `cursor` back for the next page; `""` starts over. When `done` is true the cursor is `""` and the walk is finished. Pages are in sorted key order; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window — the same caveats real SCAN has. Each page re-runs `KEYS` under the hood, because cinder has no `SCAN` command yet; the page itself stays bounded |
+| `kv_keys_scan` | `SCAN cursor [MATCH pattern] [COUNT n]` | Walk the matching keys one bounded page at a time with cinder's real `SCAN`. Returns `{"keys": [...], "cursor": str, "done": bool, "batch_size": n}`: about `batch_size` keys per page (default 100, max 1000) — `COUNT` is a hint, so a page can run a few keys over when several matches share one hash bucket. Pass the returned `cursor` back for the next page; `""` starts over. When `done` is true the cursor is `""` and the walk is finished. The cursor is opaque: pass it back verbatim. Pages are in `SCAN` order, not sorted; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window, and a key can come back twice if the table resizes mid-walk — the same caveats real `SCAN` has |
 | `kv_incr` | `INCR key` / `INCRBY key n` | `by` defaults to 1 |
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
@@ -101,7 +101,8 @@ key is one indivisible step. The summary carries `"atomic": true`.
 
 Two honest limits. First, only the single-command ops can be
 queued: `kv_keys_scan` cannot run inside a transaction, because its
-cursor walk re-runs `KEYS` between pages. Second, queue-time and
+cursor walk needs one `SCAN` call per page, which cannot happen
+inside a transaction. Second, queue-time and
 EXEC-time failures behave differently, as in real Redis: an op that
 cannot be queued at all (unknown name, `kv_keys_scan`, a missing
 required argument, a bad `kv_keys` limit) fails the whole call
@@ -170,13 +171,17 @@ identical to the old load-everything scan at any batch size — the
 tests run the scanning prompts at batch sizes 1, 2, 7 and 100 over the same
 keyspace and compare the full prompt text.
 
-One honest limitation: cinder has no `SCAN` command yet, so the
-iterator is backed by one `KEYS` call whose reply is sliced into
-batches, and each `kv_keys_scan` page re-runs `KEYS`. The bounded
-part today is everything downstream of that reply. When cinder
-grows `SCAN`, the iterator switches to cursor batches and the
-`KEYS` reply disappears too, with no change to the tools or the
-prompts.
+The scanner is backed by cinder's real `SCAN` command (cinder
+0.26.0): `SCAN cursor [MATCH pattern] [COUNT n]` returns
+`[cursor, keys]`, and the walk repeats with the returned cursor
+until it comes back `0`. The tools and prompts did not change —
+only `cinder_mcp/scan.py` did. Two honest details: `COUNT` is a
+hint, so a page can run a few keys over `batch_size` when several
+matches share one hash bucket, and real `SCAN` may return a key
+twice if the table resizes mid-walk, so the prompt iterator
+dedupes against a seen set while `kv_keys_scan` exposes the raw
+paged walk, duplicates included. Pages are in `SCAN` order, not
+sorted key order.
 
 ## Roadmap
 
@@ -203,7 +208,8 @@ prompts.
 - ~~Sorted-set tools (`kv_zadd`, `kv_zrange`): expose cinder's ZADD/ZRANGE/ZREVRANGE so agents can work with leaderboards and ranked sets — `kv_zadd` takes a `members` object of member names to scores and returns the number of newly added members (plain form only: cinder 0.24.0 has no NX/XX/GT/LT/CH/INCR options), `kv_zrange` returns members in index order with optional `withscores` member/score objects and `rev` for highest-first, at most 1000 members per call; both are batchable, plain and atomic~~ (done, v0.23.0)
 - ~~More sorted-set tools (`kv_zcard`, `kv_zscore`, `kv_zrank`, `kv_zrem`, `kv_zincrby`): expose cinder's ZCARD/ZSCORE/ZRANK/ZREM/ZINCRBY — `kv_zcard` counts members (0 for a missing key), `kv_zscore` returns a member's score or null, `kv_zrank` returns a member's rank lowest-score-first or null, `kv_zrem` removes a list of members and counts the ones actually removed, `kv_zincrby` bumps a member's score (creating it when missing) and returns the new score; plus ZADD options from cinder 0.25.0 (`nx`/`xx`/`gt`/`lt`/`ch`/`incr` flags on `kv_zadd`, with conflicting combinations rejected as invalid params and `incr` returning the new score or null) — all batchable, plain and atomic~~ (done, v0.24.0)
 - ~~Sorted-set range by score (`kv_zrangebyscore`): expose cinder's ZRANGEBYSCORE/ZREVRANGEBYSCORE — `min`/`max` bounds as numbers or strings with optional `(` exclusivity and `-inf`/`+inf` defaults, `withscores` member/score objects, `rev` for highest-first, `offset`/`count` LIMIT paging, at most 1000 members per call; batchable, plain and atomic~~ (done, v0.25.0)
+- ~~Real `SCAN` keyspace scanner: `iter_keys` and `kv_keys_scan` now run cinder's real `SCAN` cursor loop (cinder 0.26.0, `SCAN cursor [MATCH pattern] [COUNT n]`) instead of slicing one `KEYS` reply — bounded batches, `MATCH` filtering, opaque decimal cursors, cursor exhaustion at `0`; the prompt iterator dedupes so a key a table resize returns twice is still covered exactly once, and `kv_keys_scan` exposes the raw paged walk with real `SCAN` caveats. The tools and prompts did not change, only `cinder_mcp/scan.py`~~ (done, v0.26.0)
 
 ## Next
 
-- Switch the scanner to real `SCAN` cursor batches once cinder implements `SCAN`, so the `KEYS` reply itself is bounded too; the tools and prompts do not change. Still blocked: `kv_pexpire` and real `SCAN` — cinder has neither.
+- `kv_pexpire` is still blocked: cinder has no `PEXPIRE` yet.
