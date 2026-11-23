@@ -901,10 +901,10 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_all_six_prompts(self):
+    def test_prompts_list_returns_all_seven_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 6)
+        self.assertEqual(len(prompts), 7)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
@@ -923,6 +923,14 @@ class McpTests(unittest.TestCase):
         self.assertEqual(prompts[5]["name"], "write-safety")
         self.assertEqual(prompts[5]["arguments"][0]["name"], "plan")
         self.assertTrue(prompts[5]["arguments"][0]["required"])
+        self.assertEqual(prompts[6]["name"], "ttl-renewal")
+        self.assertEqual(
+            [a["name"] for a in prompts[6]["arguments"]],
+            ["pattern", "keys", "target_ttl", "max_keys"],
+        )
+        self.assertTrue(
+            all(not a["required"] for a in prompts[6]["arguments"])
+        )
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -1637,6 +1645,173 @@ class McpTests(unittest.TestCase):
         text = self._write_safety_text(plan)
         self.assertNotIn("hunter2-dont-print", text)
         self.assertIn("op 0: kv_set 'secret'", text)
+
+    def _renewal_text(self, arguments=None, batch_size=None):
+        return self._prompt_text("ttl-renewal", arguments, batch_size)
+
+    def test_prompts_get_ttl_renewal_empty_keyspace(self):
+        text = self._renewal_text()
+        self.assertIn("TTL renewal plan (pattern '*', renew to 1d 0h).", text)
+        self.assertIn("Total keys scanned: 0", text)
+        self.assertIn("Plan covers 0 key(s); 0 more need renewal", text)
+        self.assertIn("Renew (0)", text)
+        self.assertIn("Give a first expiry (0)", text)
+        self.assertIn("Already fine (0)", text)
+        self.assertIn("Missing or expired (0)", text)
+        self.assertEqual(text.count("(none)"), 4)
+        self.assertIn("kv_expire", text)
+
+    def test_prompts_get_ttl_renewal_classifies_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "soon", "value": "v", "ex": 30},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "mid", "value": "v", "ex": 40000},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "far", "value": "v", "ex": 200000},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        text = self._renewal_text()
+        self.assertIn("Total keys scanned: 4", text)
+        self.assertIn("Plan covers 3 key(s); 0 more need renewal", text)
+        renew = self._section(text, "Renew (2)")
+        self.assertEqual(len(renew), 2)
+        self.assertRegex(renew[0], r"^- soon \(expires in (29|30)s, renew to 1d 0h with kv_expire 'soon' 86400\)$")
+        self.assertTrue(renew[1].startswith(
+            "- mid (expires in 11h 6m, renew to 1d 0h with kv_expire 'mid' 86400)"))
+        first_expiry = self._section(text, "Give a first expiry (1)")
+        self.assertEqual(first_expiry, [
+            "- forever (no expiry, set to 1d 0h with kv_expire 'forever' 86400)",
+        ])
+        already = self._section(text, "Already fine (1)")
+        self.assertEqual(len(already), 1)
+        self.assertTrue(already[0].startswith("- far (expires in 2d 7h)"))
+        self.assertIn("Missing or expired (0)", text)
+        self.assertIn("Do not renew the missing or expired keys", text)
+        self.assertIn("no PEXPIRE tool", text)
+
+    def test_prompts_get_ttl_renewal_target_ttl_argument(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "mid", "value": "v", "ex": 40000},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "far", "value": "v", "ex": 200000},
+        })
+        # Target 100000s: mid renews, far is already fine.
+        text = self._renewal_text({"target_ttl": "100000"})
+        self.assertIn("renew to 1d 3h", text)
+        renew = self._section(text, "Renew (1)")
+        self.assertTrue(renew[0].startswith("- mid (expires in "))
+        self.assertIn("kv_expire 'mid' 100000", renew[0])
+        self.assertIn("Already fine (1)", text)
+        # Target 300000s: both renew.
+        text = self._renewal_text({"target_ttl": "300000"})
+        self.assertIn("Plan covers 2 key(s)", text)
+        renew = self._section(text, "Renew (2)")
+        self.assertEqual(
+            [line.split(" (")[0][2:] for line in renew], ["mid", "far"])
+
+    def test_prompts_get_ttl_renewal_explicit_keys_flags_missing(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "soon", "value": "v", "ex": 30},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        text = self._renewal_text({
+            "keys": json.dumps(["soon", "ghost", "forever"]),
+        })
+        self.assertIn(
+            "TTL renewal plan (keys ['soon', 'ghost', 'forever'], renew to 1d 0h).",
+            text,
+        )
+        self.assertIn("Total keys scanned: 3", text)
+        self.assertIn("Plan covers 2 key(s); 0 more need renewal", text)
+        missing = self._section(text, "Missing or expired (1)")
+        self.assertEqual(missing, ["- ghost"])
+
+    def test_prompts_get_ttl_renewal_max_keys_caps_the_plan(self):
+        for i in range(5):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "exp:%d" % i, "value": "v",
+                              "ex": 100 + i * 100},
+            })
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        # Cap 2: the two soonest renewals, no first expiry, 4 uncovered.
+        text = self._renewal_text({"max_keys": "2"})
+        self.assertIn("Plan covers 2 key(s); 4 more need renewal", text)
+        renew = self._section(text, "Renew (2)")
+        self.assertEqual(
+            [line.split(" (")[0][2:] for line in renew[:2]],
+            ["exp:0", "exp:1"],
+        )
+        self.assertIn(
+            "... and 3 more expiring keys not covered by the cap", renew)
+        self.assertIn("Give a first expiry (0)", text)
+        self.assertIn(
+            "... and 1 more no-expiry keys not covered by the cap", text)
+
+    def test_prompts_get_ttl_renewal_rejects_bad_arguments(self):
+        for arguments in (
+            {"target_ttl": "soon"},
+            {"target_ttl": "0"},
+            {"target_ttl": "-5"},
+            {"max_keys": "many"},
+            {"max_keys": "0"},
+            {"max_keys": "101"},
+            {"keys": "not json"},
+            {"keys": '{"op": "kv_get"}'},
+            {"keys": '["a", 1]'},
+        ):
+            reply = self._call("prompts/get", 1, {
+                "name": "ttl-renewal", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_prompts_get_ttl_renewal_never_prints_values(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "soon", "value": "hunter2-dont-print", "ex": 30},
+        })
+        text = self._renewal_text()
+        self.assertNotIn("hunter2-dont-print", text)
+        self.assertIn("- soon (expires in ", text)
+
+    def test_prompts_ttl_renewal_same_result_at_any_batch_size(self):
+        # TTLs sit mid-rendering-unit, so a second of clock drift
+        # between runs cannot reorder or reword anything.
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "perm:%03d" % i, "value": "v"},
+            })
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "exp:%03d" % i, "value": "v",
+                              "ex": 100000 + i * 1000},
+            })
+        for i in range(10):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "soon:%03d" % i, "value": "v",
+                              "ex": 1930 + i * 10},
+            })
+        baseline = self._renewal_text(batch_size=100)
+        self.assertIn("Total keys scanned: 70", baseline)
+        self.assertIn("Plan covers 20 key(s); 20 more need renewal", baseline)
+        for size in (1, 2, 7):
+            self.assertEqual(
+                self._renewal_text(batch_size=size), baseline,
+                "batch_size=%d" % size,
+            )
 
     def test_metrics_resource_records_tool_calls(self):
         self._call("tools/call", 1, {

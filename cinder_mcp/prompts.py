@@ -23,7 +23,11 @@ against the live keyspace before anything runs: it flags overwrites
 of keys that never expire, overwrites of large keys, SETs that
 would destroy a list, set, or hash, INCRs that would fail on a
 non-integer or a container, and EXPIREs with a bad timeout, then
-asks the model for a go/no-go per risky op.
+asks the model for a go/no-go per risky op. ttl-renewal plans
+renewing the TTLs of keys that are expiring soon or have no expiry:
+it reads live TTLs, flags keys that are already expired or missing,
+and proposes one kv_expire renewal per key up to a safety cap,
+without ever printing a value.
 """
 
 import bisect
@@ -61,6 +65,24 @@ MAX_HEALTH_KEYS = 10
 # counted as not audited, so a huge plan never becomes a huge
 # prompt. Ops are audited in plan order.
 MAX_WRITE_SAFETY_OPS = 50
+
+# Default target TTL for a ttl-renewal plan, in seconds (1 day):
+# keys expiring sooner than this are proposed for renewal to it.
+DEFAULT_RENEWAL_TARGET_TTL = 86400
+
+# Default safety cap on how many keys a ttl-renewal plan covers:
+# renewals plus first-expiry keys, combined.
+DEFAULT_RENEWAL_MAX_KEYS = 20
+
+# The largest max_keys a ttl-renewal plan accepts. The cap is a
+# safety bound on a plan an operator runs by hand, so it stays
+# small enough to read; narrow the pattern or pass an explicit
+# keys list instead of raising it.
+MAX_RENEWAL_MAX_KEYS = 100
+
+# At most this many keys are listed in the ttl-renewal report's
+# already-fine and missing-or-expired sections.
+MAX_RENEWAL_LISTED = 10
 
 # Ops a write plan may contain that actually write. Read ops in a
 # plan are not audited: they change nothing, so there is nothing
@@ -192,6 +214,48 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "ttl-renewal",
+        "description": (
+            "Plan TTL renewals: read live TTLs for a key pattern or "
+            "an explicit list of keys, flag keys that are already "
+            "expired or missing and keys with no expiry, and propose "
+            "one kv_expire renewal per key up to a safety cap, "
+            "renewing each key to a configurable target TTL."
+        ),
+        "arguments": [
+            {
+                "name": "pattern",
+                "description": "Glob pattern of keys to include (* and ?). Defaults to all keys. Ignored when keys is given.",
+                "required": False,
+            },
+            {
+                "name": "keys",
+                "description": (
+                    "JSON array of exact key names to plan renewals "
+                    "for, e.g. '[\"session:1\", \"cache:x\"]'. "
+                    "Overrides pattern when given."
+                ),
+                "required": False,
+            },
+            {
+                "name": "target_ttl",
+                "description": (
+                    "TTL in seconds to renew each key to. Defaults "
+                    "to 86400 (1 day)."
+                ),
+                "required": False,
+            },
+            {
+                "name": "max_keys",
+                "description": (
+                    "Safety cap: at most this many keys are covered "
+                    "by the plan. Defaults to 20, at most 100."
+                ),
+                "required": False,
+            },
+        ],
+    },
 ]
 
 
@@ -218,6 +282,8 @@ def get_prompt(client, name, arguments):
         return _keyspace_health(client, arguments)
     if name == "write-safety":
         return _write_safety(client, arguments)
+    if name == "ttl-renewal":
+        return _ttl_renewal(client, arguments)
     raise ValueError("unknown prompt: %s" % name)
 
 
@@ -1060,6 +1126,199 @@ def _write_safety(client, arguments):
     ])
     return {
         "description": _prompt_def("write-safety")["description"],
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }
+
+
+def _parse_positive_int(raw, name, default):
+    """A prompt argument as a positive integer, or ValueError.
+    `raw` arrives as a string from prompts/get; `default` is used
+    when the argument was not given at all. Bools are rejected —
+    True is 1 to int() but is not a TTL anyone meant."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise ValueError("%s must be a positive integer, got: %r" % (name, raw))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a positive integer, got: %r" % (name, raw))
+    if value <= 0:
+        raise ValueError("%s must be a positive integer, got: %r" % (name, raw))
+    return value
+
+
+def _ttl_renewal(client, arguments):
+    """Plan TTL renewals: read the live TTL of every key matching a
+    pattern (or an explicit list of keys) and propose one kv_expire
+    renewal per key that needs one. Keys expiring sooner than the
+    target TTL are renewed to it, soonest first; keys with no
+    expiry get a first expiry at the target TTL. Keys already
+    living at least as long as the target need nothing. Keys that
+    are already expired or missing are flagged and never proposed
+    for renewal. The plan covers at most max_keys keys in total
+    (renewals plus first expiries); the rest are counted as not
+    covered, so the prompt text stays bounded however large the
+    keyspace is. Values are never read and never printed: only
+    TTLs are probed. One honest limit: renewals run as kv_expire
+    (EXPIRE, whole seconds) — there is no PEXPIRE tool, so
+    sub-second precision is not available."""
+    pattern = arguments.get("pattern", "*")
+    target_ttl = _parse_positive_int(
+        arguments.get("target_ttl"), "target_ttl",
+        DEFAULT_RENEWAL_TARGET_TTL,
+    )
+    max_keys = _parse_positive_int(
+        arguments.get("max_keys"), "max_keys", DEFAULT_RENEWAL_MAX_KEYS
+    )
+    if max_keys > MAX_RENEWAL_MAX_KEYS:
+        raise ValueError(
+            "max_keys must be at most %d, got: %d"
+            % (MAX_RENEWAL_MAX_KEYS, max_keys)
+        )
+    raw_keys = arguments.get("keys")
+    if raw_keys is not None:
+        try:
+            keys = json.loads(raw_keys)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "ttl-renewal keys must be a JSON array of key names, "
+                "got: %r" % (raw_keys[:100],)
+            )
+        if not isinstance(keys, list) or not all(
+            isinstance(key, str) for key in keys
+        ):
+            raise ValueError(
+                "ttl-renewal keys must be a JSON array of key names"
+            )
+        key_batches = [keys]
+        source = "keys %r" % (keys,)
+    else:
+        key_batches = iter_keys(client, pattern, PROMPT_SCAN_BATCH_SIZE)
+        source = "pattern %r" % pattern
+    renew = []  # (ttl, key), soonest first
+    no_expiry = []  # bounded sorted keys, at most MAX_RENEWAL_MAX_KEYS
+    no_expiry_count = 0
+    already_ok = []  # bounded sorted (ttl, key)
+    already_ok_count = 0
+    missing = []  # bounded sorted keys
+    missing_count = 0
+    total = 0
+    for batch in key_batches:
+        for key in batch:
+            total += 1
+            ttl = client.command("TTL", key)
+            if ttl == -2:
+                missing_count += 1
+                _bounded_insert(missing, key, MAX_RENEWAL_LISTED)
+            elif ttl == -1:
+                no_expiry_count += 1
+                _bounded_insert(no_expiry, key, MAX_RENEWAL_MAX_KEYS)
+            elif ttl < target_ttl:
+                renew.append((ttl, key))
+            else:
+                already_ok_count += 1
+                _bounded_insert(
+                    already_ok, (ttl, key), MAX_RENEWAL_LISTED
+                )
+    renew.sort()
+    no_expiry.sort()
+    # The cap covers renewals plus first expiries, soonest first:
+    # renewals fill the plan first, no-expiry keys take what is left.
+    plan_renew = renew[:max_keys]
+    plan_no_expiry = no_expiry[:max(0, max_keys - len(plan_renew))]
+    not_covered = (
+        (len(renew) - len(plan_renew))
+        + (no_expiry_count - len(plan_no_expiry))
+    )
+    target_text = _format_ttl(target_ttl)
+    lines = [
+        "TTL renewal plan (%s, renew to %s)." % (source, target_text),
+        "",
+        "Total keys scanned: %d" % total,
+        "Plan covers %d key(s); %d more need renewal but are outside "
+        "the cap of %d." % (
+            len(plan_renew) + len(plan_no_expiry), not_covered, max_keys
+        ),
+    ]
+    lines.extend([
+        "",
+        "Renew (%d) — expiring sooner than %s, soonest first:" % (
+            len(plan_renew), target_text
+        ),
+    ])
+    if plan_renew:
+        for ttl, key in plan_renew:
+            lines.append(
+                "- %s (expires in %s, renew to %s with kv_expire %r %d)"
+                % (key, _format_ttl(ttl), target_text, key, target_ttl)
+            )
+    else:
+        lines.append("(none)")
+    if len(renew) > len(plan_renew):
+        lines.append(
+            "... and %d more expiring keys not covered by the cap"
+            % (len(renew) - len(plan_renew))
+        )
+    lines.extend([
+        "",
+        "Give a first expiry (%d) — no expiry set, proposed expiry "
+        "is %s:" % (len(plan_no_expiry), target_text),
+    ])
+    if plan_no_expiry:
+        for key in plan_no_expiry:
+            lines.append(
+                "- %s (no expiry, set to %s with kv_expire %r %d)"
+                % (key, target_text, key, target_ttl)
+            )
+    else:
+        lines.append("(none)")
+    if no_expiry_count > len(plan_no_expiry):
+        lines.append(
+            "... and %d more no-expiry keys not covered by the cap"
+            % (no_expiry_count - len(plan_no_expiry))
+        )
+    lines.extend(["", "Already fine (%d) — living at least %s:" % (
+        already_ok_count, target_text
+    )])
+    if already_ok:
+        for ttl, key in already_ok:
+            lines.append("- %s (expires in %s)" % (key, _format_ttl(ttl)))
+        if already_ok_count > MAX_RENEWAL_LISTED:
+            lines.append(
+                "... and %d more" % (already_ok_count - MAX_RENEWAL_LISTED)
+            )
+    else:
+        lines.append("(none)")
+    lines.extend(["", "Missing or expired (%d) — do not renew these:" % missing_count])
+    if missing:
+        for key in missing:
+            lines.append("- %s" % key)
+        if missing_count > MAX_RENEWAL_LISTED:
+            lines.append(
+                "... and %d more" % (missing_count - MAX_RENEWAL_LISTED)
+            )
+    else:
+        lines.append("(none)")
+    lines.extend([
+        "",
+        "Produce the renewal plan as exact kv_expire calls, in the "
+        "order listed above, or as one kv_batch call with one "
+        "kv_expire op per key. For each no-expiry key, say first "
+        "whether it looks like it should expire at all — a key "
+        "that is permanent by design must not get an expiry just "
+        "because it has none — and leave out any key you would not "
+        "renew. Do not renew the missing or expired keys: they are "
+        "gone, and kv_expire on them would be a no-op. Renewals "
+        "run as kv_expire (EXPIRE, whole seconds); there is no "
+        "PEXPIRE tool, so sub-second precision is not available. "
+        "Do not run anything yourself: nothing in this plan has "
+        "changed the keyspace yet.",
+    ])
+    return {
+        "description": _prompt_def("ttl-renewal")["description"],
         "messages": [
             {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
         ],
