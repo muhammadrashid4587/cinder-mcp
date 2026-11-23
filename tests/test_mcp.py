@@ -901,10 +901,10 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_all_five_prompts(self):
+    def test_prompts_list_returns_all_six_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 5)
+        self.assertEqual(len(prompts), 6)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
@@ -920,6 +920,9 @@ class McpTests(unittest.TestCase):
         self.assertEqual(prompts[4]["name"], "keyspace-health")
         self.assertEqual(prompts[4]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[4]["arguments"][0]["required"])
+        self.assertEqual(prompts[5]["name"], "write-safety")
+        self.assertEqual(prompts[5]["arguments"][0]["name"], "plan")
+        self.assertTrue(prompts[5]["arguments"][0]["required"])
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -1465,6 +1468,175 @@ class McpTests(unittest.TestCase):
                 self._prompt_text("keyspace-health", batch_size=size), baseline,
                 "batch_size=%d" % size,
             )
+
+    def _write_safety_text(self, plan):
+        return self._prompt_text(
+            "write-safety", {"plan": json.dumps(plan)})
+
+    def test_prompts_get_write_safety_requires_plan(self):
+        reply = self._call("prompts/get", 1, {"name": "write-safety"})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("requires a plan argument", reply["error"]["message"])
+
+    def test_prompts_get_write_safety_rejects_bad_plan(self):
+        reply = self._call("prompts/get", 1, {
+            "name": "write-safety", "arguments": {"plan": "not json"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        self.assertIn("must be a JSON array of ops", reply["error"]["message"])
+        reply = self._call("prompts/get", 2, {
+            "name": "write-safety", "arguments": {"plan": '{"op": "kv_get"}'},
+        })
+        self.assertIn("error", reply)
+        self.assertIn("must be a JSON array of ops", reply["error"]["message"])
+
+    def test_prompts_get_write_safety_flags_overwrites(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {
+                "key": "soon", "value": "v", "ex": 3600},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "big", "value": "x" * 2000},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "count", "value": "41"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_set", "key": "forever", "value": "new"},
+            {"op": "kv_set", "key": "soon", "value": "new"},
+            {"op": "kv_set", "key": "big", "value": "new"},
+            {"op": "kv_set", "key": "todo", "value": "new"},
+            {"op": "kv_set", "key": "brand-new", "value": "new"},
+            {"op": "kv_set", "key": "brand-new-ttl", "value": "new", "ex": 3600},
+            {"op": "kv_del", "key": "forever"},
+            {"op": "kv_del", "key": "ghost"},
+            {"op": "kv_incr", "key": "name"},
+            {"op": "kv_incr", "key": "count"},
+            {"op": "kv_incr", "key": "todo"},
+            {"op": "kv_incr", "key": "fresh-counter"},
+            {"op": "kv_expire", "key": "forever", "seconds": 60},
+            {"op": "kv_expire", "key": "ghost", "seconds": 60},
+            {"op": "kv_expire", "key": "forever", "seconds": -5},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 15 op(s), 15 audited, 0 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_set 'forever' — overwrites a key that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_set 'big' — overwrites a key that never expires; "
+            "overwrites a large key (2000 bytes)",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_set 'todo' — would replace a list of 2 elements "
+            "with a string, destroying its contents; overwrites a key "
+            "that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 6: kv_del 'forever' — deletes a key that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 8: kv_incr 'name' — would fail: the current value is "
+            "not an integer",
+            risky,
+        )
+        self.assertIn(
+            "op 10: kv_incr 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_expire 'forever' — would fail: invalid expire "
+            "time -5",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_set 'soon' — overwrites a string of 1 bytes that "
+            "expires in ",
+            caution,
+        )
+        self.assertIn(
+            "op 4: kv_set 'brand-new' — creates a new key with no expiry",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 5: kv_set 'brand-new-ttl' — creates a new key expiring "
+            "in 1h 0m",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_del 'ghost' — no-op, the key does not exist", safe)
+        self.assertIn(
+            "op 9: kv_incr 'count' — increments a counter currently "
+            "at 41",
+            safe,
+        )
+        self.assertIn(
+            "op 11: kv_incr 'fresh-counter' — creates a counter "
+            "starting at 1",
+            safe,
+        )
+        self.assertIn(
+            "op 12: kv_expire 'forever' — sets a string of 1 bytes "
+            "that currently has no expiry to expire in 1m",
+            safe,
+        )
+        self.assertIn(
+            "op 13: kv_expire 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+        self.assertIn("kv_batch", text)
+        self.assertIn("nothing in this audit changed the keyspace", text)
+
+    def test_prompts_get_write_safety_read_ops_not_audited(self):
+        plan = [
+            {"op": "kv_get", "key": "a"},
+            {"op": "kv_set", "key": "a", "value": "v"},
+            {"op": "kv_keys_scan", "pattern": "*"},
+            {"op": "nope", "key": "a"},
+            {"op": "kv_set"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 5 op(s), 1 audited, 4 not audited.", text)
+        self.assertIn("op 0: kv_get is a read, not a write", text)
+        self.assertIn("op 2: not a write op: kv_keys_scan", text)
+        self.assertIn("op 3: not a write op: nope", text)
+        self.assertIn("op 4: op is missing a key", text)
+
+    def test_prompts_get_write_safety_caps_at_fifty_ops(self):
+        plan = [
+            {"op": "kv_set", "key": "k%d" % i, "value": "v"} for i in range(55)
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 55 op(s), 50 audited, 5 not audited.", text)
+        self.assertIn("op 50: past the 50-op audit cap", text)
+        self.assertIn("op 54: past the 50-op audit cap", text)
+        self.assertNotIn("op 49: past the 50-op audit cap", text)
+
+    def test_prompts_get_write_safety_never_prints_values(self):
+        plan = [
+            {"op": "kv_set", "key": "secret", "value": "hunter2-dont-print"},
+            {"op": "kv_set", "key": "other", "value": "hunter2-dont-print"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertNotIn("hunter2-dont-print", text)
+        self.assertIn("op 0: kv_set 'secret'", text)
 
     def test_metrics_resource_records_tool_calls(self):
         self._call("tools/call", 1, {

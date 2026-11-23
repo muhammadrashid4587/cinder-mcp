@@ -17,10 +17,17 @@ soon, risky to delete without confirmation, or keep, and asks the
 model to turn that into a concrete cleanup plan with exact kv_del
 calls. keyspace-health is the one-view health report: total keys,
 type breakdown, keys without TTL, soonest-expiring keys, the
-largest keys, and a short list of recommended actions.
+largest keys, and a short list of recommended actions. write-safety
+audits a proposed write plan — a JSON list of kv_batch-shaped ops —
+against the live keyspace before anything runs: it flags overwrites
+of keys that never expire, overwrites of large keys, SETs that
+would destroy a list, set, or hash, INCRs that would fail on a
+non-integer or a container, and EXPIREs with a bad timeout, then
+asks the model for a go/no-go per risky op.
 """
 
 import bisect
+import json
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
@@ -49,6 +56,18 @@ MAX_CLEANUP_KEYS = 20
 # keyspace-health report: no-expiry keys, soonest-expiring keys,
 # largest string keys, largest container keys.
 MAX_HEALTH_KEYS = 10
+
+# At most this many ops in a write plan are audited; the rest are
+# counted as not audited, so a huge plan never becomes a huge
+# prompt. Ops are audited in plan order.
+MAX_WRITE_SAFETY_OPS = 50
+
+# Ops a write plan may contain that actually write. Read ops in a
+# plan are not audited: they change nothing, so there is nothing
+# to flag about them. kv_keys_scan is a read too, but it is not a
+# kv_batch op at all, so it lands in the unparseable list instead.
+WRITE_SAFETY_WRITE_OPS = ("kv_set", "kv_del", "kv_incr", "kv_expire")
+WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -150,6 +169,29 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "write-safety",
+        "description": (
+            "Audit a proposed write plan against the live keyspace "
+            "before it runs: flag overwrites of keys that never "
+            "expire, overwrites of large keys, SETs that would "
+            "destroy a container, INCRs that would fail, and "
+            "EXPIREs with a bad timeout, and give a go/no-go per "
+            "risky op."
+        ),
+        "arguments": [
+            {
+                "name": "plan",
+                "description": (
+                    "JSON array of kv_batch-shaped ops to audit, e.g. "
+                    '[{"op": "kv_set", "key": "user:1", "value": "x"}, '
+                    '{"op": "kv_del", "key": "cache:old"}]. At most 50 '
+                    "ops are audited."
+                ),
+                "required": True,
+            },
+        ],
+    },
 ]
 
 
@@ -174,6 +216,8 @@ def get_prompt(client, name, arguments):
         return _cleanup_plan(client, arguments)
     if name == "keyspace-health":
         return _keyspace_health(client, arguments)
+    if name == "write-safety":
+        return _write_safety(client, arguments)
     raise ValueError("unknown prompt: %s" % name)
 
 
@@ -754,6 +798,268 @@ def _keyspace_health(client, arguments):
     ])
     return {
         "description": _prompt_def("keyspace-health")["description"],
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }
+
+
+def _is_int(text):
+    """True when `text` parses as an integer. Used for kv_incr's
+    current value and kv_expire's seconds: cinder answers INCR on a
+    non-integer and EXPIRE with a bad timeout with an error, so the
+    audit can predict those failures instead of letting the plan
+    discover them at runtime."""
+    try:
+        int(text)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _audit_write_op(client, op):
+    """Audit one write op from a write plan against the live
+    keyspace. Returns (verdict, line) where verdict is "safe",
+    "caution", or "risky", and line is the one-line rendering for
+    the prompt text. Raises ValueError when the op is not a write
+    op at all, is missing its key, or has a malformed argument, so
+    the caller can report it as not audited instead of guessing.
+    The op's value is never printed: values can be large or hold
+    secrets, and the audit is about the key, not its new value.
+    Verdicts: "risky" destroys data that is hard to get back or
+    would fail outright — overwriting or deleting a key that never
+    expires, overwriting or deleting a large key, a SET that would
+    replace a list, set, or hash with a string, an INCR on a
+    non-integer or a container, an EXPIRE with a bad timeout.
+    "caution" changes something but the damage is bounded — an
+    overwrite or delete of a key that expires soon anyway, or a
+    SET that creates a key with no expiry. Everything else is
+    "safe": creating an expiring key, INCR on a missing key, an
+    EXPIRE on an existing key, or a no-op on a missing key."""
+    name = op.get("op")
+    if name not in WRITE_SAFETY_WRITE_OPS:
+        raise ValueError("not a write op: %s" % name)
+    key = op.get("key")
+    if not key:
+        raise ValueError("op is missing a key: %r" % (op,))
+    if client.command("EXISTS", key) == 0:
+        if name == "kv_set":
+            ttl_arg = op.get("ex", op.get("px"))
+            if ttl_arg is not None and not _is_int(ttl_arg):
+                return "risky", (
+                    "kv_set %r — would fail: bad TTL %r (not an integer)"
+                    % (key, ttl_arg)
+                )
+            if op.get("ex") is not None or op.get("px") is not None:
+                return "safe", (
+                    "kv_set %r — creates a new key expiring in %s"
+                    % (key, _format_ttl(int(op["ex"])) if op.get("ex") is not None
+                       else "%dms" % int(op["px"]))
+                )
+            return "caution", (
+                "kv_set %r — creates a new key with no expiry"
+                % key
+            )
+        if name == "kv_del":
+            return "safe", "kv_del %r — no-op, the key does not exist" % key
+        if name == "kv_incr":
+            by = op.get("by", 1)
+            if not _is_int(by):
+                raise ValueError("kv_incr by is not an integer: %r" % (by,))
+            return "safe", (
+                "kv_incr %r — creates a counter starting at %s"
+                % (key, by)
+            )
+        # kv_expire on a missing key.
+        seconds = op.get("seconds")
+        if seconds is None:
+            raise ValueError("kv_expire is missing seconds: %r" % (op,))
+        if not _is_int(seconds) or int(seconds) < 0:
+            return "risky", (
+                "kv_expire %r — would fail: invalid expire time %r"
+                % (key, seconds)
+            )
+        return "safe", "kv_expire %r — no-op, the key does not exist" % key
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        return "safe", (
+            "%s %r — no-op, the key expired while auditing"
+            % (name, key)
+        )
+    try:
+        kind, size_value, size, sample = _inspect_key(client, key)
+    except ValueError:
+        return "safe", (
+            "%s %r — no-op, the key expired while auditing"
+            % (name, key)
+        )
+    if ttl == -1:
+        ttl_text = "no expiry"
+    else:
+        ttl_text = "expires in %s" % _format_ttl(ttl)
+    large = (
+        (kind == "string" and size_value >= HEALTH_BIG_STRING_BYTES)
+        or (kind != "string" and size_value >= HEALTH_BIG_CONTAINER_ELEMENTS)
+    )
+    if name == "kv_set":
+        ttl_arg = op.get("ex", op.get("px"))
+        if ttl_arg is not None and not _is_int(ttl_arg):
+            return "risky", (
+                "kv_set %r — would fail: bad TTL %r (not an integer); "
+                "the key is a %s of %s with %s"
+                % (key, ttl_arg, kind, size, ttl_text)
+            )
+        flags = []
+        if kind != "string":
+            flags.append(
+                "would replace a %s of %s with a string, destroying "
+                "its contents" % (kind, size)
+            )
+        if ttl == -1:
+            flags.append("overwrites a key that never expires")
+        if large:
+            flags.append("overwrites a large key (%s)" % size)
+        if flags:
+            return "risky", "kv_set %r — %s" % (key, "; ".join(flags))
+        return "caution", (
+            "kv_set %r — overwrites a %s of %s that %s"
+            % (key, kind, size, ttl_text)
+        )
+    if name == "kv_del":
+        flags = []
+        if ttl == -1:
+            flags.append("deletes a key that never expires")
+        if large:
+            flags.append("deletes a large key (%s)" % size)
+        if kind != "string":
+            flags.append("deletes a %s of %s" % (kind, size))
+        if flags:
+            return "risky", "kv_del %r — %s" % (key, "; ".join(flags))
+        return "caution", (
+            "kv_del %r — deletes a %s of %s that %s"
+            % (key, kind, size, ttl_text)
+        )
+    if name == "kv_incr":
+        by = op.get("by", 1)
+        if not _is_int(by):
+            raise ValueError("kv_incr by is not an integer: %r" % (by,))
+        if kind != "string":
+            return "risky", (
+                "kv_incr %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        if not _is_int(sample):
+            return "risky", (
+                "kv_incr %r — would fail: the current value is not "
+                "an integer" % key
+            )
+        return "safe", (
+            "kv_incr %r — increments a counter currently at %s"
+            % (key, sample)
+        )
+    # kv_expire on an existing key.
+    seconds = op.get("seconds")
+    if seconds is None:
+        raise ValueError("kv_expire is missing seconds: %r" % (op,))
+    if not _is_int(seconds) or int(seconds) < 0:
+        return "risky", (
+            "kv_expire %r — would fail: invalid expire time %r"
+            % (key, seconds)
+        )
+    return "safe", (
+        "kv_expire %r — sets a %s of %s that currently has %s to "
+        "expire in %s" % (key, kind, size, ttl_text, _format_ttl(int(seconds)))
+    )
+
+
+def _write_safety(client, arguments):
+    """Audit a proposed write plan against the live keyspace before
+    anything runs. `plan` is a JSON array of kv_batch-shaped ops;
+    each write op is probed live (EXISTS, TTL, type, size) and
+    given a verdict of safe, caution, or risky. Read ops are not
+    audited — they change nothing — and malformed ops are reported
+    as not audited rather than guessed at. Only the first
+    MAX_WRITE_SAFETY_OPS ops are audited, so the prompt text stays
+    bounded however long the plan is. Values are never printed.
+    One honest limit: cinder keeps no per-key access counts, so
+    there is no way to tell a hot key from a cold one — the audit
+    flags size, permanence, and type instead of hotness."""
+    raw_plan = arguments.get("plan")
+    if not raw_plan:
+        raise ValueError("write-safety requires a plan argument")
+    try:
+        plan = json.loads(raw_plan)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "write-safety plan must be a JSON array of ops, got: %r"
+            % (raw_plan[:100],)
+        )
+    if not isinstance(plan, list):
+        raise ValueError(
+            "write-safety plan must be a JSON array of ops, got a %s"
+            % type(plan).__name__
+        )
+    audited = {"safe": [], "caution": [], "risky": []}
+    counts = {"safe": 0, "caution": 0, "risky": 0}
+    skipped = []  # (op index, reason) for ops not audited
+    for index, op in enumerate(plan):
+        if index >= MAX_WRITE_SAFETY_OPS:
+            skipped.append(
+                (index, "past the %d-op audit cap" % MAX_WRITE_SAFETY_OPS)
+            )
+            continue
+        if not isinstance(op, dict):
+            skipped.append((index, "not an op object: %r" % (op,)))
+            continue
+        name = op.get("op")
+        if name in WRITE_SAFETY_READ_OPS:
+            skipped.append((index, "%s is a read, not a write" % name))
+            continue
+        try:
+            verdict, line = _audit_write_op(client, op)
+        except ValueError as exc:
+            skipped.append((index, str(exc)))
+            continue
+        counts[verdict] += 1
+        audited[verdict].append((index, line))
+    lines = [
+        "Write-safety audit of a proposed write plan.",
+        "",
+        "Plan: %d op(s), %d audited, %d not audited."
+        % (len(plan), sum(counts.values()), len(skipped)),
+    ]
+    section_text = [
+        ("risky", "Risky (%d) — do not run these as written:"),
+        ("caution", "Caution (%d) — safe to run only if the overwrite is intended:"),
+        ("safe", "Safe (%d):"),
+    ]
+    for verdict, header in section_text:
+        lines.extend(["", header % counts[verdict]])
+        if audited[verdict]:
+            for index, line in audited[verdict]:
+                lines.append("op %d: %s" % (index, line))
+        else:
+            lines.append("(none)")
+    if skipped:
+        lines.extend(["", "Not audited (%d):" % len(skipped)])
+        for index, reason in skipped:
+            lines.append("op %d: %s" % (index, reason))
+    lines.extend([
+        "",
+        "Give a go/no-go verdict for the plan as a whole, then per "
+        "risky op: what exactly would go wrong if it ran, and what "
+        "to change — a different key, a kv_expire first, a backup "
+        "read with kv_get or cinder://key/<key> before overwriting, "
+        "or dropping the op — to make it safe. For the caution ops, "
+        "say which ones are fine as written and which need a "
+        "second look, and why. Then list the exact safe subset as "
+        "one kv_batch call, in plan order, leaving out every risky "
+        "op and every op you would not endorse. Do not run anything "
+        "yourself: the plan has not run yet, and nothing in this "
+        "audit changed the keyspace.",
+    ])
+    return {
+        "description": _prompt_def("write-safety")["description"],
         "messages": [
             {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
         ],
