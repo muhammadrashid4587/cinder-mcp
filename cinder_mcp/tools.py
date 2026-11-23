@@ -6,6 +6,7 @@ fragments, as the MCP spec requires for tools/list.
 
 import hashlib
 
+from .resp import RespError
 from .scan import (
     DEFAULT_SCAN_BATCH_SIZE,
     scan_batch,
@@ -113,10 +114,11 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists or kv_expire plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. Not atomic: cinder has no MULTI yet, so a batch is a convenience round-trip saver, not a transaction. At most 100 ops per call.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_exists or kv_expire plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "atomic": {"type": "boolean"},
                 "ops": {
                     "type": "array",
                     "items": {
@@ -203,12 +205,13 @@ def _call_batch(client, args):
 
     Ops run sequentially against cinder; a failed op is recorded in
     place and the batch keeps going, so one bad op never discards
-    the rest. The summary is {"results": [...], "ok": n, "failed": m}
-    where each result is {"op": ..., "ok": true, "result": ...} or
-    {"op": ..., "ok": false, "error": ...}. Not atomic: cinder has
-    no MULTI yet, so this is a round-trip saver, not a transaction.
+    the rest. The summary is {"results": [...], "ok": n, "failed": m,
+    "atomic": bool} where each result is {"op": ..., "ok": true,
+    "result": ...} or {"op": ..., "ok": false, "error": ...}.
     Batch-level problems (ops missing, not a list, empty, over the
-    cap) raise ValueError and fail the whole call."""
+    cap) raise ValueError and fail the whole call. With
+    atomic=true the ops run as one MULTI/EXEC transaction instead;
+    see _call_batch_atomic."""
     ops = args.get("ops")
     if not isinstance(ops, list):
         raise ValueError("kv_batch requires ops to be a list")
@@ -218,6 +221,11 @@ def _call_batch(client, args):
         raise ValueError(
             "kv_batch accepts at most %d ops, got %d" % (MAX_BATCH_OPS, len(ops))
         )
+    atomic = args.get("atomic", False)
+    if not isinstance(atomic, bool):
+        raise ValueError("kv_batch atomic must be true or false")
+    if atomic:
+        return _call_batch_atomic(client, ops)
     results = []
     ok_count = 0
     for op in ops:
@@ -244,6 +252,65 @@ def _call_batch(client, args):
         "results": results,
         "ok": ok_count,
         "failed": len(results) - ok_count,
+        "atomic": False,
+    }
+
+
+# Ops an atomic batch may contain: the single-command tools, not
+# kv_keys_scan — its cursor walk re-runs KEYS between pages, which
+# cannot happen inside a transaction — and not kv_batch itself.
+ATOMIC_BATCHABLE_TOOLS = {
+    "kv_get", "kv_set", "kv_del", "kv_keys",
+    "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
+}
+
+
+def _call_batch_atomic(client, ops):
+    """Run the ops as one MULTI/EXEC transaction and return the same
+    summary shape as the plain batch, with "atomic": true.
+
+    Every op is turned into its argv and validated before anything
+    is sent, so an op that cannot be queued (unknown name,
+    kv_keys_scan, a missing required argument) fails the whole call
+    up front and nothing runs. Once queued, the ops execute together
+    with no other client interleaved; an op that fails at EXEC time
+    (INCR on a non-integer, EXPIRE with a bad time) is recorded in
+    place as an error while the rest still run, exactly as cinder's
+    EXEC reports it."""
+    argv_list = []
+    for op in ops:
+        if not isinstance(op, dict) or not isinstance(op.get("op"), str):
+            raise ValueError(
+                "atomic kv_batch: each op needs an op name")
+        op_name = op["op"]
+        if op_name not in ATOMIC_BATCHABLE_TOOLS:
+            raise ValueError(
+                "atomic kv_batch: op cannot run in a transaction: %s"
+                % op_name
+            )
+        argv_list.append(_op_argv(op_name, op))
+    replies = client.transaction(argv_list)
+    results = []
+    ok_count = 0
+    for op, reply in zip(ops, replies):
+        op_name = op["op"]
+        if isinstance(reply, RespError):
+            results.append(
+                {"op": op_name, "ok": False, "error": str(reply)})
+            continue
+        if op_name == "kv_keys":
+            # KEYS came back as a raw list inside the transaction;
+            # apply the same sampling the standalone tool does.
+            value = _keys_result(reply or [], op)
+        else:
+            value = reply
+        results.append({"op": op_name, "ok": True, "result": value})
+        ok_count += 1
+    return {
+        "results": results,
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+        "atomic": True,
     }
 
 
@@ -269,13 +336,11 @@ def sample_keys(keys, limit, seed=""):
     return sorted(ranked[:limit])
 
 
-def _call_keys(client, args):
-    """kv_keys: KEYS, then bound the listing. Returns {"keys": [...],
-    "total": n, "returned": m, "sampled": bool} where total is the size
-    of the matching keyspace, returned is how many keys came back, and
-    sampled says whether the list was cut down to a sample. Small
-    keyspaces come back whole (sampled false); a keyspace larger than
-    `limit` (default 100) comes back as a deterministic seeded sample;
+def _keys_result(keys, args):
+    """The kv_keys return shape for a fetched key list: {"keys": [...],
+    "total": n, "returned": m, "sampled": bool}. Small keyspaces come
+    back whole (sampled false); a keyspace larger than `limit`
+    (default 100) comes back as a deterministic seeded sample;
     full=true returns the whole list whatever its size. Bad limit/full/
     seed values fail the call instead of silently ignoring the caller."""
     full = args.get("full", False)
@@ -291,7 +356,6 @@ def _call_keys(client, args):
     seed = args.get("seed", "")
     if not isinstance(seed, str):
         raise ValueError("kv_keys seed must be a string")
-    keys = client.command("KEYS", args.get("pattern", "*")) or []
     total = len(keys)
     if full or total <= limit:
         return {
@@ -309,6 +373,12 @@ def _call_keys(client, args):
     }
 
 
+def _call_keys(client, args):
+    """kv_keys: KEYS, then bound the listing (see _keys_result)."""
+    keys = client.command("KEYS", args.get("pattern", "*")) or []
+    return _keys_result(keys, args)
+
+
 def _call_keys_scan(client, args):
     """kv_keys_scan: one bounded page of the keyspace. Returns
     {"keys": [...], "cursor": str, "done": bool, "batch_size": n}.
@@ -322,33 +392,45 @@ def _call_keys_scan(client, args):
     )
 
 
-def _call_single(client, name, args):
+def _op_argv(name, args):
+    """One batchable op as a RESP argv list, for queuing inside a
+    transaction. Raises ValueError on a missing required argument,
+    and on kv_keys_scan, whose cursor walk cannot run inside MULTI.
+    kv_keys validates its limit/full/seed here too, so a bad sampling
+    argument fails an atomic batch up front instead of after EXEC."""
     if name == "kv_get":
-        return client.command("GET", _require(args, "key"))
+        return ["GET", _require(args, "key")]
     if name == "kv_set":
         cmd = ["SET", _require(args, "key"), _require(args, "value")]
         if args.get("ex") is not None:
             cmd += ["EX", args["ex"]]
         if args.get("px") is not None:
             cmd += ["PX", args["px"]]
-        return client.command(*cmd)
+        return cmd
     if name == "kv_del":
-        return client.command("DEL", _require(args, "key"))
+        return ["DEL", _require(args, "key")]
+    if name == "kv_keys":
+        # Validate the sampling arguments now; the list itself is
+        # sampled from the EXEC reply by _keys_result.
+        _keys_result([], args)
+        return ["KEYS", args.get("pattern", "*")]
+    if name == "kv_incr":
+        by = args.get("by", 1)
+        if by == 1:
+            return ["INCR", _require(args, "key")]
+        return ["INCRBY", _require(args, "key"), by]
+    if name == "kv_ttl":
+        return ["TTL", _require(args, "key")]
+    if name == "kv_exists":
+        return ["EXISTS", _require(args, "key")]
+    if name == "kv_expire":
+        return ["EXPIRE", _require(args, "key"), _require(args, "seconds")]
+    raise ValueError("unknown or unbatchable op: %s" % name)
+
+
+def _call_single(client, name, args):
     if name == "kv_keys":
         return _call_keys(client, args)
     if name == "kv_keys_scan":
         return _call_keys_scan(client, args)
-    if name == "kv_incr":
-        by = args.get("by", 1)
-        if by == 1:
-            return client.command("INCR", _require(args, "key"))
-        return client.command("INCRBY", _require(args, "key"), by)
-    if name == "kv_ttl":
-        return client.command("TTL", _require(args, "key"))
-    if name == "kv_exists":
-        return client.command("EXISTS", _require(args, "key"))
-    if name == "kv_expire":
-        return client.command(
-            "EXPIRE", _require(args, "key"), _require(args, "seconds")
-        )
-    raise ValueError("unknown tool: %s" % name)
+    return client.command(*_op_argv(name, args))

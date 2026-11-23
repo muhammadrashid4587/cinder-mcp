@@ -2,7 +2,7 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, INCR, INCRBY, TTL, EXISTS, EXPIRE, LLEN, SCARD, HLEN,
-LRANGE, SMEMBERS, HGETALL)
+LRANGE, SMEMBERS, HGETALL, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, or dict value so the
@@ -110,6 +110,8 @@ class FakeCinder(threading.Thread):
 
     def _handle(self, conn):
         f = conn.makefile("rb")
+        in_multi = False
+        queue = []
         try:
             while True:
                 try:
@@ -120,102 +122,141 @@ class FakeCinder(threading.Thread):
                     self._reply(conn, "-ERR empty command\r\n")
                     continue
                 name = cmd[0].upper()
-                args = cmd[1:]
-                if name == "PING":
-                    self._reply(conn, "+PONG\r\n")
-                elif name == "SET" and len(args) >= 2:
-                    key, value = args[0], args[1]
-                    expires = None
-                    i = 2
-                    while i < len(args):
-                        opt = args[i].upper()
-                        if opt == "EX":
-                            expires = time.time() + int(args[i + 1])
-                            i += 2
-                        elif opt == "PX":
-                            expires = time.time() + int(args[i + 1]) / 1000.0
-                            i += 2
-                        else:
-                            i += 1
-                    self.store[key] = (value, expires)
-                    self._reply(conn, "+OK\r\n")
-                elif name == "GET" and len(args) == 1:
-                    value = self._get(args[0])
-                    if value is not None and not isinstance(value, str):
-                        self._reply(conn, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                if name == "MULTI":
+                    if in_multi:
+                        self._reply(conn, "-ERR MULTI calls can not be nested\r\n")
                     else:
-                        self._reply(conn, self._bulk(value))
-                elif name == "LLEN" and len(args) == 1:
-                    self._reply(conn, self._container_len(args[0], list))
-                elif name == "SCARD" and len(args) == 1:
-                    self._reply(conn, self._container_len(args[0], set))
-                elif name == "HLEN" and len(args) == 1:
-                    self._reply(conn, self._container_len(args[0], dict))
-                elif name == "LRANGE" and len(args) == 3:
-                    self._reply(conn, self._container_items(args[0], list))
-                elif name == "SMEMBERS" and len(args) == 1:
-                    self._reply(conn, self._container_items(args[0], set))
-                elif name == "HGETALL" and len(args) == 1:
-                    value = self._get(args[0])
-                    if value is None:
-                        self._reply(conn, "*0\r\n")
-                    elif not isinstance(value, dict):
-                        self._reply(conn, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                        in_multi = True
+                        queue = []
+                        self._reply(conn, "+OK\r\n")
+                elif name == "DISCARD":
+                    if not in_multi:
+                        self._reply(conn, "-ERR DISCARD without MULTI\r\n")
                     else:
-                        flat = [x for pair in value.items() for x in pair]
-                        out = "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+                        in_multi = False
+                        queue = []
+                        self._reply(conn, "+OK\r\n")
+                elif name == "EXEC":
+                    if not in_multi:
+                        self._reply(conn, "-ERR EXEC without MULTI\r\n")
+                    else:
+                        in_multi = False
+                        queued, queue = queue, []
+                        out = "*%d\r\n" % len(queued) + "".join(
+                            self._dispatch(c) for c in queued
+                        )
                         self._reply(conn, out)
-                elif name == "DEL":
-                    n = sum(1 for k in args if self._get(k) is not None)
-                    for k in args:
-                        self.store.pop(k, None)
-                    self._reply(conn, ":%d\r\n" % n)
-                elif name == "KEYS":
-                    pattern = args[0] if args else "*"
-                    keys = [k for k in list(self.store) if self._get(k) is not None
-                            and _glob_match(pattern, k)]
-                    out = "*%d\r\n" % len(keys) + "".join(self._bulk(k) for k in keys)
-                    self._reply(conn, out)
-                elif name == "INCR" and len(args) == 1:
-                    self._reply(conn, ":%d\r\n" % self._incr(args[0], 1))
-                elif name == "INCRBY" and len(args) == 2:
-                    self._reply(conn, ":%d\r\n" % self._incr(args[0], int(args[1])))
-                elif name == "TTL" and len(args) == 1:
-                    entry = self.store.get(args[0])
-                    if entry is None or (entry[1] is not None and entry[1] <= time.time()):
-                        self.store.pop(args[0], None)
-                        self._reply(conn, ":-2\r\n")
-                    elif entry[1] is None:
-                        self._reply(conn, ":-1\r\n")
-                    else:
-                        self._reply(conn, ":%d\r\n" % int(entry[1] - time.time()))
-                elif name == "EXISTS":
-                    n = sum(1 for k in args if self._get(k) is not None)
-                    self._reply(conn, ":%d\r\n" % n)
-                elif name == "EXPIRE" and len(args) == 2:
-                    seconds = int(args[1])
-                    if seconds < 0:
-                        self._reply(conn, "-ERR invalid expire time in 'expire' command\r\n")
-                    elif self._get(args[0]) is None:
-                        self._reply(conn, ":0\r\n")
-                    else:
-                        value, _ = self.store[args[0]]
-                        self.store[args[0]] = (value, time.time() + seconds)
-                        self._reply(conn, ":1\r\n")
-                elif name == "INFO":
-                    info = (
-                        "# Server\r\n"
-                        "cinder_version:0.4.0\r\n"
-                        "uptime_in_seconds:42\r\n"
-                        "total_commands_processed:7\r\n"
-                        "# Keyspace\r\n"
-                        "keys:%d\r\n" % len(self.store)
-                    )
-                    self._reply(conn, self._bulk(info))
+                elif in_multi:
+                    queue.append(cmd)
+                    self._reply(conn, "+QUEUED\r\n")
                 else:
-                    self._reply(conn, "-ERR unknown command\r\n")
+                    self._reply(conn, self._dispatch(cmd))
         finally:
             conn.close()
+
+    def _dispatch(self, cmd):
+        """Run one command against the fake store and return its raw
+        RESP reply text. Errors are reply text, not exceptions, so an
+        EXEC array can carry a failed op in place like real cinder."""
+        name = cmd[0].upper()
+        args = cmd[1:]
+        if name == "PING":
+            return "+PONG\r\n"
+        elif name == "SET" and len(args) >= 2:
+            key, value = args[0], args[1]
+            expires = None
+            i = 2
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "EX":
+                    expires = time.time() + int(args[i + 1])
+                    i += 2
+                elif opt == "PX":
+                    expires = time.time() + int(args[i + 1]) / 1000.0
+                    i += 2
+                else:
+                    i += 1
+            self.store[key] = (value, expires)
+            return "+OK\r\n"
+        elif name == "GET" and len(args) == 1:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return self._bulk(value)
+        elif name == "LLEN" and len(args) == 1:
+            return self._container_len(args[0], list)
+        elif name == "SCARD" and len(args) == 1:
+            return self._container_len(args[0], set)
+        elif name == "HLEN" and len(args) == 1:
+            return self._container_len(args[0], dict)
+        elif name == "LRANGE" and len(args) == 3:
+            return self._container_items(args[0], list)
+        elif name == "SMEMBERS" and len(args) == 1:
+            return self._container_items(args[0], set)
+        elif name == "HGETALL" and len(args) == 1:
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            elif not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            flat = [x for pair in value.items() for x in pair]
+            return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name == "DEL":
+            n = sum(1 for k in args if self._get(k) is not None)
+            for k in args:
+                self.store.pop(k, None)
+            return ":%d\r\n" % n
+        elif name == "KEYS":
+            pattern = args[0] if args else "*"
+            keys = [k for k in list(self.store) if self._get(k) is not None
+                    and _glob_match(pattern, k)]
+            return "*%d\r\n" % len(keys) + "".join(self._bulk(k) for k in keys)
+        elif name == "INCR" and len(args) == 1:
+            try:
+                return ":%d\r\n" % self._incr(args[0], 1)
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+        elif name == "INCRBY" and len(args) == 2:
+            try:
+                return ":%d\r\n" % self._incr(args[0], int(args[1]))
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+        elif name == "TTL" and len(args) == 1:
+            entry = self.store.get(args[0])
+            if entry is None or (entry[1] is not None and entry[1] <= time.time()):
+                self.store.pop(args[0], None)
+                return ":-2\r\n"
+            elif entry[1] is None:
+                return ":-1\r\n"
+            return ":%d\r\n" % int(entry[1] - time.time())
+        elif name == "EXISTS":
+            n = sum(1 for k in args if self._get(k) is not None)
+            return ":%d\r\n" % n
+        elif name == "EXPIRE" and len(args) == 2:
+            try:
+                seconds = int(args[1])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            if seconds < 0:
+                return "-ERR invalid expire time in 'expire' command\r\n"
+            elif self._get(args[0]) is None:
+                return ":0\r\n"
+            value, _ = self.store[args[0]]
+            self.store[args[0]] = (value, time.time() + seconds)
+            return ":1\r\n"
+        elif name == "INFO":
+            info = (
+                "# Server\r\n"
+                "cinder_version:0.4.0\r\n"
+                "uptime_in_seconds:42\r\n"
+                "total_commands_processed:7\r\n"
+                "# Keyspace\r\n"
+                "keys:%d\r\n" % len(self.store)
+            )
+            return self._bulk(info)
+        return "-ERR unknown command\r\n"
 
     def _container_len(self, key, kind):
         value = self._get(key)
@@ -392,6 +433,104 @@ class McpTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 1)
         self.assertEqual(summary["failed"], 1)
         self.assertIn("unbatchable", summary["results"][0]["error"])
+
+    def _batch_summary(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_tools_call_atomic_batch_runs_as_one_transaction(self):
+        summary = self._batch_summary({"atomic": True, "ops": [
+            {"op": "kv_set", "key": "t:count", "value": "10"},
+            {"op": "kv_incr", "key": "t:count", "by": 5},
+            {"op": "kv_get", "key": "t:count"},
+            {"op": "kv_get", "key": "t:missing"},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(
+            [r["result"] for r in summary["results"]],
+            ["OK", 15, "15", None],
+        )
+        # The ops saw each other's effects inside the transaction:
+        # the GET read the value the INCR in the same batch wrote.
+        get_reply = self._call("tools/call", 2, {
+            "name": "kv_get", "arguments": {"key": "t:count"},
+        })
+        self.assertEqual(get_reply["result"]["content"][0]["text"], "15")
+
+    def test_tools_call_atomic_batch_keeps_going_past_exec_time_error(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "t:str", "value": "abc"},
+        })
+        summary = self._batch_summary({"atomic": True, "ops": [
+            {"op": "kv_set", "key": "t:one", "value": "1"},
+            # INCR on a non-integer fails at EXEC time.
+            {"op": "kv_incr", "key": "t:str"},
+            {"op": "kv_get", "key": "t:one"},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertFalse(summary["results"][1]["ok"])
+        self.assertIn("integer", summary["results"][1]["error"])
+        self.assertEqual(summary["results"][2]["result"], "1")
+
+    def test_tools_call_atomic_batch_with_kv_keys_samples_like_standalone(self):
+        self._seed_keys(3)
+        summary = self._batch_summary({"atomic": True, "ops": [
+            {"op": "kv_keys", "pattern": "key:*"},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"], {
+            "keys": ["key:000", "key:001", "key:002"],
+            "total": 3, "returned": 3, "sampled": False,
+        })
+
+    def test_tools_call_atomic_batch_rejects_unqueueable_ops_up_front(self):
+        # Nothing runs: the SET before the bad op leaves no trace.
+        for bad_ops in (
+            [{"op": "kv_set", "key": "t:x", "value": "1"},
+             {"op": "kv_keys_scan", "batch_size": 2}],
+            [{"op": "kv_set", "key": "t:x", "value": "1"},
+             {"op": "kv_nope", "key": "t:x"}],
+            [{"op": "kv_set", "key": "t:x", "value": "1"},
+             {"op": "kv_get"}],
+            [{"op": "kv_set", "key": "t:x", "value": "1"},
+             {"op": "kv_keys", "limit": 0}],
+        ):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_batch",
+                "arguments": {"atomic": True, "ops": bad_ops},
+            })
+            self.assertIn("error", reply, bad_ops)
+            self.assertEqual(reply["error"]["code"], -32602, bad_ops)
+        missing = self._call("tools/call", 2, {
+            "name": "kv_get", "arguments": {"key": "t:x"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "null")
+
+    def test_tools_call_atomic_batch_rejects_non_boolean_atomic(self):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"atomic": "yes", "ops": [
+                {"op": "kv_get", "key": "x"},
+            ]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_tools_call_plain_batch_summary_reports_atomic_false(self):
+        summary = self._batch_summary({"ops": [
+            {"op": "kv_get", "key": "x"},
+        ]})
+        self.assertFalse(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
 
     def test_tools_call_fast_call_has_no_warning(self):
         reply = self._call("tools/call", 1, {

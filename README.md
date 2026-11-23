@@ -78,7 +78,27 @@ threshold it crossed, so the client sees it without polling
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
 | `kv_expire` | `EXPIRE key seconds` | 1 if the timeout was set, 0 if the key is missing |
-| `kv_batch` | several kv ops in one call | Runs the `ops` list in order and returns one summary: per-op result or error plus `ok` / `failed` counts. A failed op is recorded and the batch keeps going; at most 100 ops. Not atomic — cinder has no `MULTI` yet, so this saves round trips, it is not a transaction. |
+| `kv_batch` | several kv ops in one call | Runs the `ops` list in order and returns one summary: per-op result or error plus `ok` / `failed` counts. A failed op is recorded and the batch keeps going; at most 100 ops. Pass `atomic: true` to run the ops as one `MULTI`/`EXEC` transaction instead, with no other client interleaved; an op that cannot be queued (unknown name, `kv_keys_scan`, a missing argument) fails the whole call before anything runs |
+
+## Atomic batches
+
+`kv_batch` takes an `atomic` flag (default `false`). With
+`atomic: true` the ops run as one `MULTI`/`EXEC` transaction on a
+single connection to cinder, so they execute together with no other
+client interleaved — a `kv_set` followed by a `kv_incr` on the same
+key is one indivisible step. The summary carries `"atomic": true`.
+
+Two honest limits. First, only the single-command ops can be
+queued: `kv_keys_scan` cannot run inside a transaction, because its
+cursor walk re-runs `KEYS` between pages. Second, queue-time and
+EXEC-time failures behave differently, as in real Redis: an op that
+cannot be queued at all (unknown name, `kv_keys_scan`, a missing
+required argument, a bad `kv_keys` limit) fails the whole call
+before anything runs, while an op that fails at EXEC time (an
+`INCR` on a non-integer, an `EXPIRE` with a bad time) is recorded
+in place as that op's error and the rest still run. `kv_keys`
+inside an atomic batch returns the same sampled shape as the
+standalone tool.
 
 ## Resources
 
@@ -158,6 +178,7 @@ prompts.
 - ~~Keyspace watch: a `cinder://changes` resource that reports keys changed since a checkpoint, so an agent can poll for what moved instead of re-listing the whole keyspace~~ (done, v0.14.0)
 - ~~Sampling support for long key listings, so `kv_keys` over a huge keyspace returns a bounded deterministic sample (default cap 100 keys, `limit` / `seed` / `full` parameters) plus `total` / `returned` / `sampled` counts instead of every key~~ (done, v0.15.0)
 - ~~Streaming the keyspace for prompts, so `ttl-audit` and `cleanup-plan` can scan a huge keyspace without loading every key into memory at once, plus a `kv_keys_scan` tool that walks the keyspace one bounded page at a time with a resume cursor~~ (done, v0.16.0)
+- ~~Atomic batches: `kv_batch` with `atomic: true` runs the ops as one `MULTI`/`EXEC` transaction on a single connection, so they execute together with no other client interleaved; ops that fail at EXEC time are recorded in place while the rest still run, and ops that cannot be queued fail the whole call before anything runs~~ (done, v0.17.0)
 
 ## Next
 

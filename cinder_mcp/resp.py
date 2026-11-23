@@ -56,10 +56,75 @@ class RespClient:
         finally:
             sock.close()
 
+    def transaction(self, commands):
+        """Run several commands as one MULTI/EXEC transaction on a
+        single connection and return the EXEC array, one reply per
+        command, in order. A command that fails at EXEC time comes
+        back as a RespError instance in its slot instead of raising,
+        like real Redis: the rest of the transaction still ran. A
+        queue-time failure (a command cinder refuses to queue) sends
+        DISCARD and raises, so nothing runs. An EXEC that returns a
+        nil array — a lost WATCH race, which this method never sets
+        up — also raises. `commands` is a list of argv lists."""
+        try:
+            sock = socket.create_connection(
+                (self.host, self.port), timeout=self.timeout
+            )
+        except OSError as exc:
+            raise ConnectionError(
+                "cinder is not reachable at %s:%d (%s)"
+                % (self.host, self.port, exc)
+            ) from exc
+        reader = sock.makefile("rb")
+        try:
+            if self._send_command(sock, reader, "MULTI") != "OK":
+                raise RespError("MULTI was not accepted")
+            for argv in commands:
+                try:
+                    queued = self._send_command(sock, reader, *argv)
+                except RespError as exc:
+                    # Cinder refused to queue this command: discard
+                    # the rest so nothing runs, then report it.
+                    try:
+                        self._send_command(sock, reader, "DISCARD")
+                    except (RespError, ConnectionError, OSError):
+                        pass
+                    raise RespError(
+                        "command was not queued: %r (%s)" % (argv, exc)
+                    ) from exc
+                if queued != "QUEUED":
+                    self._send_command(sock, reader, "DISCARD")
+                    raise RespError(
+                        "command was not queued: %r" % (argv,)
+                    )
+            results = self._send_command(sock, reader, "EXEC")
+            if results is None:
+                raise RespError("transaction aborted (nil EXEC reply)")
+            if not isinstance(results, list):
+                raise ConnectionError(
+                    "EXEC returned an unexpected reply: %r" % (results,)
+                )
+            return results
+        except OSError as exc:
+            raise ConnectionError("connection to cinder broke: %s" % exc) from exc
+        finally:
+            sock.close()
+
+    def _send_command(self, sock, reader, *args):
+        """Send one command on an already-open socket and read its
+        reply. Used by transaction(); command() is the one-shot
+        equivalent that opens its own socket."""
+        sock.sendall(encode_command(*args))
+        return self._read_reply(reader)
+
     def ping(self):
         return self.command("PING") == "PONG"
 
-    def _read_reply(self, reader):
+    def _read_reply(self, reader, nested=False):
+        """Read one RESP reply. A top-level error raises RespError;
+        an error nested inside an array comes back as a RespError
+        instance in its slot instead, so an EXEC array can carry a
+        failed op without losing the replies that follow it."""
         line = reader.readline()
         if not line:
             raise ConnectionError("cinder closed the connection")
@@ -67,7 +132,10 @@ class RespClient:
         if prefix == b"+":
             return rest.decode("utf-8", "replace")
         if prefix == b"-":
-            raise RespError(rest.decode("utf-8", "replace"))
+            error = RespError(rest.decode("utf-8", "replace"))
+            if nested:
+                return error
+            raise error
         if prefix == b":":
             return int(rest)
         if prefix == b"$":
@@ -80,5 +148,5 @@ class RespClient:
             count = int(rest)
             if count == -1:
                 return None
-            return [self._read_reply(reader) for _ in range(count)]
+            return [self._read_reply(reader, nested=True) for _ in range(count)]
         raise ConnectionError("unexpected RESP reply prefix: %r" % prefix)
