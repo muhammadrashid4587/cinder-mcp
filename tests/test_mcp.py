@@ -764,7 +764,10 @@ class McpTests(unittest.TestCase):
             self._call("resources/read", 1, {"uri": "cinder://metrics"})
             ["result"]["contents"][0]["text"]
         )
-        self.assertEqual(data, {"tools": {}, "total_calls": 0, "total_errors": 0})
+        self.assertEqual(data, {
+            "tools": {}, "total_calls": 0, "total_errors": 0,
+            "budget_breaches": {"warn": [], "slow": []},
+        })
 
     def test_info_resource_includes_metrics_section(self):
         self._call("tools/call", 1, {
@@ -782,6 +785,33 @@ class McpTests(unittest.TestCase):
         text = reply["result"]["contents"][0]["text"]
         self.assertIn("# Tool metrics (cinder-mcp, this session)", text)
         self.assertIn("(no tool calls yet)", text)
+
+    def test_metrics_resource_flags_slow_tool_live(self):
+        # Tiny budgets, so any real round trip breaches slow.
+        from cinder_mcp.metrics import ToolMetrics
+        server = MCPServer(
+            RespClient("127.0.0.1", self.fake.port),
+            metrics=ToolMetrics(default_warn_ms=0.001, default_slow_ms=0.002),
+        )
+        server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "kv_set", "arguments": {"key": "a", "value": "1"}}})
+        data = json.loads(server.handle_message(
+            {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+             "params": {"uri": "cinder://metrics"}}
+        )["result"]["contents"][0]["text"])
+        stats = data["tools"]["kv_set"]
+        self.assertEqual(stats["status"], "slow")
+        self.assertEqual(stats["warn_ms"], 0.001)
+        self.assertEqual(stats["slow_ms"], 0.002)
+        self.assertGreaterEqual(stats["slow_breaches"], 1)
+        self.assertEqual(data["budget_breaches"], {"warn": [], "slow": ["kv_set"]})
+        info = server.handle_message(
+            {"jsonrpc": "2.0", "id": 3, "method": "resources/read",
+             "params": {"uri": "cinder://info"}}
+        )["result"]["contents"][0]["text"]
+        self.assertIn("status:slow", info)
+        self.assertIn(
+            "# Latency budget breaches: warn: (none); slow: kv_set", info)
 
     def test_resources_read_unknown_uri_returns_error(self):
         reply = self._call("resources/read", 1, {"uri": "cinder://nope"})
@@ -862,10 +892,130 @@ class MetricsTests(unittest.TestCase):
         from cinder_mcp.metrics import ToolMetrics
         self.assertEqual(
             ToolMetrics().snapshot(),
-            {"tools": {}, "total_calls": 0, "total_errors": 0},
+            {
+                "tools": {}, "total_calls": 0, "total_errors": 0,
+                "budget_breaches": {"warn": [], "slow": []},
+            },
         )
         self.assertIn("(no tool calls yet)", ToolMetrics().render_text())
 
+
+class BudgetTests(unittest.TestCase):
+    def test_default_budget_in_snapshot(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        metrics.record("kv_get", 2.0)
+        stats = metrics.snapshot()["tools"]["kv_get"]
+        self.assertEqual(stats["warn_ms"], 100.0)
+        self.assertEqual(stats["slow_ms"], 500.0)
+        self.assertEqual(stats["status"], "ok")
+        self.assertEqual(stats["warn_breaches"], 0)
+        self.assertEqual(stats["slow_breaches"], 0)
+        self.assertEqual(
+            metrics.snapshot()["budget_breaches"], {"warn": [], "slow": []}
+        )
+
+    def test_custom_per_tool_budget_overrides_defaults(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics(
+            budgets={"kv_keys": {"warn_ms": 10, "slow_ms": 20}}
+        )
+        for ms in (1, 5, 11, 12, 13, 14, 15, 16, 17, 18):
+            metrics.record("kv_keys", ms)
+        for ms in (1, 5, 11, 12, 13, 14, 15, 16, 17, 18):
+            metrics.record("kv_get", ms)
+        snapshot = metrics.snapshot()
+        keyed = snapshot["tools"]["kv_keys"]
+        self.assertEqual(keyed["warn_ms"], 10)
+        self.assertEqual(keyed["slow_ms"], 20)
+        # p95 is 18: over the 10ms warn threshold, under slow.
+        self.assertEqual(keyed["status"], "warn")
+        self.assertEqual(keyed["warn_breaches"], 8)  # 11..18
+        self.assertEqual(keyed["slow_breaches"], 0)
+        # Same samples, default budget: still ok.
+        self.assertEqual(snapshot["tools"]["kv_get"]["status"], "ok")
+        self.assertEqual(
+            snapshot["budget_breaches"], {"warn": ["kv_keys"], "slow": []}
+        )
+
+    def test_status_slow_and_breach_counts(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        metrics.record("kv_get", 1.0)
+        metrics.record("kv_get", 600.0)
+        stats = metrics.snapshot()["tools"]["kv_get"]
+        # p95 is 600: over both thresholds.
+        self.assertEqual(stats["status"], "slow")
+        self.assertEqual(stats["warn_breaches"], 1)
+        self.assertEqual(stats["slow_breaches"], 1)
+        self.assertEqual(
+            metrics.snapshot()["budget_breaches"],
+            {"warn": [], "slow": ["kv_get"]},
+        )
+
+    def test_render_text_flags_breaches_and_summarizes(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        metrics.record("kv_get", 1.0)
+        metrics.record("kv_get", 600.0)
+        metrics.record("kv_set", 2.0)
+        text = metrics.render_text()
+        self.assertIn("tool:kv_get", text)
+        self.assertIn("status:slow", text)
+        self.assertIn("warn_breaches:1", text)
+        self.assertIn("slow_breaches:1", text)
+        self.assertIn("tool:kv_set", text)
+        self.assertIn("status:ok", text)
+        self.assertIn(
+            "# Latency budget breaches: warn: (none); slow: kv_get", text
+        )
+
+    def test_budget_validation_rejects_bad_thresholds(self):
+        from cinder_mcp.metrics import ToolMetrics
+        metrics = ToolMetrics()
+        with self.assertRaises(ValueError):
+            metrics.set_budget("kv_get", 500, 100)  # slow below warn
+        with self.assertRaises(ValueError):
+            metrics.set_budget("kv_get", 100, 100)  # equal
+        with self.assertRaises(ValueError):
+            metrics.set_budget("kv_get", 0, 100)  # not positive
+        with self.assertRaises(ValueError):
+            ToolMetrics(default_warn_ms=500, default_slow_ms=100)
+        # Partial override inherits the other default and validates.
+        metrics = ToolMetrics(budgets={"kv_get": {"warn_ms": 50}})
+        self.assertEqual(metrics.budget_for("kv_get"), (50.0, 500.0))
+        with self.assertRaises(ValueError):
+            ToolMetrics(budgets={"kv_get": {"slow_ms": 50}})  # below default warn
+
+    def test_budgets_from_env(self):
+        import os
+        from unittest.mock import patch
+
+        from cinder_mcp.server import _budgets_from_env
+        with patch.dict(os.environ, {}, clear=True):
+            metrics = _budgets_from_env()
+            self.assertEqual(metrics.budget_for("kv_get"), (100.0, 500.0))
+        with patch.dict(os.environ, {
+            "CINDER_MCP_WARN_MS": "25",
+            "CINDER_MCP_SLOW_MS": "250",
+            "CINDER_MCP_BUDGETS": '{"kv_keys": {"warn_ms": 10, "slow_ms": 40}}',
+        }, clear=True):
+            metrics = _budgets_from_env()
+            self.assertEqual(metrics.budget_for("kv_get"), (25.0, 250.0))
+            self.assertEqual(metrics.budget_for("kv_keys"), (10.0, 40.0))
+        with patch.dict(os.environ, {
+            "CINDER_MCP_BUDGETS": "{not json",
+        }, clear=True):
+            with self.assertRaises(ValueError):
+                _budgets_from_env()
+        with patch.dict(os.environ, {"CINDER_MCP_WARN_MS": "fast"}, clear=True):
+            with self.assertRaises(ValueError):
+                _budgets_from_env()
+        with patch.dict(os.environ, {
+            "CINDER_MCP_BUDGETS": '{"kv_get": {"warn_ms": 900, "slow_ms": 100}}',
+        }, clear=True):
+            with self.assertRaises(ValueError):
+                _budgets_from_env()
 
 if __name__ == "__main__":
     unittest.main()

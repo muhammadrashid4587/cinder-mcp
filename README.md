@@ -33,6 +33,27 @@ CINDER_HOST=127.0.0.1 CINDER_PORT=6380 python3 -m cinder_mcp.server
 Wire it into an MCP client as a stdio server with the command
 `python3 -m cinder_mcp.server` and the working directory set to this repo.
 
+## Latency budgets
+
+Every tool has a latency budget: a warn threshold and a slow threshold
+in milliseconds. Defaults are 100ms warn / 500ms slow; override them
+with environment variables:
+
+```sh
+CINDER_MCP_WARN_MS=50 CINDER_MCP_SLOW_MS=200 python3 -m cinder_mcp.server
+
+# Per-tool overrides as JSON (partial overrides inherit the defaults):
+CINDER_MCP_BUDGETS='{"kv_keys": {"warn_ms": 250, "slow_ms": 1000}}' python3 -m cinder_mcp.server
+```
+
+A tool whose p95 latency is over its warn threshold is flagged `warn`
+in `cinder://metrics`; over its slow threshold it is `slow`. The
+metrics resource also counts, per tool, how many individual samples
+crossed each threshold, and `cinder://info` ends with a summary line
+listing the tools currently over each threshold. A misconfigured
+budget (non-numeric, non-positive, or slow at or below warn) fails
+the server at startup instead of running with nonsense thresholds.
+
 ## Tools
 
 | Tool | Cinder command | Notes |
@@ -50,8 +71,8 @@ Wire it into an MCP client as a stdio server with the command
 
 | URI | Cinder command | Notes |
 | --- | --- | --- |
-| `cinder://info` | `INFO` | Server version, uptime, commands processed, key count, plus this server's per-tool latency metrics for the current session |
-| `cinder://metrics` | — | Per-tool call counts, error counts and mean/p50/p95 latency in milliseconds for this server session, as JSON. Metrics are recorded in memory by the server itself (every `tools/call`, success or failure); nothing is stored in cinder. |
+| `cinder://info` | `INFO` | Server version, uptime, commands processed, key count, plus this server's per-tool latency metrics for the current session and a summary of which tools are over their latency budgets |
+| `cinder://metrics` | — | Per-tool call counts, error counts and mean/p50/p95 latency in milliseconds for this server session, as JSON, with each tool's warn/slow latency budget, its warn/slow/ok status, per-threshold breach counts, and a `budget_breaches` summary. Metrics are recorded in memory by the server itself (every `tools/call`, success or failure); nothing is stored in cinder. |
 | `cinder://key/<key>` | `EXISTS` + `GET` / `LLEN` / `SCARD` / `HLEN` | Value and type as JSON; not-found error for missing keys. Non-string values report their type and length instead of a value (cinder has no `TYPE` command, so the type is probed) |
 
 Fetchable with `resources/list` and `resources/read`.
@@ -96,7 +117,8 @@ requests return JSON-RPC errors.
 - ~~TTL audit prompt (`ttl-audit`: TTL buckets, soonest-expiring keys, keys with no expiry)~~ (done, v0.7.0)
 - ~~Cleanup-plan prompt (`cleanup-plan`: per-key TTL/type/size sampling, safe / expiring-soon / risky-confirm / keep classification, concrete plan with exact `kv_del` calls)~~ (done, v0.8.0)
 - ~~Per-tool latency metrics (call count, mean/p50/p95 latency, error count in memory; exposed in `cinder://info` and as a `cinder://metrics` resource)~~ (done, v0.9.0)
+- ~~Latency budgets: per-tool warn/slow thresholds on `cinder://metrics`, so a slow tool is flagged instead of just measured~~ (done, v0.10.0)
 
 ## Next
 
-- Latency budgets: per-tool warn/slow thresholds on `cinder://metrics`, so a slow tool is flagged instead of just measured
+- Slow-tool warning in `tools/call`: include a warning in the tool result when a call crosses its slow budget, so the agent sees it in the moment instead of only in `cinder://metrics`

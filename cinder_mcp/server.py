@@ -15,14 +15,14 @@ import os
 import sys
 import time
 
-from .metrics import ToolMetrics
+from .metrics import DEFAULT_SLOW_MS, DEFAULT_WARN_MS, ToolMetrics
 from .resp import ConnectionError, RespClient, RespError
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, read_resource
 from .tools import TOOLS, call_tool
 
 SERVER_NAME = "cinder-mcp"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.10.0"
 
 # The protocol version this server negotiates. The client may request a
 # newer one; we answer with the one we speak.
@@ -128,8 +128,39 @@ def _render(value):
     return str(value)
 
 
-def serve(client, instream, outstream):
-    server = MCPServer(client)
+def _budgets_from_env():
+    """Build the ToolMetrics for this process from the environment.
+
+    CINDER_MCP_WARN_MS / CINDER_MCP_SLOW_MS set the default warn/slow
+    thresholds in milliseconds; CINDER_MCP_BUDGETS is a JSON object
+    mapping tool names to {"warn_ms": ..., "slow_ms": ...} overrides,
+    e.g. '{"kv_keys": {"warn_ms": 250, "slow_ms": 1000}}'.
+    Raises ValueError on bad input, so a misconfigured server fails
+    loudly at startup instead of running with nonsense budgets.
+    """
+    try:
+        warn_ms = float(os.environ.get("CINDER_MCP_WARN_MS", DEFAULT_WARN_MS))
+        slow_ms = float(os.environ.get("CINDER_MCP_SLOW_MS", DEFAULT_SLOW_MS))
+    except ValueError:
+        raise ValueError(
+            "CINDER_MCP_WARN_MS / CINDER_MCP_SLOW_MS must be numbers"
+        )
+    budgets = None
+    raw = os.environ.get("CINDER_MCP_BUDGETS")
+    if raw:
+        try:
+            budgets = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("CINDER_MCP_BUDGETS is not valid JSON: %s" % exc)
+        if not isinstance(budgets, dict):
+            raise ValueError("CINDER_MCP_BUDGETS must be a JSON object")
+    return ToolMetrics(
+        budgets=budgets, default_warn_ms=warn_ms, default_slow_ms=slow_ms
+    )
+
+
+def serve(client, instream, outstream, metrics=None):
+    server = MCPServer(client, metrics=metrics)
     for line in instream:
         line = line.strip()
         if not line:
@@ -154,7 +185,13 @@ def main(argv=None):
         "--port", type=int, default=int(os.environ.get("CINDER_PORT", "6379"))
     )
     args = parser.parse_args(argv)
-    serve(RespClient(args.host, args.port), sys.stdin, sys.stdout)
+    try:
+        metrics = _budgets_from_env()
+    except ValueError as exc:
+        print("cinder-mcp: %s" % exc, file=sys.stderr)
+        return 2
+    serve(RespClient(args.host, args.port), sys.stdin, sys.stdout,
+          metrics=metrics)
     return 0
 
 

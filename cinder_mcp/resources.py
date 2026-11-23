@@ -37,7 +37,9 @@ RESOURCES = [
         "name": "Tool metrics",
         "description": (
             "Per-tool call counts, error counts and mean/p50/p95 "
-            "latency in milliseconds for this server session, as JSON."
+            "latency in milliseconds for this server session, as JSON, "
+            "with each tool's warn/slow latency budget, its warn/slow/"
+            "ok status, and how many samples crossed each threshold."
         ),
         "mimeType": "application/json",
     },
