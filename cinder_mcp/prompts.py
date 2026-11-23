@@ -18,7 +18,15 @@ model to turn that into a concrete cleanup plan with exact kv_del
 calls.
 """
 
+import bisect
+
 from .resp import RespError
+from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
+
+# Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
+# The prompts process one batch at a time and keep only bounded
+# result lists, so a huge keyspace never becomes a huge prompt.
+PROMPT_SCAN_BATCH_SIZE = DEFAULT_SCAN_BATCH_SIZE
 
 # A string sample longer than this is truncated in the prompt text.
 MAX_SAMPLE_CHARS = 200
@@ -251,6 +259,18 @@ def _key_deep_dive(client, arguments):
     }
 
 
+def _bounded_insert(ordered, item, cap):
+    """Insert `item` into the sorted list `ordered`, keeping at most
+    `cap` smallest items. Items compare with <, so this works for
+    keys, for (ttl, key) pairs, and for (key, line) pairs alike.
+    The prompts use it to keep only the entries they actually print
+    — the 10 soonest-expiring keys, the first 20 of a section —
+    plus a count of the rest, instead of holding every key."""
+    bisect.insort(ordered, item)
+    if len(ordered) > cap:
+        ordered.pop()
+
+
 def _format_ttl(seconds):
     """Render a TTL in seconds as a short human duration: 45s, 12m,
     3h 20m, 2d 4h, 3w 1d."""
@@ -266,48 +286,59 @@ def _format_ttl(seconds):
 
 
 def _ttl_audit(client, arguments):
-    """Scan the keyspace, group every key by how soon it expires, and
-    list the soonest-expiring keys and the keys with no expiry so the
-    operator can act on them. TTL is probed per key with TTL: -1 means
-    no expiry, -2 means the key expired between the KEYS scan and the
-    TTL probe and is counted separately rather than bucketed."""
+    """Scan the keyspace in bounded batches, group every key by how
+    soon it expires, and list the soonest-expiring keys and the keys
+    with no expiry so the operator can act on them. TTL is probed
+    per key with TTL: -1 means no expiry, -2 means the key expired
+    between the KEYS scan and the TTL probe and is counted
+    separately rather than bucketed. The scan is streamed: keys are
+    processed batch by batch and only counts plus the bounded
+    soonest / no-expiry lists are kept, so the prompt text stays
+    bounded however large the keyspace is."""
     pattern = arguments.get("pattern", "*")
-    keys = client.command("KEYS", pattern)
-    if keys is None:
-        keys = []
-    buckets = {
-        "no expiry": [],
-        "expiring in under 1 hour": [],
-        "expiring in under 1 day": [],
-        "expiring in under 1 week": [],
-        "expiring in over 1 week": [],
+    bucket_counts = {
+        "no expiry": 0,
+        "expiring in under 1 hour": 0,
+        "expiring in under 1 day": 0,
+        "expiring in under 1 week": 0,
+        "expiring in over 1 week": 0,
     }
     expired = 0
-    soonest = []  # (ttl, key), sorted ascending at the end
-    for key in keys:
-        ttl = client.command("TTL", key)
-        if ttl == -2:
-            expired += 1
-        elif ttl == -1:
-            buckets["no expiry"].append(key)
-        elif ttl < BUCKET_BOUNDS[0]:
-            buckets["expiring in under 1 hour"].append(key)
-            soonest.append((ttl, key))
-        elif ttl < BUCKET_BOUNDS[1]:
-            buckets["expiring in under 1 day"].append(key)
-            soonest.append((ttl, key))
-        elif ttl < BUCKET_BOUNDS[2]:
-            buckets["expiring in under 1 week"].append(key)
-            soonest.append((ttl, key))
-        else:
-            buckets["expiring in over 1 week"].append(key)
-            soonest.append((ttl, key))
-    soonest.sort()
-    no_expiry = sorted(buckets["no expiry"])
+    total = 0
+    expiring = 0
+    soonest = []  # bounded sorted (ttl, key), at most MAX_SOON_KEYS
+    no_expiry = []  # bounded sorted keys, at most MAX_NO_EXPIRY_KEYS
+    no_expiry_count = 0
+    for batch in iter_keys(client, pattern, PROMPT_SCAN_BATCH_SIZE):
+        for key in batch:
+            total += 1
+            ttl = client.command("TTL", key)
+            if ttl == -2:
+                expired += 1
+            elif ttl == -1:
+                bucket_counts["no expiry"] += 1
+                no_expiry_count += 1
+                _bounded_insert(no_expiry, key, MAX_NO_EXPIRY_KEYS)
+            elif ttl < BUCKET_BOUNDS[0]:
+                bucket_counts["expiring in under 1 hour"] += 1
+                expiring += 1
+                _bounded_insert(soonest, (ttl, key), MAX_SOON_KEYS)
+            elif ttl < BUCKET_BOUNDS[1]:
+                bucket_counts["expiring in under 1 day"] += 1
+                expiring += 1
+                _bounded_insert(soonest, (ttl, key), MAX_SOON_KEYS)
+            elif ttl < BUCKET_BOUNDS[2]:
+                bucket_counts["expiring in under 1 week"] += 1
+                expiring += 1
+                _bounded_insert(soonest, (ttl, key), MAX_SOON_KEYS)
+            else:
+                bucket_counts["expiring in over 1 week"] += 1
+                expiring += 1
+                _bounded_insert(soonest, (ttl, key), MAX_SOON_KEYS)
     lines = [
         "TTL audit of the cinder keyspace (pattern %r)." % pattern,
         "",
-        "Total keys scanned: %d" % len(keys),
+        "Total keys scanned: %d" % total,
     ]
     if expired:
         lines.append(
@@ -315,22 +346,24 @@ def _ttl_audit(client, arguments):
             % expired
         )
     lines.extend(["", "TTL buckets:"])
-    for label, members in buckets.items():
-        lines.append("- %s: %d" % (label, len(members)))
-    lines.extend(["", "Soonest expiring keys (%d):" % len(soonest)])
+    for label, count in bucket_counts.items():
+        lines.append("- %s: %d" % (label, count))
+    lines.extend(["", "Soonest expiring keys (%d):" % expiring])
     if soonest:
-        for ttl, key in soonest[:MAX_SOON_KEYS]:
+        for ttl, key in soonest:
             lines.append("- %s (in %s)" % (key, _format_ttl(ttl)))
-        if len(soonest) > MAX_SOON_KEYS:
-            lines.append("... and %d more" % (len(soonest) - MAX_SOON_KEYS))
+        if expiring > MAX_SOON_KEYS:
+            lines.append("... and %d more" % (expiring - MAX_SOON_KEYS))
     else:
         lines.append("(none expiring)")
-    lines.extend(["", "Keys with no expiry (%d):" % len(no_expiry)])
+    lines.extend(["", "Keys with no expiry (%d):" % no_expiry_count])
     if no_expiry:
-        for key in no_expiry[:MAX_NO_EXPIRY_KEYS]:
+        for key in no_expiry:
             lines.append("- %s" % key)
-        if len(no_expiry) > MAX_NO_EXPIRY_KEYS:
-            lines.append("... and %d more" % (len(no_expiry) - MAX_NO_EXPIRY_KEYS))
+        if no_expiry_count > MAX_NO_EXPIRY_KEYS:
+            lines.append(
+                "... and %d more" % (no_expiry_count - MAX_NO_EXPIRY_KEYS)
+            )
     else:
         lines.append("(none)")
     lines.extend([
@@ -380,49 +413,57 @@ def _looks_temporary(name):
 
 
 def _cleanup_plan(client, arguments):
-    """Inspect the live keyspace — INFO, KEYS, and a per-key TTL, type,
-    and size sample — classify every key as safe to delete, expiring
-    soon, risky to delete without confirmation, or keep, and ask the
-    model to turn that into a concrete cleanup plan. Keys that expire
-    between the KEYS scan and the TTL probe (TTL -2) are counted
-    separately rather than classified. Keys that vanish between the
-    TTL probe and the type probe are skipped the same way."""
+    """Inspect the live keyspace in bounded batches — INFO, then a
+    per-key TTL, type, and size probe — classify every key as safe
+    to delete, expiring soon, risky to delete without confirmation,
+    or keep, and ask the model to turn that into a concrete cleanup
+    plan. Keys that expire between the KEYS scan and the TTL probe
+    (TTL -2) are counted separately rather than classified. Keys
+    that vanish between the TTL probe and the type probe are skipped
+    the same way. The scan is streamed: each section keeps only its
+    first 20 keys (in key order) plus a count of the rest, so the
+    prompt text stays bounded however large the keyspace is."""
     pattern = arguments.get("pattern", "*")
     info = client.command("INFO")
-    keys = client.command("KEYS", pattern)
-    if keys is None:
-        keys = []
+    # Per section, a bounded sorted list of (key, rendered line).
     sections = {"safe": [], "soon": [], "risky": [], "keep": []}
+    counts = {"safe": 0, "soon": 0, "risky": 0, "keep": 0}
     expired = 0
-    for key in sorted(keys):
-        ttl = client.command("TTL", key)
-        if ttl == -2:
-            expired += 1
-            continue
-        try:
-            kind, size, _sample = _inspect_key(client, key)
-        except ValueError:
-            # The key vanished between the TTL probe and the type probe.
-            expired += 1
-            continue
-        category = _classify_cleanup(key, ttl)
-        if ttl == -1:
-            ttl_text = "no expiry"
-        else:
-            ttl_text = "expires in %s" % _format_ttl(ttl)
-        note = ""
-        if category == "risky" and _looks_temporary(key):
-            note = ", looks temporary"
-        sections[category].append(
-            "- %s (%s, %s, %s%s)" % (key, kind, size, ttl_text, note)
-        )
+    total = 0
+    for batch in iter_keys(client, pattern, PROMPT_SCAN_BATCH_SIZE):
+        for key in batch:
+            total += 1
+            ttl = client.command("TTL", key)
+            if ttl == -2:
+                expired += 1
+                continue
+            try:
+                kind, size, _sample = _inspect_key(client, key)
+            except ValueError:
+                # The key vanished between the TTL probe and the type probe.
+                expired += 1
+                continue
+            category = _classify_cleanup(key, ttl)
+            if ttl == -1:
+                ttl_text = "no expiry"
+            else:
+                ttl_text = "expires in %s" % _format_ttl(ttl)
+            note = ""
+            if category == "risky" and _looks_temporary(key):
+                note = ", looks temporary"
+            counts[category] += 1
+            _bounded_insert(
+                sections[category],
+                (key, "- %s (%s, %s, %s%s)" % (key, kind, size, ttl_text, note)),
+                MAX_CLEANUP_KEYS,
+            )
     lines = [
         "Cleanup plan for the cinder keyspace (pattern %r)." % pattern,
         "",
         "Server info:",
         info.strip() if info else "(no INFO output)",
         "",
-        "Total keys scanned: %d" % len(keys),
+        "Total keys scanned: %d" % total,
     ]
     if expired:
         lines.append(
@@ -445,11 +486,13 @@ def _cleanup_plan(client, arguments):
     ]
     for category, header in section_text:
         members = sections[category]
-        lines.extend(["", header % len(members)])
+        lines.extend(["", header % counts[category]])
         if members:
-            lines.extend(members[:MAX_CLEANUP_KEYS])
-            if len(members) > MAX_CLEANUP_KEYS:
-                lines.append("... and %d more" % (len(members) - MAX_CLEANUP_KEYS))
+            lines.extend(line for _key, line in members)
+            if counts[category] > MAX_CLEANUP_KEYS:
+                lines.append(
+                    "... and %d more" % (counts[category] - MAX_CLEANUP_KEYS)
+                )
         else:
             lines.append("(none)")
     lines.extend([

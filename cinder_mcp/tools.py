@@ -6,6 +6,11 @@ fragments, as the MCP spec requires for tools/list.
 
 import hashlib
 
+from .scan import (
+    DEFAULT_SCAN_BATCH_SIZE,
+    scan_batch,
+)
+
 TOOLS = [
     {
         "name": "kv_get",
@@ -49,6 +54,18 @@ TOOLS = [
                 "limit": {"type": "integer"},
                 "full": {"type": "boolean"},
                 "seed": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "kv_keys_scan",
+        "description": "Walk the keys matching a glob pattern (* and ?) one bounded page at a time, SCAN-style. Returns {\"keys\": [...], \"cursor\": str, \"done\": bool, \"batch_size\": n}: at most `batch_size` keys per page (default 100). Pass the returned `cursor` back to fetch the next page; pass \"\" (or omit it) to start. When `done` is true the cursor is \"\" and the walk is finished. Pages are in sorted key order; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window, the same caveats real SCAN has.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "batch_size": {"type": "integer"},
+                "cursor": {"type": "string"},
             },
         },
     },
@@ -116,6 +133,8 @@ TOOLS = [
                             "limit": {"type": "integer"},
                             "full": {"type": "boolean"},
                             "seed": {"type": "string"},
+                            "batch_size": {"type": "integer"},
+                            "cursor": {"type": "string"},
                         },
                         "required": ["op"],
                     },
@@ -172,7 +191,7 @@ def call_tool(client, name, args):
 # (no nesting — a batch inside a batch buys nothing and complicates
 # the summary).
 BATCHABLE_TOOLS = {
-    "kv_get", "kv_set", "kv_del", "kv_keys",
+    "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_exists", "kv_expire",
 }
 
@@ -290,6 +309,19 @@ def _call_keys(client, args):
     }
 
 
+def _call_keys_scan(client, args):
+    """kv_keys_scan: one bounded page of the keyspace. Returns
+    {"keys": [...], "cursor": str, "done": bool, "batch_size": n}.
+    Bad batch_size/cursor values fail the call instead of silently
+    ignoring the caller."""
+    return scan_batch(
+        client,
+        args.get("pattern", "*"),
+        args.get("cursor", ""),
+        args.get("batch_size", DEFAULT_SCAN_BATCH_SIZE),
+    )
+
+
 def _call_single(client, name, args):
     if name == "kv_get":
         return client.command("GET", _require(args, "key"))
@@ -304,6 +336,8 @@ def _call_single(client, name, args):
         return client.command("DEL", _require(args, "key"))
     if name == "kv_keys":
         return _call_keys(client, args)
+    if name == "kv_keys_scan":
+        return _call_keys_scan(client, args)
     if name == "kv_incr":
         by = args.get("by", 1)
         if by == 1:

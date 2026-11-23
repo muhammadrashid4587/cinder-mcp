@@ -73,6 +73,7 @@ threshold it crossed, so the client sees it without polling
 | `kv_set` | `SET key value [EX s \| PX ms]` | Optional `ex` / `px` TTL |
 | `kv_del` | `DEL key` | 1 if the key existed, 0 otherwise |
 | `kv_keys` | `KEYS pattern` | Glob `*` and `?`, defaults to `*`. Returns `{"keys": [...], "total": n, "returned": m, "sampled": bool}`: at most `limit` keys (default 100); a larger keyspace returns a deterministic sample seeded by `seed`, and `full: true` returns the whole list |
+| `kv_keys_scan` | `KEYS pattern` | Walk the matching keys one bounded page at a time, SCAN-style. Returns `{"keys": [...], "cursor": str, "done": bool, "batch_size": n}`: at most `batch_size` keys per page (default 100, max 1000). Pass the returned `cursor` back for the next page; `""` starts over. When `done` is true the cursor is `""` and the walk is finished. Pages are in sorted key order; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window — the same caveats real SCAN has. Each page re-runs `KEYS` under the hood, because cinder has no `SCAN` command yet; the page itself stays bounded |
 | `kv_incr` | `INCR key` / `INCRBY key n` | `by` defaults to 1 |
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
@@ -96,8 +97,8 @@ Fetchable with `resources/list` and `resources/read`.
 | --- | --- | --- |
 | `keyspace-summary` | `pattern` (optional, defaults to `*`) | Samples `INFO`, lists the keys matching the pattern, and asks the model to summarize the keyspace and suggest what to check next: keys worth reading, TTLs worth checking, and keys that look stale |
 | `key-deep-dive` | `key` (required) | Inspects one key in detail — type, TTL, size, a sample of its value (truncated at 200 chars), and the keys sharing its namespace — and asks the model to judge whether the key looks healthy |
-| `ttl-audit` | `pattern` (optional, defaults to `*`) | Scans the keyspace, groups keys by TTL bucket (no expiry, expiring <1h, <1d, <1w, >1w), lists the soonest-expiring keys and the keys with no expiry, and asks the model to flag what the operator should act on |
-| `cleanup-plan` | `pattern` (optional, defaults to `*`) | Inspects the live keyspace (INFO, KEYS, per-key TTL/type/size) and classifies every key as safe to delete (expires <1h), expiring soon (<1d), risky to delete without confirmation (no expiry), or keep (>1d), and asks the model to produce a concrete cleanup plan with exact `kv_del` calls — risky keys need a human to confirm each delete |
+| `ttl-audit` | `pattern` (optional, defaults to `*`) | Scans the keyspace in bounded batches of 100 keys, groups keys by TTL bucket (no expiry, expiring <1h, <1d, <1w, >1w), lists the soonest-expiring keys and the keys with no expiry, and asks the model to flag what the operator should act on. Only counts plus the 10 soonest keys and the first 20 no-expiry keys are kept, so the prompt stays bounded on a huge keyspace |
+| `cleanup-plan` | `pattern` (optional, defaults to `*`) | Inspects the live keyspace in bounded batches of 100 keys (INFO, per-key TTL/type/size) and classifies every key as safe to delete (expires <1h), expiring soon (<1d), risky to delete without confirmation (no expiry), or keep (>1d), and asks the model to produce a concrete cleanup plan with exact `kv_del` calls — risky keys need a human to confirm each delete. Each section keeps only its first 20 keys plus a count of the rest, so the prompt stays bounded on a huge keyspace |
 
 Fetchable with `prompts/list` and `prompts/get`.
 
@@ -121,6 +122,26 @@ handshake returns the tool list, a SET-then-GET round trip returns the
 value, an unreachable cinder returns a clean JSON-RPC error, and malformed
 requests return JSON-RPC errors.
 
+## Streaming the keyspace
+
+`ttl-audit` and `cleanup-plan` scan the keyspace in bounded batches
+of 100 keys (`cinder_mcp/scan.py`), and `kv_keys_scan` exposes the
+same walk as a paged tool. The per-key work and the prompt text stay
+bounded: the prompts keep only counts plus the 10 soonest-expiring
+keys, the first 20 no-expiry keys, and the first 20 keys per cleanup
+section, with "... and N more" for the rest. The results are
+identical to the old load-everything scan at any batch size — the
+tests run both prompts at batch sizes 1, 2, 7 and 100 over the same
+keyspace and compare the full prompt text.
+
+One honest limitation: cinder has no `SCAN` command yet, so the
+iterator is backed by one `KEYS` call whose reply is sliced into
+batches, and each `kv_keys_scan` page re-runs `KEYS`. The bounded
+part today is everything downstream of that reply. When cinder
+grows `SCAN`, the iterator switches to cursor batches and the
+`KEYS` reply disappears too, with no change to the tools or the
+prompts.
+
 ## Roadmap
 
 - ~~Sampling the cinder INFO output as a `cinder://info` resource~~ (done, v0.3.0)
@@ -136,7 +157,8 @@ requests return JSON-RPC errors.
 - ~~Batch tool (`kv_batch`): run several kv ops in one call, in order, with a per-op result/error summary and ok/failed counts; a failed op is recorded and the batch keeps going; at most 100 ops; explicitly not atomic until cinder has MULTI~~ (done, v0.13.0)
 - ~~Keyspace watch: a `cinder://changes` resource that reports keys changed since a checkpoint, so an agent can poll for what moved instead of re-listing the whole keyspace~~ (done, v0.14.0)
 - ~~Sampling support for long key listings, so `kv_keys` over a huge keyspace returns a bounded deterministic sample (default cap 100 keys, `limit` / `seed` / `full` parameters) plus `total` / `returned` / `sampled` counts instead of every key~~ (done, v0.15.0)
+- ~~Streaming the keyspace for prompts, so `ttl-audit` and `cleanup-plan` can scan a huge keyspace without loading every key into memory at once, plus a `kv_keys_scan` tool that walks the keyspace one bounded page at a time with a resume cursor~~ (done, v0.16.0)
 
 ## Next
 
-- Streaming the keyspace for prompts, so `ttl-audit` and `cleanup-plan` can scan a huge keyspace without loading every key into memory at once.
+- Switch the scanner to real `SCAN` cursor batches once cinder implements `SCAN`, so the `KEYS` reply itself is bounded too; the tools and prompts do not change.

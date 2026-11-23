@@ -270,8 +270,8 @@ class McpTests(unittest.TestCase):
         listed = self._call("tools/list", 2)
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
-            names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_incr", "kv_ttl",
-                    "kv_exists", "kv_expire", "kv_batch"]
+            names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
+                    "kv_incr", "kv_ttl", "kv_exists", "kv_expire", "kv_batch"]
         )
 
     def test_tools_list_advertises_default_budgets(self):
@@ -557,6 +557,110 @@ class McpTests(unittest.TestCase):
             "keys": ["key:000", "key:001", "key:002"],
             "total": 3, "returned": 3, "sampled": False,
         })
+
+    def _scan_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_keys_scan", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_keys_scan_pages_through_the_keyspace(self):
+        self._seed_keys(250)
+        seen = []
+        cursor = ""
+        pages = 0
+        while True:
+            data = self._scan_result({"batch_size": 100, "cursor": cursor})
+            self.assertEqual(data["batch_size"], 100)
+            seen.extend(data["keys"])
+            pages += 1
+            self.assertLessEqual(pages, 10)
+            if data["done"]:
+                self.assertEqual(data["cursor"], "")
+                break
+            self.assertNotEqual(data["cursor"], "")
+            cursor = data["cursor"]
+        self.assertEqual(pages, 3)
+        self.assertEqual(seen, ["key:%03d" % i for i in range(250)])
+        # A cursor resumes mid-keyspace: past key:099 comes key:100.
+        data = self._scan_result({"batch_size": 5, "cursor": "key:099"})
+        self.assertEqual(
+            data["keys"],
+            ["key:%03d" % i for i in range(100, 105)],
+        )
+        self.assertEqual(data["cursor"], "key:104")
+        self.assertFalse(data["done"])
+        # The pattern filters, and a small keyspace finishes in one page.
+        data = self._scan_result({"pattern": "key:00*"})
+        self.assertEqual(
+            data["keys"], ["key:%03d" % i for i in range(10)])
+        self.assertTrue(data["done"])
+        self.assertEqual(data["cursor"], "")
+        # An empty keyspace is done at once, with no keys.
+        empty = self._scan_result({"pattern": "nope:*"})
+        self.assertEqual(
+            empty, {"keys": [], "cursor": "", "done": True, "batch_size": 100})
+
+    def test_kv_keys_scan_rejects_bad_arguments(self):
+        self._seed_keys(2)
+        for bad in ({"batch_size": 0}, {"batch_size": -1},
+                    {"batch_size": 1001}, {"batch_size": "ten"},
+                    {"batch_size": True}, {"cursor": 7}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_keys_scan", "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_keys_scan_in_batch(self):
+        self._seed_keys(3)
+        reply = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_keys_scan", "batch_size": 2},
+            ]},
+        })
+        summary = json.loads(reply["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"], {
+            "keys": ["key:000", "key:001"],
+            "cursor": "key:001",
+            "done": False,
+            "batch_size": 2,
+        })
+
+    def test_iter_keys_yields_bounded_batches_covering_every_key(self):
+        from cinder_mcp.scan import iter_keys
+
+        class StubClient:
+            def __init__(self, keys):
+                self.keys = keys
+
+            def command(self, *args):
+                if args[0] == "KEYS":
+                    return list(self.keys)
+                raise AssertionError(args)
+
+        keys = ["key:%03d" % i for i in range(250)]
+        batches = list(iter_keys(StubClient(keys), "key:*", batch_size=100))
+        self.assertEqual([len(b) for b in batches], [100, 100, 50])
+        self.assertEqual([k for b in batches for k in b], keys)
+        # A batch size larger than the keyspace is a single batch.
+        self.assertEqual(list(iter_keys(StubClient(keys), batch_size=1000)), [keys])
+        # An empty keyspace yields no batches at all.
+        self.assertEqual(list(iter_keys(StubClient([]))), [])
+
+    def test_iter_keys_rejects_bad_batch_size(self):
+        from cinder_mcp.scan import iter_keys
+
+        class StubClient:
+            def command(self, *args):
+                return ["a"]
+
+        for bad in (0, -1, 1001, "ten", True):
+            with self.assertRaises(ValueError, msg=bad):
+                list(iter_keys(StubClient(), batch_size=bad))
 
     def test_tools_call_exists_and_expire(self):
         missing = self._call("tools/call", 1, {
@@ -986,6 +1090,95 @@ class McpTests(unittest.TestCase):
         self.assertIn("Risky — confirm before deleting (0)", text)
         self.assertIn("- user:1 (string, 1 bytes, expires in ", text)
         self.assertNotIn("cache:x", text)
+
+    def _prompt_text(self, name, arguments=None, batch_size=None):
+        """One prompt's text, with the scan batch size overridden
+        for the call so streaming behaviour can be compared."""
+        import cinder_mcp.prompts as prompts
+        old = prompts.PROMPT_SCAN_BATCH_SIZE
+        try:
+            if batch_size is not None:
+                prompts.PROMPT_SCAN_BATCH_SIZE = batch_size
+            reply = self._call(
+                "prompts/get", 1,
+                {"name": name, "arguments": arguments or {}},
+            )
+        finally:
+            prompts.PROMPT_SCAN_BATCH_SIZE = old
+        self.assertNotIn("error", reply)
+        return reply["result"]["messages"][0]["content"]["text"]
+
+    def test_prompts_ttl_audit_same_result_at_any_batch_size(self):
+        # TTLs are spaced 1000s apart, far from any bucket or
+        # rendering boundary, so a second of clock drift between
+        # runs cannot reorder or reword anything.
+        for i in range(60):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "perm:%03d" % i, "value": "v"},
+            })
+        for i in range(60):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "exp:%03d" % i, "value": "v",
+                              "ex": 100000 + i * 1000},
+            })
+        baseline = self._prompt_text("ttl-audit", batch_size=100)
+        self.assertIn("Total keys scanned: 120", baseline)
+        self.assertIn("Soonest expiring keys (60):", baseline)
+        self.assertIn("... and 50 more", baseline)
+        for size in (1, 2, 7):
+            self.assertEqual(
+                self._prompt_text("ttl-audit", batch_size=size), baseline,
+                "batch_size=%d" % size,
+            )
+
+    def test_prompts_cleanup_plan_same_result_at_any_batch_size(self):
+        # TTLs sit mid-bucket and mid-rendering-unit, so a second of
+        # drift between runs cannot reclassify or reword a key.
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "safe:%03d" % i, "value": "v",
+                              "ex": 1900 + i * 10},
+            })
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "soon:%03d" % i, "value": "v",
+                              "ex": 40000 + i * 1000},
+            })
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "keep:%03d" % i, "value": "v",
+                              "ex": 200000 + i * 1000},
+            })
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "risky:%03d" % i, "value": "v"},
+            })
+        baseline = self._prompt_text("cleanup-plan", batch_size=100)
+        self.assertIn("Total keys scanned: 120", baseline)
+        for size in (1, 2, 7):
+            self.assertEqual(
+                self._prompt_text("cleanup-plan", batch_size=size), baseline,
+                "batch_size=%d" % size,
+            )
+
+    def test_prompts_bounded_lists_on_a_large_keyspace(self):
+        self._seed_keys(250, prefix="perm")
+        text = self._prompt_text("ttl-audit")
+        self.assertIn("Total keys scanned: 250", text)
+        self.assertIn("Keys with no expiry (250):", text)
+        self.assertIn("... and 230 more", text)
+        listed = [l for l in text.split("\n") if l.startswith("- perm:")]
+        self.assertEqual(len(listed), 20)
+        plan = self._prompt_text("cleanup-plan")
+        risky = self._section(plan, "Risky — confirm before deleting (250)")
+        self.assertEqual(len(risky), 21)
+        self.assertEqual(risky[-1], "... and 230 more")
 
     def test_metrics_resource_records_tool_calls(self):
         self._call("tools/call", 1, {
