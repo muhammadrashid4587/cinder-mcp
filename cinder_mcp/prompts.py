@@ -15,7 +15,9 @@ inspects the live keyspace — INFO, KEYS, and a per-key TTL, type,
 and size sample — classifies every key as safe to delete, expiring
 soon, risky to delete without confirmation, or keep, and asks the
 model to turn that into a concrete cleanup plan with exact kv_del
-calls.
+calls. keyspace-health is the one-view health report: total keys,
+type breakdown, keys without TTL, soonest-expiring keys, the
+largest keys, and a short list of recommended actions.
 """
 
 import bisect
@@ -42,6 +44,18 @@ MAX_NO_EXPIRY_KEYS = 20
 
 # At most this many keys are listed per section in the cleanup-plan.
 MAX_CLEANUP_KEYS = 20
+
+# At most this many keys are listed per section in the
+# keyspace-health report: no-expiry keys, soonest-expiring keys,
+# largest string keys, largest container keys.
+MAX_HEALTH_KEYS = 10
+
+# A largest-string recommendation only fires when the biggest string
+# is at least this many bytes, and a largest-container one when the
+# biggest container holds at least this many elements: below that,
+# the largest key is unremarkable and not worth an action.
+HEALTH_BIG_STRING_BYTES = 1024
+HEALTH_BIG_CONTAINER_ELEMENTS = 100
 
 # TTL bucket boundaries, in seconds: under 1 hour, under 1 day,
 # under 1 week, over 1 week. Keys with TTL -1 have no expiry.
@@ -121,6 +135,21 @@ PROMPTS = [
             },
         ],
     },
+    {
+        "name": "keyspace-health",
+        "description": (
+            "Report keyspace health in one view: total keys, type "
+            "breakdown, keys without TTL, soonest-expiring keys, "
+            "largest keys, and a short list of recommended actions."
+        ),
+        "arguments": [
+            {
+                "name": "pattern",
+                "description": "Glob pattern of keys to include (* and ?). Defaults to all keys.",
+                "required": False,
+            },
+        ],
+    },
 ]
 
 
@@ -143,6 +172,8 @@ def get_prompt(client, name, arguments):
         return _ttl_audit(client, arguments)
     if name == "cleanup-plan":
         return _cleanup_plan(client, arguments)
+    if name == "keyspace-health":
+        return _keyspace_health(client, arguments)
     raise ValueError("unknown prompt: %s" % name)
 
 
@@ -183,12 +214,15 @@ def _keyspace_summary(client, arguments):
 
 def _inspect_key(client, key):
     """Type and size of one key, plus a sample value for string keys.
-    Returns (kind, size_text, sample) where sample is the string value
-    for string keys and None for containers. Cinder has no TYPE
-    command, so the type is probed the same way the per-key resource
-    does: GET succeeds for strings, otherwise LLEN / SCARD / HLEN are
-    tried in turn and the first one that does not answer WRONGTYPE
-    names it."""
+    Returns (kind, size_value, size_text, sample) where sample is
+    the string value for string keys and None for containers.
+    size_value is the byte length for strings and the element count
+    for containers, so callers can rank keys by size; size_text is
+    the human rendering ("5 bytes", "2 elements"). Cinder has no
+    TYPE command, so the type is probed the same way the per-key
+    resource does: GET succeeds for strings, otherwise LLEN /
+    SCARD / HLEN are tried in turn and the first one that does not
+    answer WRONGTYPE names it."""
     try:
         value = client.command("GET", key)
     except RespError:
@@ -198,12 +232,13 @@ def _inspect_key(client, key):
                 length = client.command(probe, key)
             except RespError:
                 continue
-            return name, "%d elements" % length, None
+            return name, length, "%d elements" % length, None
         raise ValueError("key has an unreadable type: %s" % key)
     if value is None:
         # The key expired between EXISTS and GET, or was deleted.
         raise ValueError("key not found: %s" % key)
-    return "string", "%d bytes" % len(value.encode("utf-8")), value
+    size = len(value.encode("utf-8"))
+    return "string", size, "%d bytes" % size, value
 
 
 def _key_deep_dive(client, arguments):
@@ -215,7 +250,7 @@ def _key_deep_dive(client, arguments):
     if client.command("EXISTS", key) == 0:
         raise ValueError("key not found: %s" % key)
     ttl = client.command("TTL", key)
-    kind, size, sample = _inspect_key(client, key)
+    kind, _size_value, size, sample = _inspect_key(client, key)
     if ttl == -2:
         ttl_text = "expired while reading"
     elif ttl == -1:
@@ -438,7 +473,7 @@ def _cleanup_plan(client, arguments):
                 expired += 1
                 continue
             try:
-                kind, size, _sample = _inspect_key(client, key)
+                kind, _size_value, size, _sample = _inspect_key(client, key)
             except ValueError:
                 # The key vanished between the TTL probe and the type probe.
                 expired += 1
@@ -531,3 +566,195 @@ def _related_keys(client, key):
     if keys is None:
         return []
     return sorted(k for k in keys if k != key)[:MAX_RELATED_KEYS]
+
+
+def _keyspace_health(client, arguments):
+    """One-view health report: total keys, type breakdown, keys
+    without TTL, soonest-expiring keys, the largest keys, and a
+    short list of recommended actions. Scanned in bounded batches
+    like ttl-audit and cleanup-plan; only counts plus the bounded
+    top-10 lists are kept, so the prompt text stays bounded however
+    large the keyspace is. "Largest" is measured where it is cheap:
+    string keys by byte length and containers by element count,
+    reported separately because bytes and element counts are not
+    comparable. Keys that expire between the KEYS scan and the
+    probes are counted separately rather than reported. The
+    recommended actions are derived from the data, not invented:
+    no-expiry keys get a kv_expire suggestion (temporary-looking
+    names first), keys expiring within the hour get a renew-or-let-
+    go decision, and a largest key only earns an inspection action
+    when it is big enough to be remarkable."""
+    pattern = arguments.get("pattern", "*")
+    info = client.command("INFO")
+    type_counts = {"string": 0, "list": 0, "set": 0, "hash": 0}
+    total = 0
+    expired = 0
+    no_expiry = []  # bounded sorted keys, at most MAX_HEALTH_KEYS
+    no_expiry_count = 0
+    expiring = 0
+    expiring_soon = 0  # expiring within the hour
+    soonest = []  # bounded sorted (ttl, key), at most MAX_HEALTH_KEYS
+    # Largest keys, stored negated so _bounded_insert keeps the
+    # biggest: (-size, key) sorts smallest-first, i.e. largest size
+    # first, and pop() drops the smallest size.
+    largest_strings = []  # (-bytes, key)
+    largest_containers = []  # (-elements, key)
+    for batch in iter_keys(client, pattern, PROMPT_SCAN_BATCH_SIZE):
+        for key in batch:
+            total += 1
+            ttl = client.command("TTL", key)
+            if ttl == -2:
+                expired += 1
+                continue
+            try:
+                kind, size_value, _size_text, _sample = _inspect_key(client, key)
+            except ValueError:
+                # The key vanished between the TTL probe and the type probe.
+                expired += 1
+                continue
+            type_counts[kind] += 1
+            if ttl == -1:
+                no_expiry_count += 1
+                _bounded_insert(no_expiry, key, MAX_HEALTH_KEYS)
+            else:
+                expiring += 1
+                _bounded_insert(soonest, (ttl, key), MAX_HEALTH_KEYS)
+                if ttl < CLEANUP_SAFE_TTL:
+                    expiring_soon += 1
+            if kind == "string":
+                _bounded_insert(
+                    largest_strings, (-size_value, key), MAX_HEALTH_KEYS
+                )
+            else:
+                _bounded_insert(
+                    largest_containers, (-size_value, key), MAX_HEALTH_KEYS
+                )
+    lines = [
+        "Keyspace health report (pattern %r)." % pattern,
+        "",
+        "Server info:",
+        info.strip() if info else "(no INFO output)",
+        "",
+        "Total keys scanned: %d" % total,
+    ]
+    if expired:
+        lines.append(
+            "%d key(s) expired while scanning and were not reported."
+            % expired
+        )
+    lines.extend(["", "Type breakdown:"])
+    for kind in ("string", "list", "set", "hash"):
+        lines.append("- %s: %d" % (kind, type_counts[kind]))
+    lines.extend(["", "Keys with no expiry (%d):" % no_expiry_count])
+    if no_expiry:
+        for key in no_expiry:
+            lines.append("- %s" % key)
+        if no_expiry_count > MAX_HEALTH_KEYS:
+            lines.append(
+                "... and %d more" % (no_expiry_count - MAX_HEALTH_KEYS)
+            )
+    else:
+        lines.append("(none)")
+    lines.extend(["", "Soonest expiring keys (%d):" % expiring])
+    if soonest:
+        for ttl, key in soonest:
+            lines.append("- %s (in %s)" % (key, _format_ttl(ttl)))
+        if expiring > MAX_HEALTH_KEYS:
+            lines.append("... and %d more" % (expiring - MAX_HEALTH_KEYS))
+    else:
+        lines.append("(none expiring)")
+    lines.extend(["", "Largest string keys (by bytes):"])
+    if largest_strings:
+        for neg_size, key in largest_strings:
+            lines.append("- %s (%d bytes)" % (key, -neg_size))
+        if type_counts["string"] > MAX_HEALTH_KEYS:
+            lines.append(
+                "... and %d more" % (type_counts["string"] - MAX_HEALTH_KEYS)
+            )
+    else:
+        lines.append("(none)")
+    containers = (
+        type_counts["list"] + type_counts["set"] + type_counts["hash"]
+    )
+    lines.extend(["", "Largest container keys (by element count):"])
+    if largest_containers:
+        for neg_size, key in largest_containers:
+            lines.append("- %s (%d elements)" % (key, -neg_size))
+        if containers > MAX_HEALTH_KEYS:
+            lines.append("... and %d more" % (containers - MAX_HEALTH_KEYS))
+    else:
+        lines.append("(none)")
+    actions = []
+    if total == 0:
+        actions.append("Nothing to do: the keyspace is empty.")
+    else:
+        if no_expiry_count:
+            temp = [k for k in no_expiry if _looks_temporary(k)]
+            if temp:
+                actions.append(
+                    "Give the %d key(s) with no expiry a TTL with "
+                    "kv_expire, starting with the temporary-looking "
+                    "ones: %s." % (no_expiry_count, ", ".join(temp))
+                )
+            else:
+                actions.append(
+                    "Give the %d key(s) with no expiry a TTL with "
+                    "kv_expire, starting with the ones listed above."
+                    % no_expiry_count
+                )
+        if expiring_soon:
+            actions.append(
+                "Decide on the %d key(s) expiring within the hour: "
+                "renew them with kv_expire or let them go."
+                % expiring_soon
+            )
+        if largest_strings and -largest_strings[0][0] >= HEALTH_BIG_STRING_BYTES:
+            big_key = largest_strings[0][1]
+            actions.append(
+                "Inspect the largest string key %r (%d bytes) with "
+                "key-deep-dive or cinder://key/%s: a multi-kilobyte "
+                "value may be a runaway cache entry."
+                % (big_key, -largest_strings[0][0], big_key)
+            )
+        if (
+            largest_containers
+            and -largest_containers[0][0] >= HEALTH_BIG_CONTAINER_ELEMENTS
+        ):
+            big_key = largest_containers[0][1]
+            actions.append(
+                "Inspect the largest container %r (%d elements) with "
+                "key-deep-dive or cinder://key/%s: a very long list, "
+                "set, or hash may be growing without bound."
+                % (big_key, -largest_containers[0][0], big_key)
+            )
+        dominant_kind, dominant_count = max(
+            type_counts.items(), key=lambda item: item[1]
+        )
+        if total >= 5 and dominant_count * 5 >= total * 4:
+            actions.append(
+                "The keyspace is %d%% %s keys — check that matches "
+                "what this cinder instance is for."
+                % (dominant_count * 100 // total, dominant_kind)
+            )
+        if not actions:
+            actions.append(
+                "Nothing urgent: no key needs an expiry, a renewal, "
+                "or a size check."
+            )
+    lines.extend(["", "Recommended actions:"])
+    lines.extend("- %s" % action for action in actions)
+    lines.extend([
+        "",
+        "Assess the health of this keyspace: which of the recommended "
+        "actions matter most, in what order, and is there anything in "
+        "the type breakdown or the largest keys that suggests a "
+        "problem the actions above miss? Give the exact kv_expire, "
+        "kv_del, or key-deep-dive call for each action you endorse, "
+        "and say which actions you would not take and why.",
+    ])
+    return {
+        "description": _prompt_def("keyspace-health")["description"],
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }

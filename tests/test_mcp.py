@@ -901,10 +901,10 @@ class McpTests(unittest.TestCase):
         self.assertIn("cinder_version:0.4.0", contents[0]["text"])
         self.assertIn("keys:0", contents[0]["text"])
 
-    def test_prompts_list_returns_all_four_prompts(self):
+    def test_prompts_list_returns_all_five_prompts(self):
         listed = self._call("prompts/list", 1)
         prompts = listed["result"]["prompts"]
-        self.assertEqual(len(prompts), 4)
+        self.assertEqual(len(prompts), 5)
         self.assertEqual(prompts[0]["name"], "keyspace-summary")
         self.assertEqual(prompts[0]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[0]["arguments"][0]["required"])
@@ -917,6 +917,9 @@ class McpTests(unittest.TestCase):
         self.assertEqual(prompts[3]["name"], "cleanup-plan")
         self.assertEqual(prompts[3]["arguments"][0]["name"], "pattern")
         self.assertFalse(prompts[3]["arguments"][0]["required"])
+        self.assertEqual(prompts[4]["name"], "keyspace-health")
+        self.assertEqual(prompts[4]["arguments"][0]["name"], "pattern")
+        self.assertFalse(prompts[4]["arguments"][0]["required"])
 
     def test_prompts_get_empty_keyspace(self):
         reply = self._call("prompts/get", 1, {"name": "keyspace-summary"})
@@ -1318,6 +1321,150 @@ class McpTests(unittest.TestCase):
         risky = self._section(plan, "Risky — confirm before deleting (250)")
         self.assertEqual(len(risky), 21)
         self.assertEqual(risky[-1], "... and 230 more")
+
+    def test_prompts_get_keyspace_health_empty_keyspace(self):
+        reply = self._call("prompts/get", 1, {"name": "keyspace-health"})
+        messages = reply["result"]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "user")
+        text = messages[0]["content"]["text"]
+        self.assertIn("Keyspace health report (pattern '*').", text)
+        self.assertIn("Total keys scanned: 0", text)
+        self.assertIn("cinder_version:0.4.0", text)
+        self.assertIn("- string: 0", text)
+        self.assertIn("- list: 0", text)
+        self.assertIn("- set: 0", text)
+        self.assertIn("- hash: 0", text)
+        self.assertIn("Keys with no expiry (0):", text)
+        self.assertIn("Soonest expiring keys (0):", text)
+        self.assertIn("(none expiring)", text)
+        self.assertIn("Largest string keys (by bytes):", text)
+        self.assertIn("Largest container keys (by element count):", text)
+        self.assertIn("Nothing to do: the keyspace is empty.", text)
+        self.assertNotIn("expired while scanning", text)
+
+    def test_prompts_get_keyspace_health_mixed_keyspace(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "soon", "value": "v", "ex": 1905},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "today", "value": "v", "ex": 40000},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "far", "value": "v", "ex": 200000},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "cache:old", "value": "v"},
+        })
+        self._call("tools/call", 6, {
+            "name": "kv_set", "arguments": {"key": "big", "value": "x" * 2000},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it", "call"], None)
+        self.fake.store["tags"] = ({"a", "b"}, None)
+        self.fake.store["meta"] = ({"f": "v"}, None)
+        reply = self._call("prompts/get", 7, {"name": "keyspace-health"})
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 9", text)
+        self.assertIn("- string: 6", text)
+        self.assertIn("- list: 1", text)
+        self.assertIn("- set: 1", text)
+        self.assertIn("- hash: 1", text)
+        self.assertIn("Keys with no expiry (6):", text)
+        self.assertIn("- big", text)
+        self.assertIn("- cache:old", text)
+        self.assertIn("- forever", text)
+        self.assertIn("Soonest expiring keys (3):", text)
+        soonest = text.split("Soonest expiring keys (3):\n")[1].split("\n\n")[0]
+        self.assertEqual(
+            [line.split(" (in ")[0][2:] for line in soonest.split("\n")],
+            ["soon", "today", "far"],
+        )
+        # Largest string first, then the 1-byte strings in key order.
+        largest = text.split("Largest string keys (by bytes):\n")[1].split("\n\n")[0]
+        self.assertEqual(largest.split("\n")[0], "- big (2000 bytes)")
+        self.assertIn("- cache:old (1 bytes)", largest)
+        largest_containers = text.split(
+            "Largest container keys (by element count):\n")[1].split("\n\n")[0]
+        self.assertEqual(
+            largest_containers.split("\n"),
+            ["- todo (3 elements)", "- tags (2 elements)", "- meta (1 elements)"],
+        )
+        # Recommended actions are derived from the data.
+        actions = text.split("Recommended actions:\n")[1].split("\n\n")[0]
+        self.assertIn(
+            "Give the 6 key(s) with no expiry a TTL with kv_expire, "
+            "starting with the temporary-looking ones: cache:old.",
+            actions,
+        )
+        self.assertIn(
+            "Decide on the 1 key(s) expiring within the hour: renew "
+            "them with kv_expire or let them go.",
+            actions,
+        )
+        self.assertIn(
+            "Inspect the largest string key 'big' (2000 bytes) with "
+            "key-deep-dive or cinder://key/big",
+            actions,
+        )
+        # No dominance action: strings are 6 of 9, under 80%.
+        self.assertNotIn("check that matches what this cinder", actions)
+        self.assertIn("kv_expire", text)
+
+    def test_prompts_get_keyspace_health_pattern_filters_keys(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "user:1", "value": "a", "ex": 60},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "cache:x", "value": "c"},
+        })
+        reply = self._call("prompts/get", 3, {
+            "name": "keyspace-health", "arguments": {"pattern": "user:*"},
+        })
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Total keys scanned: 1", text)
+        self.assertIn("- string: 1", text)
+        self.assertIn("Keys with no expiry (0):", text)
+        self.assertIn("- user:1 (in ", text)
+        self.assertNotIn("cache:x", text)
+
+    def test_prompts_keyspace_health_same_result_at_any_batch_size(self):
+        # TTLs sit mid-rendering-unit, so a second of clock drift
+        # between runs cannot reorder or reword anything.
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "perm:%03d" % i, "value": "v"},
+            })
+        for i in range(30):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "exp:%03d" % i, "value": "v",
+                              "ex": 100000 + i * 1000},
+            })
+        for i in range(10):
+            self._call("tools/call", 1, {
+                "name": "kv_set",
+                "arguments": {"key": "soon:%03d" % i, "value": "v",
+                              "ex": 1930 + i * 10},
+            })
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "big", "value": "x" * 2000},
+        })
+        for i in range(5):
+            self.fake.store["l:%d" % i] = (["x"] * (i + 1), None)
+        baseline = self._prompt_text("keyspace-health", batch_size=100)
+        self.assertIn("Total keys scanned: 76", baseline)
+        self.assertIn("- big (2000 bytes)", baseline)
+        self.assertIn("- l:4 (5 elements)", baseline)
+        for size in (1, 2, 7):
+            self.assertEqual(
+                self._prompt_text("keyspace-health", batch_size=size), baseline,
+                "batch_size=%d" % size,
+            )
 
     def test_metrics_resource_records_tool_calls(self):
         self._call("tools/call", 1, {

@@ -119,6 +119,7 @@ Fetchable with `resources/list` and `resources/read`.
 | `key-deep-dive` | `key` (required) | Inspects one key in detail — type, TTL, size, a sample of its value (truncated at 200 chars), and the keys sharing its namespace — and asks the model to judge whether the key looks healthy |
 | `ttl-audit` | `pattern` (optional, defaults to `*`) | Scans the keyspace in bounded batches of 100 keys, groups keys by TTL bucket (no expiry, expiring <1h, <1d, <1w, >1w), lists the soonest-expiring keys and the keys with no expiry, and asks the model to flag what the operator should act on. Only counts plus the 10 soonest keys and the first 20 no-expiry keys are kept, so the prompt stays bounded on a huge keyspace |
 | `cleanup-plan` | `pattern` (optional, defaults to `*`) | Inspects the live keyspace in bounded batches of 100 keys (INFO, per-key TTL/type/size) and classifies every key as safe to delete (expires <1h), expiring soon (<1d), risky to delete without confirmation (no expiry), or keep (>1d), and asks the model to produce a concrete cleanup plan with exact `kv_del` calls — risky keys need a human to confirm each delete. Each section keeps only its first 20 keys plus a count of the rest, so the prompt stays bounded on a huge keyspace |
+| `keyspace-health` | `pattern` (optional, defaults to `*`) | One-view health report: total keys, type breakdown, keys with no expiry, soonest-expiring keys, largest string keys (by bytes) and largest container keys (by element count), and a short list of recommended actions derived from the data. Scanned in bounded batches of 100 keys; each list keeps only its first 10 keys plus a count of the rest, so the prompt stays bounded on a huge keyspace |
 
 Fetchable with `prompts/list` and `prompts/get`.
 
@@ -144,14 +145,14 @@ requests return JSON-RPC errors.
 
 ## Streaming the keyspace
 
-`ttl-audit` and `cleanup-plan` scan the keyspace in bounded batches
+`ttl-audit`, `cleanup-plan`, and `keyspace-health` scan the keyspace in bounded batches
 of 100 keys (`cinder_mcp/scan.py`), and `kv_keys_scan` exposes the
 same walk as a paged tool. The per-key work and the prompt text stay
 bounded: the prompts keep only counts plus the 10 soonest-expiring
 keys, the first 20 no-expiry keys, and the first 20 keys per cleanup
 section, with "... and N more" for the rest. The results are
 identical to the old load-everything scan at any batch size — the
-tests run both prompts at batch sizes 1, 2, 7 and 100 over the same
+tests run the three scanning prompts at batch sizes 1, 2, 7 and 100 over the same
 keyspace and compare the full prompt text.
 
 One honest limitation: cinder has no `SCAN` command yet, so the
@@ -179,6 +180,7 @@ prompts.
 - ~~Sampling support for long key listings, so `kv_keys` over a huge keyspace returns a bounded deterministic sample (default cap 100 keys, `limit` / `seed` / `full` parameters) plus `total` / `returned` / `sampled` counts instead of every key~~ (done, v0.15.0)
 - ~~Streaming the keyspace for prompts, so `ttl-audit` and `cleanup-plan` can scan a huge keyspace without loading every key into memory at once, plus a `kv_keys_scan` tool that walks the keyspace one bounded page at a time with a resume cursor~~ (done, v0.16.0)
 - ~~Atomic batches: `kv_batch` with `atomic: true` runs the ops as one `MULTI`/`EXEC` transaction on a single connection, so they execute together with no other client interleaved; ops that fail at EXEC time are recorded in place while the rest still run, and ops that cannot be queued fail the whole call before anything runs~~ (done, v0.17.0)
+- ~~Keyspace-health prompt (`keyspace-health`): one-view health report — total keys, type breakdown, keys without TTL, soonest-expiring keys, largest string keys by bytes and largest containers by element count, plus a short list of recommended actions derived from the data, all scanned in bounded batches~~ (done, v0.18.0)
 
 ## Next
 
