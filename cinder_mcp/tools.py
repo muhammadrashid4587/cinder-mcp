@@ -382,6 +382,37 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_hkeys",
+        "description": "The field names of a hash: HKEYS key. Returns the field names in cinder's order. At most 1000 fields per call; a larger hash fails instead of returning a silently truncated list — page it with kv_hscan instead. Returns an empty list when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_hvals",
+        "description": "The values of a hash: HVALS key. Returns the field values in cinder's order, matching kv_hkeys field for field. At most 1000 values per call; a larger hash fails instead of returning a silently truncated list — page it with kv_hscan instead. Returns an empty list when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_hincrbyfloat",
+        "description": "Increment the float stored in one field of a hash: HINCRBYFLOAT key field increment. Creates the field holding the increment when it does not exist, and the key when it does not exist. Returns the new value as a number. A negative increment counts down, as in Redis. The increment may be an integer or a float, but not NaN or an infinity; a field holding a non-float fails.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "field": {"type": "string"},
+                "increment": {"type": "number"},
+            },
+            "required": ["key", "field", "increment"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -671,7 +702,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -782,6 +813,7 @@ BATCHABLE_TOOLS = {
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
+    "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
@@ -860,6 +892,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
+    "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
@@ -953,6 +986,24 @@ def _call_batch_atomic(client, ops):
             value = hscan_result(
                 reply, op.get("batch_size", DEFAULT_SCAN_BATCH_SIZE)
             )
+        elif op_name in ("kv_hkeys", "kv_hvals"):
+            # HKEYS/HVALS came back as a flat list inside the
+            # transaction; a hash wider than the cap is recorded as
+            # this op's error, in place, like an EXEC-time failure
+            # — the rest still run.
+            fields = list(reply or [])
+            if len(fields) > MAX_HASH_FIELDS:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "%s returns at most %d fields; "
+                              "the hash is larger"
+                              % (op_name, MAX_HASH_FIELDS)})
+                continue
+            value = fields
+        elif op_name == "kv_hincrbyfloat":
+            # HINCRBYFLOAT came back as a bulk string inside the
+            # transaction; parse it like the standalone tool does.
+            value = float(reply)
         elif op_name == "kv_zrange":
             # ZRANGE came back as a flat list inside the transaction;
             # shape it like the standalone tool does, including the
@@ -1262,6 +1313,13 @@ def _op_argv(name, args):
         key, pattern, batch_size, cursor = _hscan_args(args)
         return ["HSCAN", key, cursor or "0", "MATCH", pattern,
                 "COUNT", batch_size]
+    if name == "kv_hkeys":
+        return ["HKEYS", _require(args, "key")]
+    if name == "kv_hvals":
+        return ["HVALS", _require(args, "key")]
+    if name == "kv_hincrbyfloat":
+        key, field, increment = _hincrbyfloat_args(args)
+        return ["HINCRBYFLOAT", key, field, increment]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -1493,6 +1551,29 @@ def _hincrby_args(args):
     if isinstance(increment, bool) or not isinstance(increment, int):
         raise ValueError("kv_hincrby increment must be an integer")
     return key, field, increment
+
+
+def _hincrbyfloat_args(args):
+    """Validate a kv_hincrbyfloat call: (key, field, increment).
+    The increment must be a finite number — an int or a float, as
+    in Redis. cinder rejects a non-float argument as a server
+    error and an increment that would overflow as one too, so both
+    fail here as invalid params instead: NaN and infinities never
+    reach the server. repr round-trips a float exactly, and prints
+    an int plainly, so either form parses back in cinder."""
+    key = _require(args, "key")
+    field = _require(args, "field")
+    increment = _require(args, "increment")
+    if isinstance(increment, bool) or not isinstance(increment, (int, float)):
+        raise ValueError("kv_hincrbyfloat increment must be a number")
+    if isinstance(increment, float) and (
+        increment != increment
+        or increment in (float("inf"), float("-inf"))
+    ):
+        raise ValueError(
+            "kv_hincrbyfloat increment must be a finite number"
+        )
+    return key, field, repr(increment)
 
 
 def _hset_field_args(args):
@@ -2021,6 +2102,11 @@ def _call_lrange(client, args):
     return list(client.command(*_op_argv("kv_lrange", args)) or [])
 
 
+# The most fields one kv_hkeys or kv_hvals call returns; a larger
+# hash fails instead of dumping a huge hash into one tool result.
+MAX_HASH_FIELDS = 1000
+
+
 # The most members one kv_smembers call returns; a larger set fails
 # instead of dumping a huge set into one tool result.
 MAX_SMEMBERS = 1000
@@ -2053,6 +2139,41 @@ def _call_smembers(client, args):
     return list(client.command("SMEMBERS", key) or [])
 
 
+def _call_hkeys(client, args):
+    """kv_hkeys: bound the hash first with HLEN, then run HKEYS. A
+    missing key replies as an empty list, which becomes []. The
+    HLEN check runs outside a transaction, so an atomic batch
+    checks the reply length instead (see _call_batch_atomic)."""
+    key = _require(args, "key")
+    if (client.command("HLEN", key) or 0) > MAX_HASH_FIELDS:
+        raise ValueError(
+            "kv_hkeys returns at most %d fields; the hash is larger"
+            % MAX_HASH_FIELDS
+        )
+    return list(client.command("HKEYS", key) or [])
+
+
+def _call_hvals(client, args):
+    """kv_hvals: bound the hash first with HLEN, then run HVALS. A
+    missing key replies as an empty list, which becomes []. The
+    HLEN check runs outside a transaction, so an atomic batch
+    checks the reply length instead (see _call_batch_atomic)."""
+    key = _require(args, "key")
+    if (client.command("HLEN", key) or 0) > MAX_HASH_FIELDS:
+        raise ValueError(
+            "kv_hvals returns at most %d values; the hash is larger"
+            % MAX_HASH_FIELDS
+        )
+    return list(client.command("HVALS", key) or [])
+
+
+def _call_hincrbyfloat(client, args):
+    """kv_hincrbyfloat: the field's new value as a number. Cinder
+    replies with the value as a bulk string, formatted with %.17g,
+    as it does for ZINCRBY scores."""
+    return float(client.command(*_op_argv("kv_hincrbyfloat", args)))
+
+
 def _call_single(client, name, args):
     if name == "kv_keys":
         return _call_keys(client, args)
@@ -2060,6 +2181,12 @@ def _call_single(client, name, args):
         return _call_keys_scan(client, args)
     if name == "kv_hscan":
         return _call_hscan(client, args)
+    if name == "kv_hkeys":
+        return _call_hkeys(client, args)
+    if name == "kv_hvals":
+        return _call_hvals(client, args)
+    if name == "kv_hincrbyfloat":
+        return _call_hincrbyfloat(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":

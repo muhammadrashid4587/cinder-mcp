@@ -23,8 +23,10 @@ against the live keyspace before anything runs: it flags overwrites
 of keys that never expire, overwrites of large keys, SETs, MSETs,
 SETEXes and GETSETs that would destroy a list, set, or hash, GETDELs
 that would delete a key that never expires, INCRs and DECRs that
-would fail on a non-integer or a container, and EXPIREs with a bad
-timeout, then asks the model for a go/no-go per risky op. SETNX never
+would fail on a non-integer or a container, HINCRBYs that would fail
+on a non-integer field or a container, HINCRBYFLOATs that would fail
+on a non-float field or a container, and EXPIREs with a bad timeout,
+then asks the model for a go/no-go per risky op. SETNX never
 writes to a key that already exists, so the audit reports it as a
 safe no-op there and a new key with no expiry elsewhere. ttl-renewal plans
 renewing the TTLs of keys that are expiring soon or have no expiry:
@@ -120,11 +122,12 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_set", "kv_del", "kv_incr", "kv_expire",
     "kv_mset", "kv_setnx", "kv_setex", "kv_getset", "kv_getdel",
     "kv_append", "kv_decr", "kv_decrby", "kv_getex",
-    "kv_hsetnx", "kv_hincrby",
+    "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
-                         "kv_strlen", "kv_hscan", "kv_zrandmember")
+                         "kv_strlen", "kv_hscan", "kv_hkeys", "kv_hvals",
+                         "kv_zrandmember")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -235,11 +238,12 @@ PROMPTS = [
             "and GETSETs that would destroy a container, GETDELs "
             "that would delete a key that never expires, INCRs and "
             "DECRs that would fail, HINCRBYs that would fail on a "
-            "non-integer field or a container, HSETNXes that would "
-            "fail on a container, APPENDs that would fail, GETEXes "
-            "that would change or remove a TTL, ZPOPs that would "
-            "drain a sorted set, and EXPIREs with a bad timeout, "
-            "and give a go/no-go per risky op."
+            "non-integer field or a container, HINCRBYFLOATs that "
+            "would fail on a non-float field or a container, "
+            "HSETNXes that would fail on a container, APPENDs that "
+            "would fail, GETEXes that would change or remove a TTL, "
+            "ZPOPs that would drain a sorted set, and EXPIREs with "
+            "a bad timeout, and give a go/no-go per risky op."
         ),
         "arguments": [
             {
@@ -975,6 +979,42 @@ def _hincrby_audit_increment(op):
     return increment
 
 
+def _is_float(text):
+    """True when `text` parses as a finite float. Cinder's float
+    parser accepts "inf" as a value, but adding anything to it
+    overflows, so a stored infinity is not a field HINCRBYFLOAT
+    can bump — the audit treats it as not a float, like NaN."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return False
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _hincrbyfloat_audit_increment(op):
+    """The increment for a kv_hincrbyfloat op in a write plan,
+    validated like the tool's own argument: it must be a finite
+    number, an int or a float, and a negative one counts down.
+    Anything else raises ValueError, so the caller reports the op
+    as not audited instead of guessing."""
+    increment = op.get("increment")
+    if increment is None:
+        raise ValueError(
+            "kv_hincrbyfloat is missing increment: %r" % (op,))
+    if isinstance(increment, bool) or not isinstance(
+        increment, (int, float)
+    ):
+        raise ValueError(
+            "kv_hincrbyfloat increment is not a number: %r" % (increment,)
+        )
+    if isinstance(increment, float) and not _is_float(increment):
+        raise ValueError(
+            "kv_hincrbyfloat increment is not a finite number: %r"
+            % (increment,)
+        )
+    return increment
+
+
 def _getex_option(op):
     """The GETEX option from a write-plan op: (ex, px, persist).
     At most one option may be given, and persist must be a
@@ -1101,7 +1141,8 @@ def _audit_write_op(client, op):
     SETEX or GETSET that would replace a list, set, or hash with a
     string, a GETDEL on a container, an INCR or DECR on
     a non-integer or a container, a HINCRBY on a non-integer field
-    or a container, a HSETNX on a container, an APPEND on a
+    or a container, a HINCRBYFLOAT on a non-float field or a
+    container, a HSETNX on a container, an APPEND on a
     container, a GETEX or ZPOP on a container, a ZPOP that would
     drain a never-expiring or large sorted set, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
@@ -1115,7 +1156,8 @@ def _audit_write_op(client, op):
     so it is safe, and so is HSETNX on a field that already
     exists. Everything else is "safe": creating an expiring key,
     INCR or DECR on a missing key, HINCRBY on a missing key or a
-    missing field, an EXPIRE on an existing key, a GETEX that
+    missing field, HINCRBYFLOAT on a missing key or a missing
+    field, an EXPIRE on an existing key, a GETEX that
     only reads a value, or a no-op on a missing key.
     kv_mset has no single key — it writes several at once — so it
     is audited by _audit_mset instead of the single-key flow below."""
@@ -1256,6 +1298,17 @@ def _audit_write_op(client, op):
             return "safe", (
                 "kv_hincrby %r — creates a counter field starting at %d"
                 % (key, int(increment))
+            )
+        if name == "kv_hincrbyfloat":
+            increment = _hincrbyfloat_audit_increment(op)
+            if not isinstance(op.get("field"), str):
+                raise ValueError(
+                    "kv_hincrbyfloat field must be a string: %r"
+                    % (op.get("field"),)
+                )
+            return "safe", (
+                "kv_hincrbyfloat %r — creates a float field starting "
+                "at %r" % (key, increment)
             )
         if name in ("kv_zpopmin", "kv_zpopmax"):
             count = op.get("count", 1)
@@ -1578,6 +1631,33 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_hincrby %r — increments a counter field currently at %s"
             % (key, current)
+        )
+    if name == "kv_hincrbyfloat":
+        increment = _hincrbyfloat_audit_increment(op)
+        field = op.get("field")
+        if not isinstance(field, str):
+            raise ValueError(
+                "kv_hincrbyfloat field must be a string: %r" % (field,)
+            )
+        if kind != "hash":
+            return "risky", (
+                "kv_hincrbyfloat %r — would fail with WRONGTYPE: the "
+                "key is a %s of %s" % (key, kind, size)
+            )
+        current = client.command("HGET", key, field)
+        if current is None:
+            return "safe", (
+                "kv_hincrbyfloat %r — creates a float field starting "
+                "at %r" % (key, increment)
+            )
+        if not _is_float(current):
+            return "risky", (
+                "kv_hincrbyfloat %r — would fail: the field value is "
+                "not a float" % key
+            )
+        return "safe", (
+            "kv_hincrbyfloat %r — increments a float field currently "
+            "at %s" % (key, current)
         )
     if name in ("kv_zpopmin", "kv_zpopmax"):
         count = op.get("count", 1)

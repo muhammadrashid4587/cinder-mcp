@@ -3,7 +3,7 @@
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HSCAN, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -486,6 +486,60 @@ class FakeCinder(threading.Thread):
                             "overflow\r\n")
             value[args[1]] = str(nxt)
             return ":%d\r\n" % nxt
+        elif name == "HKEYS" and len(args) == 1:
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return "*%d\r\n" % len(value) + "".join(
+                self._bulk(k) for k in value
+            )
+        elif name == "HVALS" and len(args) == 1:
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return "*%d\r\n" % len(value) + "".join(
+                self._bulk(v) for v in value.values()
+            )
+        elif name == "HINCRBYFLOAT" and len(args) == 3:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            try:
+                delta = float(args[2])
+            except ValueError:
+                return "-ERR value is not a valid float\r\n"
+            if delta != delta:
+                return "-ERR value is not a valid float\r\n"
+            if value is None:
+                value = {}
+                self.store[args[0]] = (value, None)
+            current = value.get(args[1])
+            if current is None:
+                nxt = delta
+            else:
+                try:
+                    cur = float(current)
+                except ValueError:
+                    return "-ERR hash value is not a float\r\n"
+                if cur != cur:
+                    return "-ERR hash value is not a float\r\n"
+                nxt = cur + delta
+            if nxt != nxt or nxt in (float("inf"), float("-inf")):
+                return ("-ERR increment or decrement would "
+                        "overflow\r\n")
+            # Cinder formats the new value with %.17g and turns a
+            # -0.0 result into "0", as Redis does.
+            if nxt == 0:
+                nxt = 0.0
+            value[args[1]] = "%.17g" % nxt
+            return self._bulk("%.17g" % nxt)
         elif name == "HSCAN" and len(args) >= 2:
             # Cinder's cursor is a decimal index into the hash's
             # fields; "0" starts (and ends) the walk. MATCH filters
@@ -1074,6 +1128,7 @@ class McpTests(unittest.TestCase):
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
                     "kv_hscan",
+                    "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
@@ -1747,6 +1802,212 @@ class McpTests(unittest.TestCase):
             "name": "kv_batch",
             "arguments": {"atomic": True, "ops": [
                 {"op": "kv_pexpire", "key": "b:temp", "milliseconds": -5},
+            ]},
+        })
+        self.assertIn("error", bad)
+
+    def test_tools_call_hash_keys_vals_and_float(self):
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "user:1",
+                          "fields": {"name": "mo", "score": "1.5",
+                                     "age": "24"}},
+        })
+        # HKEYS lists the field names and HVALS the values, in the
+        # same order, field for field. (kv_hset sends its fields
+        # sorted, so that is the order they come back in.)
+        keys = self._call("tools/call", 2, {
+            "name": "kv_hkeys", "arguments": {"key": "user:1"},
+        })
+        self.assertEqual(
+            json.loads(keys["result"]["content"][0]["text"]),
+            ["age", "name", "score"])
+        vals = self._call("tools/call", 3, {
+            "name": "kv_hvals", "arguments": {"key": "user:1"},
+        })
+        self.assertEqual(
+            json.loads(vals["result"]["content"][0]["text"]),
+            ["24", "mo", "1.5"])
+        # A missing key is an empty list for both, not an error.
+        ghost_keys = self._call("tools/call", 4, {
+            "name": "kv_hkeys", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(
+            json.loads(ghost_keys["result"]["content"][0]["text"]), [])
+        ghost_vals = self._call("tools/call", 5, {
+            "name": "kv_hvals", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(
+            json.loads(ghost_vals["result"]["content"][0]["text"]), [])
+        # HINCRBYFLOAT bumps a float field, creates a missing field
+        # holding the increment, takes an integer increment too, and
+        # counts down on a negative one.
+        bumped = self._call("tools/call", 6, {
+            "name": "kv_hincrbyfloat",
+            "arguments": {"key": "user:1", "field": "score",
+                          "increment": 0.5},
+        })
+        self.assertEqual(bumped["result"]["content"][0]["text"], "2.0")
+        new_field = self._call("tools/call", 7, {
+            "name": "kv_hincrbyfloat",
+            "arguments": {"key": "user:1", "field": "bonus",
+                          "increment": 1.25},
+        })
+        self.assertEqual(new_field["result"]["content"][0]["text"], "1.25")
+        whole = self._call("tools/call", 8, {
+            "name": "kv_hincrbyfloat",
+            "arguments": {"key": "user:1", "field": "score",
+                          "increment": 2},
+        })
+        self.assertEqual(whole["result"]["content"][0]["text"], "4.0")
+        down = self._call("tools/call", 9, {
+            "name": "kv_hincrbyfloat",
+            "arguments": {"key": "user:1", "field": "score",
+                          "increment": -0.5},
+        })
+        self.assertEqual(down["result"]["content"][0]["text"], "3.5")
+        # A zero increment on an existing field changes nothing and
+        # returns the current value.
+        zero = self._call("tools/call", 10, {
+            "name": "kv_hincrbyfloat",
+            "arguments": {"key": "user:1", "field": "score",
+                          "increment": 0},
+        })
+        self.assertEqual(zero["result"]["content"][0]["text"], "3.5")
+        # HINCRBYFLOAT on a non-float field fails.
+        bad = self._call("tools/call", 11, {
+            "name": "kv_hincrbyfloat",
+            "arguments": {"key": "user:1", "field": "name",
+                          "increment": 0.5},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32000)
+
+    def test_tools_call_hash_keys_vals_float_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_hkeys", "arguments": {}},
+            {"name": "kv_hvals", "arguments": {}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "h", "field": "a"}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "h", "increment": 1.5}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"field": "a", "increment": 1.5}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "h", "field": "a",
+                           "increment": "1.5"}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "h", "field": "a",
+                           "increment": True}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "h", "field": "a",
+                           "increment": float("nan")}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "h", "field": "a",
+                           "increment": float("inf")}},
+            {"name": "kv_hincrbyfloat", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_hash_keys_vals_float_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for i, call in enumerate([
+            {"name": "kv_hkeys", "arguments": {"key": "plain"}},
+            {"name": "kv_hvals", "arguments": {"key": "plain"}},
+            {"name": "kv_hincrbyfloat",
+             "arguments": {"key": "plain", "field": "f",
+                           "increment": 1.5}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_hash_keys_vals_float_cap(self):
+        self._seed_hash("big", 1001)
+        for i, name in enumerate(("kv_hkeys", "kv_hvals")):
+            reply = self._call("tools/call", i + 1, {
+                "name": name, "arguments": {"key": "big"},
+            })
+            self.assertIn("error", reply, name)
+            self.assertEqual(reply["error"]["code"], -32602, name)
+            self.assertIn("at most 1000", reply["error"]["message"], name)
+        # A hash at exactly the cap still reads fine.
+        self._seed_hash("edge", 1000)
+        keys = self._call("tools/call", 3, {
+            "name": "kv_hkeys", "arguments": {"key": "edge"},
+        })
+        self.assertEqual(
+            len(json.loads(keys["result"]["content"][0]["text"])), 1000)
+
+    def test_tools_call_hash_keys_vals_float_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_hset", "key": "h",
+                 "fields": {"a": "1.5", "b": "x"}},
+                {"op": "kv_hkeys", "key": "h"},
+                {"op": "kv_hvals", "key": "h"},
+                {"op": "kv_hincrbyfloat", "key": "h", "field": "a",
+                 "increment": 0.5},
+                {"op": "kv_hincrbyfloat", "key": "h", "field": "fresh",
+                 "increment": 2.5},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], ["a", "b"])
+        self.assertEqual(summary["results"][2]["result"], ["1.5", "x"])
+        self.assertEqual(summary["results"][3]["result"], 2.0)
+        self.assertEqual(summary["results"][4]["result"], 2.5)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h2",
+                 "fields": {"a": "1.5", "b": "2"}},
+                {"op": "kv_hkeys", "key": "h2"},
+                {"op": "kv_hvals", "key": "h2"},
+                {"op": "kv_hincrbyfloat", "key": "h2", "field": "a",
+                 "increment": 1},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], ["a", "b"])
+        self.assertEqual(summary["results"][2]["result"], ["1.5", "2"])
+        self.assertEqual(summary["results"][3]["result"], 2.5)
+        # A too-wide hash fails that op in place inside a
+        # transaction, while the rest still run.
+        self._seed_hash("wide", 1001)
+        capped = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hkeys", "key": "wide"},
+                {"op": "kv_hlen", "key": "wide"},
+            ]},
+        })
+        summary = json.loads(capped["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("at most 1000", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 1001)
+        # Bad hincrbyfloat arguments fail an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 4, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h3",
+                 "fields": {"a": "1"}},
+                {"op": "kv_hincrbyfloat", "key": "h3", "field": "a",
+                 "increment": float("nan")},
             ]},
         })
         self.assertIn("error", bad)
@@ -5646,6 +5907,74 @@ class McpTests(unittest.TestCase):
         self.assertIn(
             "op 10: kv_hincrby 'ghost' — creates a counter field "
             "starting at 3",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_hincrbyfloat(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "forever",
+                          "fields": {"score": "1.5", "name": "alice"}},
+        })
+        plan = [
+            {"op": "kv_hincrbyfloat", "key": "forever", "field": "score",
+             "increment": 0.5},
+            {"op": "kv_hincrbyfloat", "key": "forever", "field": "name",
+             "increment": 0.5},
+            {"op": "kv_hincrbyfloat", "key": "forever", "field": "fresh",
+             "increment": 2.5},
+            {"op": "kv_hincrbyfloat", "key": "ghost", "field": "a",
+             "increment": 1.5},
+            {"op": "kv_hincrbyfloat", "key": "plain", "field": "a",
+             "increment": 1.5},
+            {"op": "kv_hincrbyfloat", "key": "forever", "field": "score",
+             "increment": "x"},
+            {"op": "kv_hincrbyfloat", "key": "forever", "field": "score"},
+            {"op": "kv_hincrbyfloat", "key": "forever", "field": "score",
+             "increment": float("nan")},
+            {"op": "kv_hkeys", "key": "forever"},
+            {"op": "kv_hvals", "key": "forever"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 10 op(s), 5 audited, 5 not audited.", text)
+        self.assertIn(
+            "op 5: kv_hincrbyfloat increment is not a number: 'x'", text)
+        self.assertIn(
+            "op 6: kv_hincrbyfloat is missing increment", text)
+        self.assertIn(
+            "op 7: kv_hincrbyfloat increment is not a finite number: "
+            "nan",
+            text)
+        self.assertIn("op 8: kv_hkeys is a read, not a write", text)
+        self.assertIn("op 9: kv_hvals is a read, not a write", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_hincrbyfloat 'forever' — would fail: the field "
+            "value is not a float",
+            risky,
+        )
+        self.assertIn(
+            "op 4: kv_hincrbyfloat 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_hincrbyfloat 'forever' — increments a float "
+            "field currently at 1.5",
+            safe,
+        )
+        self.assertIn(
+            "op 2: kv_hincrbyfloat 'forever' — creates a float field "
+            "starting at 2.5",
+            safe,
+        )
+        self.assertIn(
+            "op 3: kv_hincrbyfloat 'ghost' — creates a float field "
+            "starting at 1.5",
             safe,
         )
 
