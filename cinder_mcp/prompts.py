@@ -23,7 +23,9 @@ against the live keyspace before anything runs: it flags overwrites
 of keys that never expire, overwrites of large keys, SETs, MSETs,
 SETEXes and GETSETs that would destroy a list, set, or hash, GETDELs
 that would delete a key that never expires, INCRs and DECRs that
-would fail on a non-integer or a container, HINCRBYs that would fail
+would fail on a non-integer or a container, LSETs on a missing key
+or with an index out of range, LSETs and LINSERTs on a container,
+HINCRBYs that would fail
 on a non-integer field or a container, HINCRBYFLOATs that would fail
 on a non-float field or a container, and EXPIREs with a bad timeout,
 then asks the model for a go/no-go per risky op. SETNX never
@@ -124,10 +126,11 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_append", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
+    "kv_lset", "kv_linsert",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
                          "kv_strlen", "kv_hscan", "kv_hkeys", "kv_hvals",
-                         "kv_zrandmember")
+                         "kv_zrandmember", "kv_lindex")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -979,6 +982,49 @@ def _hincrby_audit_increment(op):
     return increment
 
 
+def _lset_audit_args(op):
+    """The index and value for a kv_lset op in a write plan,
+    validated like the tool's own arguments: the index must be an
+    integer and the value a string. Anything else raises
+    ValueError, so the caller reports the op as not audited
+    instead of guessing."""
+    index = op.get("index")
+    if index is None:
+        raise ValueError("kv_lset is missing index: %r" % (op,))
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise ValueError(
+            "kv_lset index is not an integer: %r" % (index,)
+        )
+    if not isinstance(op.get("value"), str):
+        raise ValueError(
+            "kv_lset value must be a string: %r" % (op.get("value"),)
+        )
+    return index
+
+
+def _linsert_audit_args(op):
+    """The where, pivot, and element for a kv_linsert op in a write
+    plan, validated like the tool's own arguments: `where` is
+    "before" or "after" in any case, and the pivot and element are
+    strings. Anything else raises ValueError, so the caller
+    reports the op as not audited instead of guessing."""
+    where = op.get("where")
+    if not isinstance(where, str) or where.lower() not in ("before", "after"):
+        raise ValueError(
+            "kv_linsert where must be \"before\" or \"after\": %r" % (where,)
+        )
+    if not isinstance(op.get("pivot"), str):
+        raise ValueError(
+            "kv_linsert pivot must be a string: %r" % (op.get("pivot"),)
+        )
+    if not isinstance(op.get("element"), str):
+        raise ValueError(
+            "kv_linsert element must be a string: %r"
+            % (op.get("element"),)
+        )
+    return where.lower()
+
+
 def _is_float(text):
     """True when `text` parses as a finite float. Cinder's float
     parser accepts "inf" as a value, but adding anything to it
@@ -1143,18 +1189,23 @@ def _audit_write_op(client, op):
     a non-integer or a container, a HINCRBY on a non-integer field
     or a container, a HINCRBYFLOAT on a non-float field or a
     container, a HSETNX on a container, an APPEND on a
-    container, a GETEX or ZPOP on a container, a ZPOP that would
-    drain a never-expiring or large sorted set, or an EXPIRE,
+    container, a GETEX or ZPOP on a container, an LSET or LINSERT
+    on a container, an LSET on a missing key or with an index out
+    of range, a ZPOP that would drain a never-expiring or large
+    sorted set, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
     of a key that expires soon anyway, a SET, MSET, SETNX, APPEND
     or GETSET that creates a key with no expiry, a HSETNX that
     creates a hash with no expiry or adds a field to a hash that
     never expires, a GETEX that gives a never-expiring key an
-    expiry or removes one, or a ZPOP that takes some but not all
-    members. SETNX on a key that already exists writes nothing,
-    so it is safe, and so is HSETNX on a field that already
-    exists. Everything else is "safe": creating an expiring key,
+    expiry or removes one, a ZPOP that takes some but not all
+    members, an LSET that replaces one element of a list, or an
+    LINSERT that adds one element to a list. SETNX on a key that
+    already exists writes nothing, so it is safe, and so is HSETNX
+    on a field that already exists, an LSET that writes the value
+    the element already holds, and an LINSERT whose pivot is not
+    in the list. Everything else is "safe": creating an expiring key,
     INCR or DECR on a missing key, HINCRBY on a missing key or a
     missing field, HINCRBYFLOAT on a missing key or a missing
     field, an EXPIRE on an existing key, a GETEX that
@@ -1318,6 +1369,19 @@ def _audit_write_op(client, op):
                 )
             return "safe", (
                 "%s %r — no-op, the key does not exist" % (name, key)
+            )
+        if name == "kv_lset":
+            # LSET on a missing key fails outright in cinder.
+            _lset_audit_args(op)
+            return "risky", (
+                "kv_lset %r — would fail: no such key" % key
+            )
+        if name == "kv_linsert":
+            # LINSERT on a missing key answers -1 and changes
+            # nothing, as in Redis.
+            _linsert_audit_args(op)
+            return "safe", (
+                "kv_linsert %r — no-op, the key does not exist" % key
             )
         # kv_expire on a missing key.
         seconds = op.get("seconds")
@@ -1658,6 +1722,64 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_hincrbyfloat %r — increments a float field currently "
             "at %s" % (key, current)
+        )
+    if name == "kv_lset":
+        index = _lset_audit_args(op)
+        if kind != "list":
+            return "risky", (
+                "kv_lset %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        resolved = index if index >= 0 else index + size_value
+        if resolved < 0 or resolved >= size_value:
+            return "risky", (
+                "kv_lset %r — would fail: index %d is out of range "
+                "for a list of %s" % (key, index, size)
+            )
+        current = client.command("LINDEX", key, index)
+        if current == op.get("value"):
+            # Cinder treats setting an element to the value it
+            # already holds as a no-op.
+            return "safe", (
+                "kv_lset %r — no-op, the element at index %d already "
+                "holds that value" % (key, index)
+            )
+        return "caution", (
+            "kv_lset %r — replaces the element at index %d of a "
+            "list of %s that %s" % (key, index, size, ttl_text)
+        )
+    if name == "kv_linsert":
+        where = _linsert_audit_args(op)
+        if kind != "list":
+            return "risky", (
+                "kv_linsert %r — would fail with WRONGTYPE: the key "
+                "is a %s of %s" % (key, kind, size)
+            )
+        if size_value > 1000:
+            # The pivot check needs the whole list, and a list this
+            # wide is past the audit's read bound: the insert is
+            # still one bounded element, but whether the pivot is
+            # even there is unchecked.
+            return "caution", (
+                "kv_linsert %r — adds an element to a large list of "
+                "%s; the pivot was not checked" % (key, size)
+            )
+        members = client.command("LRANGE", key, 0, -1) or []
+        if op.get("pivot") not in members:
+            # The pivot is not in the list: LINSERT answers 0 and
+            # changes nothing.
+            return "safe", (
+                "kv_linsert %r — no-op, the pivot is not in the list"
+                % key
+            )
+        if ttl == -1:
+            return "caution", (
+                "kv_linsert %r — inserts an element %s the pivot in "
+                "a list that never expires" % (key, where)
+            )
+        return "safe", (
+            "kv_linsert %r — inserts an element %s the pivot in a "
+            "list of %s that %s" % (key, where, size, ttl_text)
         )
     if name in ("kv_zpopmin", "kv_zpopmax"):
         count = op.get("count", 1)

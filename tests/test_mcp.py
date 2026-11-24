@@ -339,6 +339,49 @@ class FakeCinder(threading.Thread):
                 # A list emptied by popping is gone, as in Redis.
                 del self.store[args[0]]
             return self._bulk(element)
+        elif name == "LINDEX" and len(args) == 2:
+            value = self._get(args[0])
+            if value is None:
+                return self._bulk(None)
+            if not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            index = int(args[1])
+            if index < 0:
+                index += len(value)
+            if index < 0 or index >= len(value):
+                return self._bulk(None)
+            return self._bulk(value[index])
+        elif name == "LSET" and len(args) == 3:
+            value = self._get(args[0])
+            if value is None:
+                return "-ERR no such key\r\n"
+            if not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            index = int(args[1])
+            if index < 0:
+                index += len(value)
+            if index < 0 or index >= len(value):
+                return "-ERR index out of range\r\n"
+            value[index] = args[2]
+            return "+OK\r\n"
+        elif name == "LINSERT" and len(args) == 4:
+            value = self._get(args[0])
+            if value is None:
+                return ":-1\r\n"
+            if not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if args[1].upper() not in ("BEFORE", "AFTER"):
+                return "-ERR syntax error\r\n"
+            if args[2] not in value:
+                return ":0\r\n"
+            pos = value.index(args[2])
+            if args[1].upper() == "AFTER":
+                pos += 1
+            value.insert(pos, args[3])
+            return ":%d\r\n" % len(value)
         elif name == "SMEMBERS" and len(args) == 1:
             return self._container_items(args[0], set)
         elif name == "SADD" and len(args) >= 2:
@@ -1137,6 +1180,7 @@ class McpTests(unittest.TestCase):
                     "kv_zrandmember",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
+                    "kv_lindex", "kv_lset", "kv_linsert",
                     "kv_sadd", "kv_smembers", "kv_scard",
                     "kv_srem", "kv_sismember",
                     "kv_batch"]
@@ -3178,6 +3222,10 @@ class McpTests(unittest.TestCase):
             ("kv_llen", {"key": "plain"}),
             ("kv_lpop", {"key": "plain"}),
             ("kv_rpop", {"key": "plain"}),
+            ("kv_lindex", {"key": "plain", "index": 0}),
+            ("kv_lset", {"key": "plain", "index": 0, "value": "x"}),
+            ("kv_linsert", {"key": "plain", "where": "before",
+                            "pivot": "a", "element": "x"}),
         ):
             reply = self._call("tools/call", 2, {
                 "name": tool, "arguments": arguments,
@@ -3224,6 +3272,172 @@ class McpTests(unittest.TestCase):
             "name": "kv_batch",
             "arguments": {"atomic": True, "ops": [
                 {"op": "kv_lpush", "key": "q3", "elements": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "q3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_list_index_set_insert(self):
+        self._call("tools/call", 1, {
+            "name": "kv_rpush",
+            "arguments": {"key": "queue", "elements": ["a", "b", "c"]},
+        })
+        # LINDEX reads by position; negative indices count from the
+        # end, as in Redis.
+        first = self._call("tools/call", 2, {
+            "name": "kv_lindex",
+            "arguments": {"key": "queue", "index": 0},
+        })
+        self.assertEqual(first["result"]["content"][0]["text"], "a")
+        last = self._call("tools/call", 3, {
+            "name": "kv_lindex",
+            "arguments": {"key": "queue", "index": -1},
+        })
+        self.assertEqual(last["result"]["content"][0]["text"], "c")
+        # Out of range and missing keys read as null.
+        past = self._call("tools/call", 4, {
+            "name": "kv_lindex",
+            "arguments": {"key": "queue", "index": 9},
+        })
+        self.assertEqual(past["result"]["content"][0]["text"], "null")
+        missing = self._call("tools/call", 5, {
+            "name": "kv_lindex",
+            "arguments": {"key": "ghost", "index": 0},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "null")
+        # LSET replaces in place, including by negative index.
+        set_mid = self._call("tools/call", 6, {
+            "name": "kv_lset",
+            "arguments": {"key": "queue", "index": 1, "value": "B"},
+        })
+        self.assertEqual(set_mid["result"]["content"][0]["text"], "OK")
+        set_last = self._call("tools/call", 7, {
+            "name": "kv_lset",
+            "arguments": {"key": "queue", "index": -1, "value": "C"},
+        })
+        self.assertEqual(set_last["result"]["content"][0]["text"], "OK")
+        # LSET on a missing key or an out-of-range index fails.
+        no_key = self._call("tools/call", 8, {
+            "name": "kv_lset",
+            "arguments": {"key": "ghost", "index": 0, "value": "x"},
+        })
+        self.assertIn("error", no_key)
+        out_of_range = self._call("tools/call", 9, {
+            "name": "kv_lset",
+            "arguments": {"key": "queue", "index": 9, "value": "x"},
+        })
+        self.assertIn("error", out_of_range)
+        # LINSERT before and after a pivot, in order.
+        before = self._call("tools/call", 10, {
+            "name": "kv_linsert",
+            "arguments": {"key": "queue", "where": "before",
+                          "pivot": "B", "element": "X"},
+        })
+        self.assertEqual(before["result"]["content"][0]["text"], "4")
+        after = self._call("tools/call", 11, {
+            "name": "kv_linsert",
+            "arguments": {"key": "queue", "where": "after",
+                          "pivot": "C", "element": "Y"},
+        })
+        self.assertEqual(after["result"]["content"][0]["text"], "5")
+        whole = self._call("tools/call", 12, {
+            "name": "kv_lrange", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(
+            json.loads(whole["result"]["content"][0]["text"]),
+            ["a", "X", "B", "C", "Y"],
+        )
+        # A pivot that is not in the list inserts nothing (0), and a
+        # missing key inserts nothing either (-1).
+        no_pivot = self._call("tools/call", 13, {
+            "name": "kv_linsert",
+            "arguments": {"key": "queue", "where": "before",
+                          "pivot": "nope", "element": "Z"},
+        })
+        self.assertEqual(no_pivot["result"]["content"][0]["text"], "0")
+        no_list = self._call("tools/call", 14, {
+            "name": "kv_linsert",
+            "arguments": {"key": "ghost", "where": "before",
+                          "pivot": "a", "element": "Z"},
+        })
+        self.assertEqual(no_list["result"]["content"][0]["text"], "-1")
+
+    def test_tools_call_list_index_set_insert_rejects_bad_arguments(self):
+        for i, call in enumerate([
+            {"name": "kv_lindex",
+             "arguments": {"key": "q", "index": "0"}},
+            {"name": "kv_lindex", "arguments": {"key": "q"}},
+            {"name": "kv_lset",
+             "arguments": {"key": "q", "index": 1.5, "value": "x"}},
+            {"name": "kv_lset",
+             "arguments": {"key": "q", "index": 0, "value": 7}},
+            {"name": "kv_lset", "arguments": {"key": "q", "index": 0}},
+            {"name": "kv_linsert",
+             "arguments": {"key": "q", "where": "beside",
+                           "pivot": "a", "element": "x"}},
+            {"name": "kv_linsert",
+             "arguments": {"key": "q", "where": "before",
+                           "pivot": 7, "element": "x"}},
+            {"name": "kv_linsert",
+             "arguments": {"key": "q", "where": "after",
+                           "pivot": "a", "element": 7}},
+        ]):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_list_index_set_insert_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_rpush", "key": "q",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_lindex", "key": "q", "index": -1},
+                {"op": "kv_lset", "key": "q", "index": 0, "value": "A"},
+                {"op": "kv_linsert", "key": "q", "where": "after",
+                 "pivot": "A", "element": "a2"},
+                {"op": "kv_lrange", "key": "q"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], "c")
+        self.assertEqual(summary["results"][2]["result"], "OK")
+        self.assertEqual(summary["results"][3]["result"], 4)
+        self.assertEqual(
+            summary["results"][4]["result"], ["A", "a2", "b", "c"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_rpush", "key": "q2",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_lindex", "key": "q2", "index": 1},
+                {"op": "kv_lset", "key": "q2", "index": 1, "value": "B"},
+                {"op": "kv_linsert", "key": "q2", "where": "before",
+                 "pivot": "B", "element": "X"},
+                {"op": "kv_lrange", "key": "q2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][1]["result"], "b")
+        self.assertEqual(summary["results"][2]["result"], "OK")
+        self.assertEqual(summary["results"][3]["result"], 4)
+        self.assertEqual(
+            summary["results"][4]["result"], ["a", "X", "B", "c"])
+        # A bad where fails an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_rpush", "key": "q3", "elements": ["a"]},
+                {"op": "kv_linsert", "key": "q3", "where": "beside",
+                 "pivot": "a", "element": "x"},
             ]},
         })
         self.assertIn("error", bad)
@@ -5651,6 +5865,94 @@ class McpTests(unittest.TestCase):
         )
         self.assertIn(
             "op 21: kv_zpopmin 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_list_write_ops(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        self.fake.store["soon-list"] = (["a", "b"], time.time() + 3600)
+        plan = [
+            {"op": "kv_lset", "key": "todo", "index": 0,
+             "value": "buy milk"},
+            {"op": "kv_lset", "key": "todo", "index": 1,
+             "value": "shipped"},
+            {"op": "kv_lset", "key": "todo", "index": 5, "value": "x"},
+            {"op": "kv_lset", "key": "ghost", "index": 0, "value": "x"},
+            {"op": "kv_lset", "key": "plain", "index": 0, "value": "x"},
+            {"op": "kv_linsert", "key": "todo", "where": "before",
+             "pivot": "ship it", "element": "pack"},
+            {"op": "kv_linsert", "key": "todo", "where": "before",
+             "pivot": "nope", "element": "x"},
+            {"op": "kv_linsert", "key": "ghost", "where": "before",
+             "pivot": "a", "element": "x"},
+            {"op": "kv_linsert", "key": "plain", "where": "before",
+             "pivot": "a", "element": "x"},
+            {"op": "kv_linsert", "key": "soon-list", "where": "after",
+             "pivot": "a", "element": "a2"},
+            {"op": "kv_lindex", "key": "todo", "index": 0},
+            {"op": "kv_lset", "key": "todo", "index": "0", "value": "x"},
+            {"op": "kv_linsert", "key": "todo", "where": "beside",
+             "pivot": "a", "element": "x"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 13 op(s), 10 audited, 3 not audited.", text)
+        self.assertIn("op 10: kv_lindex is a read, not a write", text)
+        self.assertIn(
+            "op 11: kv_lset index is not an integer", text)
+        self.assertIn(
+            "op 12: kv_linsert where must be \"before\" or \"after\"", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_lset 'todo' — would fail: index 5 is out of range "
+            "for a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_lset 'ghost' — would fail: no such key",
+            risky,
+        )
+        self.assertIn(
+            "op 4: kv_lset 'plain' — would fail with WRONGTYPE: the "
+            "key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 8: kv_linsert 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_lset 'todo' — replaces the element at index 1 "
+            "of a list of 2 elements that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 5: kv_linsert 'todo' — inserts an element before the "
+            "pivot in a list that never expires",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_lset 'todo' — no-op, the element at index 0 "
+            "already holds that value",
+            safe,
+        )
+        self.assertIn(
+            "op 6: kv_linsert 'todo' — no-op, the pivot is not in "
+            "the list",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_linsert 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_linsert 'soon-list' — inserts an element after "
+            "the pivot in a list of 2 elements that expires in ",
             safe,
         )
 

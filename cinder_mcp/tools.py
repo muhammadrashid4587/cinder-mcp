@@ -647,6 +647,45 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_lindex",
+        "description": "The element of a list at an index: LINDEX key index. Negative indices count from the end, as in Redis. Returns null when the key does not exist or the index is out of range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "index": {"type": "integer"},
+            },
+            "required": ["key", "index"],
+        },
+    },
+    {
+        "name": "kv_lset",
+        "description": "Set the element of a list at an index: LSET key index value. Negative indices count from the end, as in Redis. Returns OK. Fails when the key does not exist or the index is out of range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "index": {"type": "integer"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "index", "value"],
+        },
+    },
+    {
+        "name": "kv_linsert",
+        "description": "Insert an element into a list before or after a pivot: LINSERT key BEFORE|AFTER pivot element. Takes `where` as \"before\" or \"after\" and `pivot` as the element to insert beside. Returns the length of the list after the insert, 0 when the pivot is not found, -1 when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "where": {"type": "string"},
+                "pivot": {"type": "string"},
+                "element": {"type": "string"},
+            },
+            "required": ["key", "where", "pivot", "element"],
+        },
+    },
+    {
         "name": "kv_sadd",
         "description": "Add members to a set: SADD key member [member ...]. Takes `members` as a list of member names. Returns the number of members that were newly added (adding a member already present returns 0 for it). Creates the set when the key does not exist.",
         "inputSchema": {
@@ -702,7 +741,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -819,6 +858,7 @@ BATCHABLE_TOOLS = {
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
+    "kv_lindex", "kv_lset", "kv_linsert",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
 
@@ -898,6 +938,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
+    "kv_lindex", "kv_lset", "kv_linsert",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
 
@@ -1370,6 +1411,15 @@ def _op_argv(name, args):
         return ["LPOP", _require(args, "key")]
     if name == "kv_rpop":
         return ["RPOP", _require(args, "key")]
+    if name == "kv_lindex":
+        key, index = _list_index_args(args, name)
+        return ["LINDEX", key, index]
+    if name == "kv_lset":
+        key, index, value = _lset_args(args)
+        return ["LSET", key, index, value]
+    if name == "kv_linsert":
+        key, where, pivot, element = _linsert_args(args)
+        return ["LINSERT", key, where, pivot, element]
     if name == "kv_sadd":
         return ["SADD", _require(args, "key")] + _set_members_args(args, name)
     if name == "kv_smembers":
@@ -2060,6 +2110,45 @@ def _list_elements_args(args, name):
         if not isinstance(element, str):
             raise ValueError("%s elements must be strings" % name)
     return list(elements)
+
+
+def _list_index_args(args, name):
+    """Validate a kv_lindex / kv_lset index: (key, index). The index
+    must be an integer; a negative one counts from the end, as in
+    Redis. Bad types fail the call instead of sending a half-formed
+    LINDEX or LSET."""
+    key = _require(args, "key")
+    index = _require(args, "index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise ValueError("%s index must be an integer" % name)
+    return key, index
+
+
+def _lset_args(args):
+    """Validate a kv_lset call: (key, index, value)."""
+    key, index = _list_index_args(args, "kv_lset")
+    value = _require(args, "value")
+    if not isinstance(value, str):
+        raise ValueError("kv_lset value must be a string")
+    return key, index, value
+
+
+def _linsert_args(args):
+    """Validate a kv_linsert call: (key, where, pivot, element).
+    `where` is \"before\" or \"after\", in any case — cinder compares
+    it case-insensitively — and is sent as BEFORE or AFTER. Bad
+    values fail the call instead of sending a half-formed LINSERT."""
+    key = _require(args, "key")
+    where = _require(args, "where")
+    if not isinstance(where, str) or where.lower() not in ("before", "after"):
+        raise ValueError("kv_linsert where must be \"before\" or \"after\"")
+    pivot = _require(args, "pivot")
+    if not isinstance(pivot, str):
+        raise ValueError("kv_linsert pivot must be a string")
+    element = _require(args, "element")
+    if not isinstance(element, str):
+        raise ValueError("kv_linsert element must be a string")
+    return key, where.upper(), pivot, element
 
 
 def _lrange_args(args):
