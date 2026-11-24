@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1200,6 +1200,20 @@ class FakeCinder(threading.Thread):
                         "wrong kind of value\r\n")
             score = value.members.get(args[1])
             return self._bulk(None if score is None else repr(score))
+        elif name == "ZMSCORE" and len(args) >= 2:
+            value = self._get(args[0])
+            if value is None:
+                return "*%d\r\n" % (len(args) - 1) + "".join(
+                    self._bulk(None) for _ in args[1:]
+                )
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return "*%d\r\n" % (len(args) - 1) + "".join(
+                self._bulk(None if value.members.get(m) is None
+                           else repr(value.members[m]))
+                for m in args[1:]
+            )
         elif name == "ZRANK" and len(args) == 2:
             value = self._get(args[0])
             if value is None:
@@ -1974,7 +1988,7 @@ class McpTests(unittest.TestCase):
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
                     "kv_zcard",
-                    "kv_zscore",
+                    "kv_zscore", "kv_zmscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem",
                     "kv_zremrangebyscore", "kv_zremrangebyrank",
                     "kv_zincrby",
@@ -3503,6 +3517,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _zmscore_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zmscore", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def test_kv_zscan_pages_through_a_sorted_set(self):
         self._seed_zset("big", 250)
         seen = []
@@ -3772,6 +3793,100 @@ class McpTests(unittest.TestCase):
         self.assertEqual(bad["error"]["code"], -32602)
         untouched = self._call("tools/call", 4, {
             "name": "kv_exists", "arguments": {"key": "s3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_kv_zmscore_returns_scores_in_request_order(self):
+        self._seed_zset("board", 5)
+        # Scores come back in request order, not score order, with
+        # null for a member that is not in the set.
+        self.assertEqual(
+            self._zmscore_result({"key": "board",
+                                  "members": ["m:004", "m:001", "m:002"]}),
+            [4.0, 1.0, 2.0])
+        self.assertEqual(
+            self._zmscore_result({"key": "board",
+                                  "members": ["m:001", "ghost", "m:003"]}),
+            [1.0, None, 3.0])
+        # A missing key scores null for every member.
+        self.assertEqual(
+            self._zmscore_result({"key": "ghost",
+                                  "members": ["a", "b"]}),
+            [None, None])
+        # One member is the same as kv_zscore.
+        self.assertEqual(
+            self._zmscore_result({"key": "board", "members": ["m:002"]}),
+            [2.0])
+
+    def test_kv_zmscore_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"members": []}, {"members": "m:000"},
+                    {"members": [1]}, {"members": ["m:000"] * 1001},
+                    {"members": ["m:000", 2]}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zmscore",
+                "arguments": dict({"key": "z"}, **bad),
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        for missing in ({"members": ["m:000"]}, {"key": "z"}):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_zmscore", "arguments": missing,
+            })
+            self.assertIn("error", reply, missing)
+            self.assertEqual(reply["error"]["code"], -32602, missing)
+
+    def test_kv_zmscore_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zmscore",
+            "arguments": {"key": "plain", "members": ["a"]},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_zmscore_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zmscore", "key": "z",
+                 "members": ["m:004", "ghost", "m:001"]},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"],
+                         [4.0, None, 1.0])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zmscore", "key": "z2",
+                 "members": ["c", "a", "ghost"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"],
+                         [3.0, 1.0, None])
+        # Bad zmscore arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zmscore", "key": "z3", "members": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "z3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
@@ -8392,9 +8507,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_getbit", "key": "a", "offset": 0},
             {"op": "kv_bitcount", "key": "a"},
             {"op": "kv_sscan", "key": "a"},
+            {"op": "kv_zmscore", "key": "a", "members": ["m"]},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 13 op(s), 1 audited, 12 not audited.", text)
+        self.assertIn("Plan: 14 op(s), 1 audited, 13 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -8407,6 +8523,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 10: kv_getbit is a read, not a write", text)
         self.assertIn("op 11: kv_bitcount is a read, not a write", text)
         self.assertIn("op 12: kv_sscan is a read, not a write", text)
+        self.assertIn("op 13: kv_zmscore is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
@@ -11257,6 +11374,62 @@ class LiveCinderMigrationTests(unittest.TestCase):
                      {"name": "kv_zremrangebyrank",
                       "arguments": {"key": "zr:ranks",
                                     "start": "0"}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_live_zmscore(self):
+        """kv_zmscore against a real cinder 0.48.0: scores of several
+        members at once, in request order, with nil per missing
+        member, an array of nils for a missing key, WRONGTYPE on a
+        string key, and inf / -inf scores round-tripping as numbers."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zm:board",
+                "members": {"alice": 1.5, "bob": 2.5, "carol": 3,
+                            "top": float("inf"),
+                            "bot": float("-inf")}}),
+            5)
+        self.assertEqual(
+            self._tool("kv_zmscore", {
+                "key": "zm:board",
+                "members": ["carol", "alice", "bob"]}),
+            [3.0, 1.5, 2.5])
+        self.assertEqual(
+            self._tool("kv_zmscore", {
+                "key": "zm:board",
+                "members": ["alice", "nobody", "bob"]}),
+            [1.5, None, 2.5])
+        self.assertEqual(
+            self._tool("kv_zmscore", {
+                "key": "zm:ghost", "members": ["alice", "bob"]}),
+            [None, None])
+        self.assertEqual(
+            self._tool("kv_zmscore", {
+                "key": "zm:board", "members": ["top", "bot"]}),
+            [float("inf"), float("-inf")])
+        self.assertEqual(
+            self._tool("kv_zmscore", {
+                "key": "zm:board", "members": ["alice"]}),
+            [1.5])
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zm:str", "value": "hello"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zmscore",
+            "arguments": {"key": "zm:str", "members": ["alice"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        for call in ({"name": "kv_zmscore",
+                      "arguments": {"key": "zm:board", "members": []}},
+                     {"name": "kv_zmscore",
+                      "arguments": {"key": "zm:board"}},
+                     {"name": "kv_zmscore",
+                      "arguments": {"key": "zm:board",
+                                    "members": ["a"] * 1001}}):
             reply = self._call("tools/call", 99, call)
             self.assertIn("error", reply, call)
             self.assertEqual(reply["error"]["code"], -32602, call)

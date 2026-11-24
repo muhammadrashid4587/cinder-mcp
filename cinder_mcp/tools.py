@@ -619,6 +619,18 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zmscore",
+        "description": "The scores of several members of a sorted set at once: ZMSCORE key member [member ...]. Takes `members` as a list of member names. Returns the scores in the same order, as numbers, with null for a member that is not in the set — and null for every member when the key does not exist. At most 1000 members per call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
         "name": "kv_zrank",
         "description": "The rank of one member of a sorted set, lowest score first: ZRANK key member. Returns null when the key or the member does not exist.",
         "inputSchema": {
@@ -969,7 +981,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1096,7 +1108,7 @@ BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
-    "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem",
+    "kv_zscore", "kv_zmscore", "kv_zrank", "kv_zrevrank", "kv_zrem",
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan",
@@ -1181,7 +1193,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
-    "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem",
+    "kv_zscore", "kv_zmscore", "kv_zrank", "kv_zrevrank", "kv_zrem",
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan",
@@ -1400,6 +1412,11 @@ def _call_batch_atomic(client, ops):
             # ZSCORE came back as a bulk score string (or nil) inside
             # the transaction; parse it like the standalone tool does.
             value = None if reply is None else float(reply)
+        elif op_name == "kv_zmscore":
+            # ZMSCORE came back as a list of bulk score strings (or
+            # nils) inside the transaction; shape it like the
+            # standalone tool does.
+            value = _zmscore_result(reply)
         elif op_name == "kv_zincrby":
             # ZINCRBY came back as a bulk score string inside the
             # transaction; parse it like the standalone tool does.
@@ -1707,6 +1724,8 @@ def _op_argv(name, args):
         return ["ZCARD", _require(args, "key")]
     if name == "kv_zscore":
         return ["ZSCORE", _require(args, "key"), _require(args, "member")]
+    if name == "kv_zmscore":
+        return ["ZMSCORE", _require(args, "key")] + _zmscore_members_args(args)
     if name == "kv_zrank":
         return ["ZRANK", _require(args, "key"), _require(args, "member")]
     if name == "kv_zrem":
@@ -1883,6 +1902,31 @@ def _mget_keys_args(args):
         if not isinstance(key, str):
             raise ValueError("kv_mget keys must be strings")
     return list(keys)
+
+
+# The most members one kv_zmscore call reads; a wider call fails
+# instead of dumping a huge slice of the sorted set into one tool
+# result.
+MAX_ZMSCORE_MEMBERS = 1000
+
+
+def _zmscore_members_args(args):
+    """The member names for a ZMSCORE, as an argv list. `members`
+    must be a non-empty list of strings, at most
+    MAX_ZMSCORE_MEMBERS; anything else fails the call instead of
+    sending a half-formed ZMSCORE."""
+    members = args.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("kv_zmscore members must be a non-empty list")
+    if len(members) > MAX_ZMSCORE_MEMBERS:
+        raise ValueError(
+            "kv_zmscore reads at most %d members; narrow the list"
+            % MAX_ZMSCORE_MEMBERS
+        )
+    for member in members:
+        if not isinstance(member, str):
+            raise ValueError("kv_zmscore members must be strings")
+    return list(members)
 
 
 def _mset_values_args(args):
@@ -2505,6 +2549,20 @@ def _call_zscore(client, args):
     return None if reply is None else float(reply)
 
 
+def _zmscore_result(reply):
+    """Shape a ZMSCORE reply into the tool's return value: one score
+    per member, in request order, as a number, or null for a member
+    that is not in the set (cinder replies nil for those, and for
+    every member when the key does not exist)."""
+    return [None if score is None else float(score) for score in (reply or [])]
+
+
+def _call_zmscore(client, args):
+    """kv_zmscore: the scores of several members at once, in request
+    order, with null for a member that is not in the set."""
+    return _zmscore_result(client.command(*_op_argv("kv_zmscore", args)))
+
+
 def _call_zincrby(client, args):
     """kv_zincrby: the member's new score as a number. Cinder
     replies with the score as a bulk string."""
@@ -3114,6 +3172,8 @@ def _call_single(client, name, args):
         return _call_zadd(client, args)
     if name == "kv_zscore":
         return _call_zscore(client, args)
+    if name == "kv_zmscore":
+        return _call_zmscore(client, args)
     if name == "kv_zincrby":
         return _call_zincrby(client, args)
     if name == "kv_zrange":
