@@ -28,6 +28,17 @@ reply (a page fetched inside a MULTI/EXEC transaction) into the
 same page shape. COUNT is exact for HSCAN — cinder stops the page
 at exactly that many matching fields — so a page holds at most
 `batch_size` fields, never more.
+
+And two more cover cinder's ZSCAN (cinder 0.41.0) the same way,
+one sorted set at a time: `zscan_batch` returns one bounded page
+of a set's members from one real ZSCAN call, and `zscan_result`
+shapes a raw ZSCAN reply into the same page shape. COUNT is exact
+for ZSCAN too — cinder stops the page at exactly that many
+matching members. Members come back in score order, lowest first.
+The cursor is a rank into that order, so members added or deleted
+between pages can shift the window: a member can be missed or
+come back twice if the set changes mid-walk, the same caveats
+real ZSCAN has.
 """
 
 # Keys per batch when the caller does not say otherwise.
@@ -186,6 +197,78 @@ def hscan_batch(client, key, pattern="*", cursor="",
         "done": done,
         "batch_size": batch_size,
     }
+
+
+def zscan_result(reply, batch_size, withscores=False):
+    """Shape one ZSCAN reply [cursor, [member, ...]] into
+    {"members": [...], "cursor": str, "done": bool, "batch_size": n}.
+    With withscores the reply is [cursor, [member, score, ...]] and
+    the members become {"member": ..., "score": ...} objects, the
+    scores parsed as numbers. A missing key replies as ["0", []],
+    which becomes done with no members. The cursor is cinder's
+    opaque decimal cursor — pass it back verbatim; when done is
+    true the cursor is ""."""
+    batch_size = validate_batch_size(batch_size)
+    if not isinstance(withscores, bool):
+        raise ValueError("withscores must be true or false")
+    if not isinstance(reply, list) or len(reply) != 2:
+        raise ValueError("ZSCAN returned an unexpected reply: %r" % (reply,))
+    next_cursor, flat = reply
+    if not isinstance(next_cursor, str) or not next_cursor.isdigit():
+        raise ValueError(
+            "ZSCAN returned an invalid cursor: %r" % (next_cursor,))
+    if not isinstance(flat, list):
+        raise ValueError(
+            "ZSCAN returned an unexpected member list: %r" % (flat,))
+    if withscores:
+        if len(flat) % 2 != 0:
+            raise ValueError(
+                "ZSCAN returned an unexpected member list: %r" % (flat,))
+        members = [
+            {"member": flat[i], "score": float(flat[i + 1])}
+            for i in range(0, len(flat), 2)
+        ]
+    else:
+        members = list(flat)
+    done = next_cursor == SCAN_DONE_CURSOR
+    return {
+        "members": members,
+        "cursor": "" if done else next_cursor,
+        "done": done,
+        "batch_size": batch_size,
+    }
+
+
+def zscan_batch(client, key, pattern="*", cursor="",
+                batch_size=DEFAULT_SCAN_BATCH_SIZE, withscores=False):
+    """One page of a sorted set, ZSCAN-style: at most `batch_size`
+    members from one real ZSCAN call, plus the cursor to resume
+    from and whether the scan is done. Pass "" to start. The cursor
+    is cinder's opaque decimal cursor — pass it back verbatim; do
+    not read meaning into it. When done is true the cursor is ""
+    and there is nothing left to fetch. COUNT is exact here: cinder
+    stops the page at exactly `batch_size` matching members.
+    `pattern` matches member names only, with the same glob
+    (* and ?). With withscores=true the members come back as
+    {"member": ..., "score": ...} objects instead of plain names.
+    A missing key is done at once, with no members. Members come
+    back in score order, lowest first, not sorted by name; members
+    added or deleted between pages can shift the window, the same
+    caveats real ZSCAN has. Returns {"members": [...], "cursor":
+    str, "done": bool, "batch_size": n}."""
+    batch_size = validate_batch_size(batch_size)
+    if not isinstance(withscores, bool):
+        raise ValueError("withscores must be true or false")
+    if not isinstance(cursor, str):
+        raise ValueError("cursor must be a string")
+    if cursor and not cursor.isdigit():
+        raise ValueError("cursor must be a decimal ZSCAN cursor string")
+    cmd = ["ZSCAN", key, cursor or SCAN_DONE_CURSOR, "MATCH", pattern,
+           "COUNT", str(batch_size)]
+    if withscores:
+        cmd.append("WITHSCORES")
+    reply = client.command(*cmd)
+    return zscan_result(reply, batch_size, withscores)
 
 
 def scan_batch(client, pattern="*", cursor="", batch_size=DEFAULT_SCAN_BATCH_SIZE):

@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -925,6 +925,62 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     flat.append(repr(value.members[member]))
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name == "ZSCAN" and len(args) >= 2:
+            # Cinder's cursor is a rank into the set's score order;
+            # "0" starts (and ends) the walk. MATCH filters member
+            # names, COUNT caps the matching members in the page —
+            # exact here, as in HSCAN: only matches count toward it.
+            # WITHSCORES interleaves each score after its member. A
+            # missing key is done at once, with no members.
+            value = self._get(args[0])
+            if value is None:
+                return "*2\r\n$1\r\n0\r\n*0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if not args[1].isdigit():
+                return "-ERR invalid cursor\r\n"
+            cursor = int(args[1])
+            pattern = "*"
+            count = 10
+            withscores = False
+            i = 2
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "MATCH" and i + 1 < len(args):
+                    pattern = args[i + 1]
+                    i += 2
+                elif opt == "COUNT" and i + 1 < len(args):
+                    try:
+                        count = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR value is not an integer or out "
+                                "of range\r\n")
+                    i += 2
+                elif opt == "WITHSCORES":
+                    withscores = True
+                    i += 1
+                else:
+                    return "-ERR syntax error\r\n"
+            ordered = value.ordered()
+            if count == 0 or cursor >= len(ordered):
+                return "*2\r\n$1\r\n0\r\n*0\r\n"
+            page = []
+            idx = cursor
+            while idx < len(ordered) and len(page) < count:
+                member = ordered[idx]
+                if _glob_match(pattern, member):
+                    page.append(member)
+                idx += 1
+            nxt = 0 if idx >= len(ordered) else idx
+            flat = []
+            for member in page:
+                flat.append(member)
+                if withscores:
+                    flat.append(repr(value.members[member]))
+            return ("*2\r\n" + self._bulk(str(nxt))
+                    + "*%d\r\n" % len(flat)
+                    + "".join(self._bulk(v) for v in flat))
         elif name in ("ZRANGE", "ZREVRANGE") and len(args) in (3, 4):
             value = self._get(args[0])
             if value is None:
@@ -1261,7 +1317,7 @@ class McpTests(unittest.TestCase):
                     "kv_zscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
-                    "kv_zrandmember",
+                    "kv_zrandmember", "kv_zscan",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -2750,6 +2806,161 @@ class McpTests(unittest.TestCase):
         self.assertEqual(bad["error"]["code"], -32602)
         untouched = self._call("tools/call", 4, {
             "name": "kv_exists", "arguments": {"key": "h3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def _seed_zset(self, key, count):
+        members = {"m:%03d" % i: float(i) for i in range(count)}
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": key, "members": members},
+        })
+        self.assertNotIn("error", reply, key)
+        self.assertEqual(reply["result"]["content"][0]["text"], str(count))
+
+    def _zscan_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zscan", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_zscan_pages_through_a_sorted_set(self):
+        self._seed_zset("big", 250)
+        seen = []
+        cursor = ""
+        pages = 0
+        while True:
+            data = self._zscan_result({"key": "big", "batch_size": 100,
+                                       "cursor": cursor})
+            self.assertEqual(data["batch_size"], 100)
+            # COUNT is exact for ZSCAN: never more than batch_size.
+            self.assertLessEqual(len(data["members"]), 100)
+            seen.extend(data["members"])
+            pages += 1
+            self.assertLessEqual(pages, 10)
+            if data["done"]:
+                self.assertEqual(data["cursor"], "")
+                break
+            # The cursor is cinder's opaque decimal cursor: pass it
+            # back verbatim, never read a member out of it.
+            self.assertNotEqual(data["cursor"], "")
+            self.assertTrue(data["cursor"].isdigit(), data["cursor"])
+            cursor = data["cursor"]
+        self.assertEqual(pages, 3)
+        self.assertEqual(seen, ["m:%03d" % i for i in range(250)])
+        # A cursor returned by one page resumes the walk: the first
+        # five members come back, then the next five after it.
+        first = self._zscan_result({"key": "big", "batch_size": 5})
+        self.assertEqual(
+            first["members"], ["m:%03d" % i for i in range(5)])
+        self.assertFalse(first["done"])
+        second = self._zscan_result(
+            {"key": "big", "batch_size": 5, "cursor": first["cursor"]})
+        self.assertEqual(
+            second["members"], ["m:%03d" % i for i in range(5, 10)])
+        self.assertFalse(second["done"])
+        # The pattern filters on member names, and a small set
+        # finishes in one page.
+        data = self._zscan_result({"key": "big", "pattern": "m:00*"})
+        self.assertEqual(
+            data["members"], ["m:%03d" % i for i in range(10)])
+        self.assertTrue(data["done"])
+        self.assertEqual(data["cursor"], "")
+        # Withscores returns member/score objects in score order.
+        scored = self._zscan_result(
+            {"key": "big", "batch_size": 5, "withscores": True})
+        self.assertEqual(scored["members"], [
+            {"member": "m:%03d" % i, "score": float(i)}
+            for i in range(5)
+        ])
+        self.assertFalse(scored["done"])
+        # A missing key is done at once, with no members.
+        empty = self._zscan_result({"key": "ghost"})
+        self.assertEqual(
+            empty, {"members": [], "cursor": "", "done": True,
+                    "batch_size": 100})
+
+    def test_kv_zscan_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"batch_size": 0}, {"batch_size": -1},
+                    {"batch_size": 1001}, {"batch_size": "ten"},
+                    {"batch_size": True}, {"cursor": 7},
+                    {"cursor": "m:001"}, {"cursor": "abc"},
+                    {"pattern": 7}, {"withscores": "yes"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zscan",
+                "arguments": dict({"key": "z"}, **bad),
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        missing_key = self._call("tools/call", 2, {
+            "name": "kv_zscan", "arguments": {"members": ["a"]},
+        })
+        self.assertIn("error", missing_key)
+        self.assertEqual(missing_key["error"]["code"], -32602)
+
+    def test_kv_zscan_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zscan", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_zscan_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zscan", "key": "z", "batch_size": 2},
+                {"op": "kv_zscan", "key": "z", "batch_size": 2,
+                 "cursor": "2"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], {
+            "members": ["m:000", "m:001"],
+            "cursor": "2", "done": False, "batch_size": 2,
+        })
+        self.assertEqual(summary["results"][1]["result"], {
+            "members": ["m:002", "m:003"],
+            "cursor": "4", "done": False, "batch_size": 2,
+        })
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zscan", "key": "z2", "batch_size": 2,
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], {
+            "members": [{"member": "a", "score": 1.0},
+                        {"member": "b", "score": 2.0}],
+            "cursor": "2", "done": False, "batch_size": 2,
+        })
+        # Bad zscan arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3",
+                 "members": {"a": 1.0}},
+                {"op": "kv_zscan", "key": "z3", "batch_size": 0},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "z3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
@@ -5989,14 +6200,16 @@ class McpTests(unittest.TestCase):
             {"op": "nope", "key": "a"},
             {"op": "kv_set"},
             {"op": "kv_hscan", "key": "a"},
+            {"op": "kv_zscan", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 6 op(s), 1 audited, 5 not audited.", text)
+        self.assertIn("Plan: 7 op(s), 1 audited, 6 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
         self.assertIn("op 4: op is missing a key", text)
         self.assertIn("op 5: kv_hscan is a read, not a write", text)
+        self.assertIn("op 6: kv_zscan is a read, not a write", text)
 
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
