@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1224,6 +1224,88 @@ class FakeCinder(threading.Thread):
                     del value.members[member]
                     removed += 1
             return ":%d\r\n" % removed
+        elif name == "ZREMRANGEBYSCORE" and len(args) == 3:
+            # ZREMRANGEBYSCORE key min max: remove the members
+            # whose scores fall in the range, with the same bounds
+            # as ZRANGEBYSCORE: a plain double, "-inf" / "+inf",
+            # or a leading '(' for an exclusive endpoint. A missing
+            # key removes nothing, and removing the last member
+            # deletes the key, as in real cinder.
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+
+            def _parse_bound(text):
+                excl = False
+                if text.startswith("("):
+                    excl = True
+                    text = text[1:]
+                if not text:
+                    return None
+                try:
+                    score = float(text)
+                except ValueError:
+                    return None
+                if score != score:
+                    return None
+                return score, excl
+
+            parsed_min = _parse_bound(args[1])
+            parsed_max = _parse_bound(args[2])
+            if parsed_min is None or parsed_max is None:
+                return "-ERR value is not a valid float\r\n"
+            lo, lo_excl = parsed_min
+            hi, hi_excl = parsed_max
+            doomed = [
+                m for m in value.members
+                if (value.members[m] > lo if lo_excl
+                    else value.members[m] >= lo)
+                and (value.members[m] < hi if hi_excl
+                     else value.members[m] <= hi)
+            ]
+            for member in doomed:
+                del value.members[member]
+            if not value.members:
+                del self.store[args[0]]
+            return ":%d\r\n" % len(doomed)
+        elif name == "ZREMRANGEBYRANK" and len(args) == 3:
+            # ZREMRANGEBYRANK key start stop: remove the members
+            # ranked [start, stop], 0-based, with negative indices
+            # counting from the end and out-of-range ends clamped,
+            # as in ZRANGE. A missing key removes nothing, and
+            # removing the last member deletes the key.
+            try:
+                start, stop = int(args[1]), int(args[2])
+            except ValueError:
+                return ("-ERR value is not an integer or out of "
+                        "range\r\n")
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            ordered = value.ordered()
+            length = len(ordered)
+            if start < 0:
+                start += length
+            if stop < 0:
+                stop += length
+            if start < 0:
+                start = 0
+            if stop >= length:
+                stop = length - 1
+            if start > stop or start >= length:
+                return ":0\r\n"
+            doomed = ordered[start:stop + 1]
+            for member in doomed:
+                del value.members[member]
+            if not value.members:
+                del self.store[args[0]]
+            return ":%d\r\n" % len(doomed)
         elif name == "ZINCRBY" and len(args) == 3:
             try:
                 incr = float(args[1])
@@ -1844,7 +1926,9 @@ class McpTests(unittest.TestCase):
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
-                    "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+                    "kv_zrank", "kv_zrevrank", "kv_zrem",
+                    "kv_zremrangebyscore", "kv_zremrangebyrank",
+                    "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
                     "kv_zrandmember", "kv_zscan",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
@@ -6960,6 +7044,177 @@ class McpTests(unittest.TestCase):
                           {"member": "b", "score": 2.0}])
         self.assertEqual(summary["results"][2]["result"], 0)
 
+    def test_tools_call_zremrangebyscore_zremrangebyrank(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "board",
+                          "members": {"a": 1, "b": 2, "c": 3, "d": 4,
+                                      "e": 5}},
+        })
+        # Inclusive bounds remove the middle three.
+        removed = self._call("tools/call", 2, {
+            "name": "kv_zremrangebyscore",
+            "arguments": {"key": "board", "min": 2, "max": 4},
+        })
+        self.assertEqual(
+            json.loads(removed["result"]["content"][0]["text"]), 3)
+        left = self._call("tools/call", 3, {
+            "name": "kv_zrange", "arguments": {"key": "board"},
+        })
+        self.assertEqual(
+            json.loads(left["result"]["content"][0]["text"]), ["a", "e"])
+        # Exclusive bounds remove nothing here: a scores 1 and e
+        # scores 5, both outside (1, 5).
+        none = self._call("tools/call", 4, {
+            "name": "kv_zremrangebyscore",
+            "arguments": {"key": "board", "min": "(1", "max": "(5"},
+        })
+        self.assertEqual(
+            json.loads(none["result"]["content"][0]["text"]), 0)
+        # A finite min above the max removes nothing, and neither
+        # does a range over a missing key.
+        self.assertEqual(
+            json.loads(self._call("tools/call", 5, {
+                "name": "kv_zremrangebyscore",
+                "arguments": {"key": "board", "min": 5, "max": 1},
+            })["result"]["content"][0]["text"]), 0)
+        self.assertEqual(
+            json.loads(self._call("tools/call", 6, {
+                "name": "kv_zremrangebyscore",
+                "arguments": {"key": "ghost"},
+            })["result"]["content"][0]["text"]), 0)
+        # -inf/+inf drains the set and deletes the key.
+        drained = self._call("tools/call", 7, {
+            "name": "kv_zremrangebyscore",
+            "arguments": {"key": "board"},
+        })
+        self.assertEqual(
+            json.loads(drained["result"]["content"][0]["text"]), 2)
+        gone = self._call("tools/call", 8, {
+            "name": "kv_exists", "arguments": {"key": "board"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        # By rank: negative indices count from the end, and
+        # out-of-range ends are clamped.
+        self._call("tools/call", 9, {
+            "name": "kv_zadd",
+            "arguments": {"key": "ranks",
+                          "members": {"m1": 10, "m2": 20, "m3": 30,
+                                      "m4": 40, "m5": 50}},
+        })
+        cut = self._call("tools/call", 10, {
+            "name": "kv_zremrangebyrank",
+            "arguments": {"key": "ranks", "start": 0, "stop": 1},
+        })
+        self.assertEqual(
+            json.loads(cut["result"]["content"][0]["text"]), 2)
+        tail = self._call("tools/call", 11, {
+            "name": "kv_zremrangebyrank",
+            "arguments": {"key": "ranks", "start": -2, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(tail["result"]["content"][0]["text"]), 2)
+        left = self._call("tools/call", 12, {
+            "name": "kv_zrange", "arguments": {"key": "ranks"},
+        })
+        self.assertEqual(
+            json.loads(left["result"]["content"][0]["text"]), ["m3"])
+        # A start past the end and a start above the stop remove
+        # nothing, and a missing key removes nothing either.
+        for i, args in enumerate([
+            {"key": "ranks", "start": 5, "stop": 10},
+            {"key": "ranks", "start": 1, "stop": 0},
+            {"key": "ghost", "start": 0, "stop": -1},
+        ]):
+            reply = self._call("tools/call", 13 + i, {
+                "name": "kv_zremrangebyrank", "arguments": args,
+            })
+            self.assertEqual(
+                json.loads(reply["result"]["content"][0]["text"]), 0,
+                args)
+        # Draining by rank deletes the key too.
+        drained = self._call("tools/call", 16, {
+            "name": "kv_zremrangebyrank",
+            "arguments": {"key": "ranks"},
+        })
+        self.assertEqual(
+            json.loads(drained["result"]["content"][0]["text"]), 1)
+        gone = self._call("tools/call", 17, {
+            "name": "kv_exists", "arguments": {"key": "ranks"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_zremrange_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_zremrangebyscore", "arguments": {}},
+            {"name": "kv_zremrangebyrank", "arguments": {}},
+            {"name": "kv_zremrangebyscore",
+             "arguments": {"key": "z", "min": "foo"}},
+            {"name": "kv_zremrangebyscore",
+             "arguments": {"key": "z", "max": float("nan")}},
+            {"name": "kv_zremrangebyscore",
+             "arguments": {"key": "z", "min": True}},
+            {"name": "kv_zremrangebyrank",
+             "arguments": {"key": "z", "start": "0"}},
+            {"name": "kv_zremrangebyrank",
+             "arguments": {"key": "z", "stop": True}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zremrange_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        for i, call in enumerate([
+            {"name": "kv_zremrangebyscore",
+             "arguments": {"key": "queue", "min": 0, "max": 10}},
+            {"name": "kv_zremrangebyrank",
+             "arguments": {"key": "queue", "start": 0, "stop": -1}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_zremrange_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3, "d": 4}},
+                {"op": "kv_zremrangebyscore", "key": "z",
+                 "min": 2, "max": 3},
+                {"op": "kv_zremrangebyrank", "key": "z",
+                 "start": 0, "stop": 0},
+                {"op": "kv_exists", "key": "z"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 4)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zremrangebyscore", "key": "z2",
+                 "min": "(1", "max": "+inf"},
+                {"op": "kv_zcard", "key": "z2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 1)
+
     def test_tools_call_zrandmember(self):
         self._call("tools/call", 1, {
             "name": "kv_zadd",
@@ -8341,6 +8596,94 @@ class McpTests(unittest.TestCase):
         )
         self.assertIn(
             "op 21: kv_zpopmin 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_zremrange(self):
+        board = ZSet()
+        board.members = {"amy": 10.0, "bo": 20.0}
+        self.fake.store["board"] = (board, None)
+        soon_board = ZSet()
+        soon_board.members = {"amy": 10.0, "bo": 20.0}
+        self.fake.store["soon-board"] = (soon_board, time.time() + 3600)
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_zremrangebyscore", "key": "board",
+             "min": 10, "max": 10},
+            {"op": "kv_zremrangebyscore", "key": "board"},
+            {"op": "kv_zremrangebyscore", "key": "todo"},
+            {"op": "kv_zremrangebyscore", "key": "ghost"},
+            {"op": "kv_zremrangebyscore", "key": "ghost", "min": "foo"},
+            {"op": "kv_zremrangebyrank", "key": "board",
+             "start": 0, "stop": 0},
+            {"op": "kv_zremrangebyrank", "key": "board",
+             "start": 0, "stop": -1},
+            {"op": "kv_zremrangebyrank", "key": "board",
+             "start": 5, "stop": 10},
+            {"op": "kv_zremrangebyrank", "key": "todo"},
+            {"op": "kv_zremrangebyrank", "key": "ghost"},
+            {"op": "kv_zremrangebyrank", "key": "ghost", "start": "0"},
+            {"op": "kv_zremrangebyscore", "key": "soon-board"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 12 op(s), 10 audited, 2 not audited.", text)
+        self.assertIn(
+            "op 4: kv_zremrangebyscore bound 'foo' is not a valid "
+            "score", text)
+        self.assertIn(
+            "op 10: kv_zremrangebyrank start must be an integer: '0'",
+            text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_zremrangebyscore 'board' — removes every "
+            "member, deleting a sorted set that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_zremrangebyscore 'todo' — would fail with "
+            "WRONGTYPE: the key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 6: kv_zremrangebyrank 'board' — removes every "
+            "member, deleting a sorted set that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 8: kv_zremrangebyrank 'todo' — would fail with "
+            "WRONGTYPE: the key is a list of 2 elements",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_zremrangebyscore 'board' — removes 1 of 2 "
+            "members",
+            caution,
+        )
+        self.assertIn(
+            "op 5: kv_zremrangebyrank 'board' — removes 1 of 2 "
+            "members",
+            caution,
+        )
+        self.assertIn(
+            "op 11: kv_zremrangebyscore 'soon-board' — removes every "
+            "member of a sorted set of 2 elements that expires in ",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_zremrangebyscore 'ghost' — no-op, the key does "
+            "not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_zremrangebyrank 'board' — no-op, the range is "
+            "empty",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_zremrangebyrank 'ghost' — no-op, the key does "
+            "not exist",
             safe,
         )
 
@@ -10621,6 +10964,99 @@ class LiveCinderMigrationTests(unittest.TestCase):
                            "offset": 4294967289}]}},
                      {"name": "kv_bitfield",
                       "arguments": {"key": "bf:a", "ops": []}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+
+    def test_live_zremrangebyscore_zremrangebyrank(self):
+        """kv_zremrangebyscore / kv_zremrangebyrank against a real
+        cinder 0.46.0: inclusive and exclusive score bounds, -inf /
+        +inf, a finite min above the max, a missing key, WRONGTYPE
+        on a container key, negative rank indices, clamped
+        out-of-range ranks, and the key deleted when the last
+        member is removed by either command."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zr:board",
+                "members": {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}}),
+            5)
+        self.assertEqual(
+            self._tool("kv_zremrangebyscore", {
+                "key": "zr:board", "min": 2, "max": 4}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zrange", {"key": "zr:board"}),
+            ["a", "e"])
+        self.assertEqual(
+            self._tool("kv_zremrangebyscore", {
+                "key": "zr:board", "min": "(1", "max": "(5"}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zremrangebyscore", {
+                "key": "zr:board", "min": 5, "max": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zremrangebyscore", {"key": "zr:ghost"}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zremrangebyscore", {"key": "zr:board"}),
+            2)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zr:board"}), 0)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zr:ranks",
+                "members": {"m1": 10, "m2": 20, "m3": 30, "m4": 40,
+                            "m5": 50}}),
+            5)
+        self.assertEqual(
+            self._tool("kv_zremrangebyrank", {
+                "key": "zr:ranks", "start": 0, "stop": 1}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zremrangebyrank", {
+                "key": "zr:ranks", "start": -2, "stop": -1}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zrange", {"key": "zr:ranks"}),
+            ["m3"])
+        self.assertEqual(
+            self._tool("kv_zremrangebyrank", {
+                "key": "zr:ranks", "start": 5, "stop": 10}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zremrangebyrank", {
+                "key": "zr:ranks", "start": 1, "stop": 0}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zremrangebyrank", {"key": "zr:ghost"}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zremrangebyrank", {"key": "zr:ranks"}),
+            1)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zr:ranks"}), 0)
+        # WRONGTYPE on a list key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_rpush", {"key": "zr:list",
+                                   "elements": ["a"]}),
+            1)
+        for call in ({"name": "kv_zremrangebyscore",
+                      "arguments": {"key": "zr:list", "min": 0,
+                                    "max": 10}},
+                     {"name": "kv_zremrangebyrank",
+                      "arguments": {"key": "zr:list", "start": 0,
+                                    "stop": -1}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+        for call in ({"name": "kv_zremrangebyscore",
+                      "arguments": {"key": "zr:ranks", "min": "foo"}},
+                     {"name": "kv_zremrangebyrank",
+                      "arguments": {"key": "zr:ranks",
+                                    "start": "0"}}):
             reply = self._call("tools/call", 99, call)
             self.assertIn("error", reply, call)
             self.assertEqual(reply["error"]["code"], -32602, call)

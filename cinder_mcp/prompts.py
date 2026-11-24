@@ -129,6 +129,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_setbit", "kv_bitop", "kv_bitfield",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
+    "kv_zremrangebyscore", "kv_zremrangebyrank",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
@@ -1664,6 +1665,88 @@ def _audit_bitop(client, op):
     )
 
 
+def _zremrangebyscore_audit_bounds(op):
+    """The min/max bounds for a kv_zremrangebyscore op in a write
+    plan, as RESP arguments, validated like the tool's own: numbers
+    or strings with an optional leading '(' for exclusivity,
+    -inf/+inf by default. NaN and anything unparsable raises
+    ValueError, so a bad bound fails the audit instead of being
+    reported as a safe no-op."""
+    name = "kv_zremrangebyscore"
+    bounds = []
+    for arg, default in (("min", "-inf"), ("max", "+inf")):
+        value = op.get(arg, default)
+        if isinstance(value, bool):
+            raise ValueError(
+                "%s %s must be a number or a string: %r"
+                % (name, arg, value)
+            )
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value != value:
+                raise ValueError(
+                    "%s bounds must not be NaN" % name
+                )
+            bounds.append(repr(value))
+            continue
+        if isinstance(value, str):
+            text = value[1:] if value.startswith("(") else value
+            if not text:
+                raise ValueError(
+                    "%s bound %r is not a valid score" % (name, value)
+                )
+            try:
+                parsed = float(text)
+            except ValueError:
+                raise ValueError(
+                    "%s bound %r is not a valid score" % (name, value)
+                )
+            if parsed != parsed:
+                raise ValueError(
+                    "%s bounds must not be NaN" % name
+                )
+            bounds.append(value)
+            continue
+        raise ValueError(
+            "%s %s must be a number or a string: %r"
+            % (name, arg, value)
+        )
+    return bounds[0], bounds[1]
+
+
+def _zremrangebyrank_audit_ranks(op):
+    """The start/stop ranks for a kv_zremrangebyrank op in a write
+    plan, validated like the tool's own: integers, 0 and -1 by
+    default. Anything else raises ValueError."""
+    name = "kv_zremrangebyrank"
+    ranks = []
+    for arg, default in (("start", 0), ("stop", -1)):
+        value = op.get(arg, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                "%s %s must be an integer: %r" % (name, arg, value)
+            )
+        ranks.append(value)
+    return ranks[0], ranks[1]
+
+
+def _zremrange_window(start, stop, length):
+    """How many members a [start, stop] rank range covers in a
+    sorted set of `length` members, resolving negative indices
+    the way Redis does: -1 is the last member, out-of-range ends
+    clamped. Returns 0 for an empty range."""
+    if start < 0:
+        start += length
+    if stop < 0:
+        stop += length
+    if start < 0:
+        start = 0
+    if stop >= length:
+        stop = length - 1
+    if start > stop or start >= length:
+        return 0
+    return stop - start + 1
+
+
 def _audit_write_op(client, op):
     """Audit one write op from a write plan against the live
     keyspace. Returns (verdict, line) where verdict is "safe",
@@ -1700,7 +1783,9 @@ def _audit_write_op(client, op):
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
-    members, an LSET that replaces one element of a list, or an
+    members, a ZREMRANGEBYSCORE or ZREMRANGEBYRANK that removes
+    some but not all members, an LSET that replaces one element
+    of a list, or an
     LINSERT that adds one element to a list, an LPUSHX or RPUSHX
     that adds elements to a list that never expires, an LTRIM
     that shortens a list that never expires or deletes a list
@@ -1962,6 +2047,20 @@ def _audit_write_op(client, op):
                 )
             return "safe", (
                 "%s %r — no-op, the key does not exist" % (name, key)
+            )
+        if name == "kv_zremrangebyscore":
+            # A bad bound fails the audit instead of being
+            # reported as a safe no-op on a missing key.
+            _zremrangebyscore_audit_bounds(op)
+            return "safe", (
+                "kv_zremrangebyscore %r — no-op, the key does not exist"
+                % key
+            )
+        if name == "kv_zremrangebyrank":
+            _zremrangebyrank_audit_ranks(op)
+            return "safe", (
+                "kv_zremrangebyrank %r — no-op, the key does not exist"
+                % key
             )
         if name == "kv_lset":
             # LSET on a missing key fails outright in cinder.
@@ -2582,6 +2681,97 @@ def _audit_write_op(client, op):
         return "caution", (
             "%s %r — removes %d of %d members"
             % (name, key, count, size_value)
+        )
+    if name == "kv_zremrangebyscore":
+        min_b, max_b = _zremrangebyscore_audit_bounds(op)
+        if kind != "zset":
+            return "risky", (
+                "kv_zremrangebyscore %r — would fail with WRONGTYPE: "
+                "the key is a %s of %s" % (key, kind, size)
+            )
+        # The count comes from the server: fetch the range with
+        # one extra member, so a range wider than the audit's
+        # read bound is reported as more than 1000 instead of a
+        # silently truncated count.
+        members = client.command(
+            "ZRANGEBYSCORE", key, min_b, max_b,
+            "LIMIT", 0, 1001,
+        ) or []
+        if len(members) > 1000:
+            return "risky", (
+                "kv_zremrangebyscore %r — removes more than 1000 "
+                "members of a sorted set of %s" % (key, size)
+            )
+        removed = len(members)
+        if removed == 0:
+            return "safe", (
+                "kv_zremrangebyscore %r — no-op, the range is empty"
+                % key
+            )
+        if removed >= size_value:
+            # Removing every member deletes the key outright.
+            flags = []
+            if ttl == -1:
+                flags.append(
+                    "removes every member, deleting a sorted set "
+                    "that never expires"
+                )
+            if large:
+                flags.append(
+                    "removes every member of a large sorted set (%s)"
+                    % size
+                )
+            if flags:
+                return "risky", (
+                    "kv_zremrangebyscore %r — %s" % (key, "; ".join(flags))
+                )
+            return "caution", (
+                "kv_zremrangebyscore %r — removes every member of a "
+                "sorted set of %s that %s"
+                % (key, size, ttl_text)
+            )
+        return "caution", (
+            "kv_zremrangebyscore %r — removes %d of %d members"
+            % (key, removed, size_value)
+        )
+    if name == "kv_zremrangebyrank":
+        start, stop = _zremrangebyrank_audit_ranks(op)
+        if kind != "zset":
+            return "risky", (
+                "kv_zremrangebyrank %r — would fail with WRONGTYPE: "
+                "the key is a %s of %s" % (key, kind, size)
+            )
+        removed = _zremrange_window(start, stop, size_value)
+        if removed == 0:
+            return "safe", (
+                "kv_zremrangebyrank %r — no-op, the range is empty"
+                % key
+            )
+        if removed >= size_value:
+            # Removing every member deletes the key outright.
+            flags = []
+            if ttl == -1:
+                flags.append(
+                    "removes every member, deleting a sorted set "
+                    "that never expires"
+                )
+            if large:
+                flags.append(
+                    "removes every member of a large sorted set (%s)"
+                    % size
+                )
+            if flags:
+                return "risky", (
+                    "kv_zremrangebyrank %r — %s" % (key, "; ".join(flags))
+                )
+            return "caution", (
+                "kv_zremrangebyrank %r — removes every member of a "
+                "sorted set of %s that %s"
+                % (key, size, ttl_text)
+            )
+        return "caution", (
+            "kv_zremrangebyrank %r — removes %d of %d members"
+            % (key, removed, size_value)
         )
     # kv_expire on an existing key.
     seconds = op.get("seconds")
