@@ -9,7 +9,10 @@ import hashlib
 from .resp import RespError
 from .scan import (
     DEFAULT_SCAN_BATCH_SIZE,
+    hscan_batch,
+    hscan_result,
     scan_batch,
+    validate_batch_size,
 )
 
 TOOLS = [
@@ -365,6 +368,20 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_hscan",
+        "description": "Walk the fields of a hash one bounded page at a time with cinder's real HSCAN. Returns {\"fields\": {...}, \"cursor\": str, \"done\": bool, \"batch_size\": n}: at most `batch_size` fields per page (default 100) — COUNT is exact here, cinder stops the page at that many matching fields. Pass the returned `cursor` back to fetch the next page; pass \"\" (or omit it) to start. When `done` is true the cursor is \"\" and the walk is finished. The cursor is opaque: pass it back verbatim, do not read meaning into it. Pass `pattern` to match field names only, with the same glob (* and ?). A missing key is done at once, with no fields. Fields come back in hash order, not sorted; fields added or deleted between pages can shift the window, the same caveats real HSCAN has.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "pattern": {"type": "string"},
+                "batch_size": {"type": "integer"},
+                "cursor": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -654,7 +671,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -764,7 +781,7 @@ BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
-    "kv_hmget", "kv_hsetnx", "kv_hincrby",
+    "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
@@ -842,7 +859,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
-    "kv_hmget", "kv_hsetnx", "kv_hincrby",
+    "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
@@ -929,6 +946,13 @@ def _call_batch_atomic(client, ops):
             # inside the transaction; shape it into a dict like the
             # standalone tool does.
             value = _hgetall_result(reply or [])
+        elif op_name == "kv_hscan":
+            # HSCAN came back as [cursor, [field, value, ...]]
+            # inside the transaction; shape it like the standalone
+            # tool does, into one page with its resume cursor.
+            value = hscan_result(
+                reply, op.get("batch_size", DEFAULT_SCAN_BATCH_SIZE)
+            )
         elif op_name == "kv_zrange":
             # ZRANGE came back as a flat list inside the transaction;
             # shape it like the standalone tool does, including the
@@ -1090,6 +1114,27 @@ def _call_keys(client, args):
     return _keys_result(keys, args)
 
 
+def _hscan_args(args):
+    """The validated (key, pattern, batch_size, cursor) for a
+    kv_hscan call. Bad values fail up front instead of sending a
+    half-formed HSCAN, in the standalone tool and in a batch."""
+    key = _require(args, "key")
+    pattern = args.get("pattern", "*")
+    if not isinstance(pattern, str):
+        raise ValueError("kv_hscan pattern must be a string")
+    batch_size = validate_batch_size(
+        args.get("batch_size", DEFAULT_SCAN_BATCH_SIZE)
+    )
+    cursor = args.get("cursor", "")
+    if not isinstance(cursor, str):
+        raise ValueError("kv_hscan cursor must be a string")
+    if cursor and not cursor.isdigit():
+        raise ValueError(
+            "kv_hscan cursor must be a decimal HSCAN cursor string"
+        )
+    return key, pattern, batch_size, cursor
+
+
 def _call_keys_scan(client, args):
     """kv_keys_scan: one bounded page of the keyspace from one real
     SCAN call. Returns {"keys": [...], "cursor": str, "done": bool,
@@ -1101,6 +1146,15 @@ def _call_keys_scan(client, args):
         args.get("cursor", ""),
         args.get("batch_size", DEFAULT_SCAN_BATCH_SIZE),
     )
+
+
+def _call_hscan(client, args):
+    """kv_hscan: one bounded page of a hash from one real HSCAN
+    call. Returns {"fields": {...}, "cursor": str, "done": bool,
+    "batch_size": n}. Bad key/batch_size/cursor values fail the call
+    instead of silently ignoring the caller."""
+    key, pattern, batch_size, cursor = _hscan_args(args)
+    return hscan_batch(client, key, pattern, cursor, batch_size)
 
 
 def _op_argv(name, args):
@@ -1204,6 +1258,10 @@ def _op_argv(name, args):
     if name == "kv_hincrby":
         key, field, increment = _hincrby_args(args)
         return ["HINCRBY", key, field, increment]
+    if name == "kv_hscan":
+        key, pattern, batch_size, cursor = _hscan_args(args)
+        return ["HSCAN", key, cursor or "0", "MATCH", pattern,
+                "COUNT", batch_size]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -2000,6 +2058,8 @@ def _call_single(client, name, args):
         return _call_keys(client, args)
     if name == "kv_keys_scan":
         return _call_keys_scan(client, args)
+    if name == "kv_hscan":
+        return _call_hscan(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":

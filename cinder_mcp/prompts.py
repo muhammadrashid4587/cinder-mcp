@@ -124,7 +124,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_zpopmin", "kv_zpopmax",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
-                         "kv_strlen", "kv_zrandmember")
+                         "kv_strlen", "kv_hscan", "kv_zrandmember")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the

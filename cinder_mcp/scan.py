@@ -20,6 +20,14 @@ string per key scanned, while the per-key TTL/type/size work stays
 bounded per batch. `scan_batch` is the raw paged tool and does not
 dedupe: it exposes real SCAN semantics, duplicates included, with
 the same caveats real SCAN has.
+
+Two more functions cover cinder's HSCAN the same way, one hash at a
+time: `hscan_batch` returns one bounded page of a hash's fields
+from one real HSCAN call, and `hscan_result` shapes a raw HSCAN
+reply (a page fetched inside a MULTI/EXEC transaction) into the
+same page shape. COUNT is exact for HSCAN — cinder stops the page
+at exactly that many matching fields — so a page holds at most
+`batch_size` fields, never more.
 """
 
 # Keys per batch when the caller does not say otherwise.
@@ -96,6 +104,88 @@ def iter_keys(client, pattern="*", batch_size=DEFAULT_SCAN_BATCH_SIZE):
             break
     if batch:
         yield batch
+
+
+def _hscan_reply(client, key, cursor, pattern, count):
+    """One HSCAN call: `HSCAN key cursor MATCH pattern COUNT count`.
+    Returns (next_cursor, fields) with the cursor as the decimal
+    string cinder sent back and fields as a field->value dict. A
+    malformed reply fails loudly instead of silently ending or
+    looping the walk."""
+    reply = client.command(
+        "HSCAN", key, cursor, "MATCH", pattern, "COUNT", str(count)
+    )
+    if not isinstance(reply, list) or len(reply) != 2:
+        raise ValueError("HSCAN returned an unexpected reply: %r" % (reply,))
+    next_cursor, flat = reply
+    if not isinstance(next_cursor, str) or not next_cursor.isdigit():
+        raise ValueError(
+            "HSCAN returned an invalid cursor: %r" % (next_cursor,))
+    if not isinstance(flat, list) or len(flat) % 2 != 0:
+        raise ValueError(
+            "HSCAN returned an unexpected field list: %r" % (flat,))
+    return next_cursor, {
+        flat[i]: flat[i + 1] for i in range(0, len(flat), 2)
+    }
+
+
+def hscan_result(reply, batch_size):
+    """Shape one HSCAN reply [cursor, [field, value, ...]] into
+    {"fields": {...}, "cursor": str, "done": bool, "batch_size": n}.
+    A missing key replies as ["0", []], which becomes done with no
+    fields. The cursor is cinder's opaque decimal cursor — pass it
+    back verbatim; when done is true the cursor is ""."""
+    batch_size = validate_batch_size(batch_size)
+    if not isinstance(reply, list) or len(reply) != 2:
+        raise ValueError("HSCAN returned an unexpected reply: %r" % (reply,))
+    next_cursor, flat = reply
+    if not isinstance(next_cursor, str) or not next_cursor.isdigit():
+        raise ValueError(
+            "HSCAN returned an invalid cursor: %r" % (next_cursor,))
+    if not isinstance(flat, list) or len(flat) % 2 != 0:
+        raise ValueError(
+            "HSCAN returned an unexpected field list: %r" % (flat,))
+    done = next_cursor == SCAN_DONE_CURSOR
+    return {
+        "fields": {
+            flat[i]: flat[i + 1] for i in range(0, len(flat), 2)
+        },
+        "cursor": "" if done else next_cursor,
+        "done": done,
+        "batch_size": batch_size,
+    }
+
+
+def hscan_batch(client, key, pattern="*", cursor="",
+                batch_size=DEFAULT_SCAN_BATCH_SIZE):
+    """One page of a hash, HSCAN-style: at most `batch_size` fields
+    from one real HSCAN call, plus the cursor to resume from and
+    whether the scan is done. Pass "" to start. The cursor is
+    cinder's opaque decimal cursor — pass it back verbatim; do not
+    read meaning into it. When done is true the cursor is "" and
+    there is nothing left to fetch. Unlike SCAN, COUNT is exact
+    here: cinder stops the page at exactly `batch_size` matching
+    fields. `pattern` matches field names only, with the same glob
+    (* and ?). A missing key is done at once, with no fields. Fields
+    come back in hash order, not sorted; fields added or deleted
+    between pages can shift the window, the same caveats real
+    HSCAN has. Returns {"fields": {...}, "cursor": str,
+    "done": bool, "batch_size": n}."""
+    batch_size = validate_batch_size(batch_size)
+    if not isinstance(cursor, str):
+        raise ValueError("cursor must be a string")
+    if cursor and not cursor.isdigit():
+        raise ValueError("cursor must be a decimal HSCAN cursor string")
+    next_cursor, fields = _hscan_reply(
+        client, key, cursor or SCAN_DONE_CURSOR, pattern, batch_size
+    )
+    done = next_cursor == SCAN_DONE_CURSOR
+    return {
+        "fields": fields,
+        "cursor": "" if done else next_cursor,
+        "done": done,
+        "batch_size": batch_size,
+    }
 
 
 def scan_batch(client, pattern="*", cursor="", batch_size=DEFAULT_SCAN_BATCH_SIZE):

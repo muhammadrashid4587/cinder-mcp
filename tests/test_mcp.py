@@ -3,7 +3,7 @@
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HSCAN, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -486,6 +486,47 @@ class FakeCinder(threading.Thread):
                             "overflow\r\n")
             value[args[1]] = str(nxt)
             return ":%d\r\n" % nxt
+        elif name == "HSCAN" and len(args) >= 2:
+            # Cinder's cursor is a decimal index into the hash's
+            # fields; "0" starts (and ends) the walk. MATCH filters
+            # field names, COUNT caps the matching fields in the
+            # page — exact here, unlike SCAN's bucket overshoot. A
+            # missing key is done at once, with no fields.
+            value = self._get(args[0])
+            if value is None:
+                return "*2\r\n$1\r\n0\r\n*0\r\n"
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if not args[1].isdigit():
+                return "-ERR invalid cursor\r\n"
+            cursor = int(args[1])
+            pattern = "*"
+            count = 10
+            i = 2
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "MATCH" and i + 1 < len(args):
+                    pattern = args[i + 1]
+                    i += 2
+                elif opt == "COUNT" and i + 1 < len(args):
+                    try:
+                        count = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR value is not an integer or out "
+                                "of range\r\n")
+                    i += 2
+                else:
+                    return "-ERR syntax error\r\n"
+            fields = [f for f in value if _glob_match(pattern, f)]
+            page = fields[cursor:cursor + count]
+            nxt = cursor + len(page)
+            if nxt >= len(fields):
+                nxt = 0
+            flat = [x for f in page for x in (f, value[f])]
+            return ("*2\r\n" + self._bulk(str(nxt))
+                    + "*%d\r\n" % len(flat)
+                    + "".join(self._bulk(v) for v in flat))
         elif name == "ZADD" and len(args) >= 3:
             # Options come after the key and before the first score,
             # as in cinder 0.25.0: NX | XX | GT | LT | CH | INCR.
@@ -1032,6 +1073,7 @@ class McpTests(unittest.TestCase):
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
+                    "kv_hscan",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
@@ -2163,6 +2205,155 @@ class McpTests(unittest.TestCase):
                 {"op": "kv_hset", "key": "h3",
                  "fields": {"a": "1"}},
                 {"op": "kv_hmget", "key": "h3", "fields": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "h3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def _seed_hash(self, key, count):
+        fields = {"f:%03d" % i: "v%d" % i for i in range(count)}
+        reply = self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": key, "fields": fields},
+        })
+        self.assertNotIn("error", reply, key)
+        self.assertEqual(reply["result"]["content"][0]["text"], str(count))
+
+    def _hscan_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_hscan", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_hscan_pages_through_a_hash(self):
+        self._seed_hash("big", 250)
+        seen = {}
+        cursor = ""
+        pages = 0
+        while True:
+            data = self._hscan_result({"key": "big", "batch_size": 100,
+                                       "cursor": cursor})
+            self.assertEqual(data["batch_size"], 100)
+            # COUNT is exact for HSCAN: never more than batch_size.
+            self.assertLessEqual(len(data["fields"]), 100)
+            seen.update(data["fields"])
+            pages += 1
+            self.assertLessEqual(pages, 10)
+            if data["done"]:
+                self.assertEqual(data["cursor"], "")
+                break
+            # The cursor is cinder's opaque decimal cursor: pass it
+            # back verbatim, never read a field out of it.
+            self.assertNotEqual(data["cursor"], "")
+            self.assertTrue(data["cursor"].isdigit(), data["cursor"])
+            cursor = data["cursor"]
+        self.assertEqual(pages, 3)
+        self.assertEqual(
+            seen, {"f:%03d" % i: "v%d" % i for i in range(250)})
+        # A cursor returned by one page resumes the walk: the first
+        # five fields come back, then the next five after it.
+        first = self._hscan_result({"key": "big", "batch_size": 5})
+        self.assertEqual(
+            first["fields"],
+            {"f:%03d" % i: "v%d" % i for i in range(5)})
+        self.assertFalse(first["done"])
+        second = self._hscan_result(
+            {"key": "big", "batch_size": 5, "cursor": first["cursor"]})
+        self.assertEqual(
+            second["fields"],
+            {"f:%03d" % i: "v%d" % i for i in range(5, 10)})
+        self.assertFalse(second["done"])
+        # The pattern filters on field names, and a small hash
+        # finishes in one page.
+        data = self._hscan_result({"key": "big", "pattern": "f:00*"})
+        self.assertEqual(
+            data["fields"],
+            {"f:%03d" % i: "v%d" % i for i in range(10)})
+        self.assertTrue(data["done"])
+        self.assertEqual(data["cursor"], "")
+        # A missing key is done at once, with no fields.
+        empty = self._hscan_result({"key": "ghost"})
+        self.assertEqual(
+            empty, {"fields": {}, "cursor": "", "done": True,
+                    "batch_size": 100})
+
+    def test_kv_hscan_rejects_bad_arguments(self):
+        self._seed_hash("h", 2)
+        for bad in ({"batch_size": 0}, {"batch_size": -1},
+                    {"batch_size": 1001}, {"batch_size": "ten"},
+                    {"batch_size": True}, {"cursor": 7},
+                    {"cursor": "f:001"}, {"cursor": "abc"},
+                    {"pattern": 7}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_hscan",
+                "arguments": dict({"key": "h"}, **bad),
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        missing_key = self._call("tools/call", 2, {
+            "name": "kv_hscan", "arguments": {"fields": ["a"]},
+        })
+        self.assertIn("error", missing_key)
+        self.assertEqual(missing_key["error"]["code"], -32602)
+
+    def test_kv_hscan_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_hscan", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_hscan_in_plain_and_atomic_batch(self):
+        self._seed_hash("h", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_hscan", "key": "h", "batch_size": 2},
+                {"op": "kv_hscan", "key": "h", "batch_size": 2,
+                 "cursor": "2"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], {
+            "fields": {"f:000": "v0", "f:001": "v1"},
+            "cursor": "2", "done": False, "batch_size": 2,
+        })
+        self.assertEqual(summary["results"][1]["result"], {
+            "fields": {"f:002": "v2", "f:003": "v3"},
+            "cursor": "4", "done": False, "batch_size": 2,
+        })
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h2",
+                 "fields": {"a": "1", "b": "2", "c": "3"}},
+                {"op": "kv_hscan", "key": "h2", "batch_size": 2},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], {
+            "fields": {"a": "1", "b": "2"},
+            "cursor": "2", "done": False, "batch_size": 2,
+        })
+        # Bad hscan arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h3",
+                 "fields": {"a": "1"}},
+                {"op": "kv_hscan", "key": "h3", "batch_size": 0},
             ]},
         })
         self.assertIn("error", bad)
@@ -5012,13 +5203,15 @@ class McpTests(unittest.TestCase):
             {"op": "kv_keys_scan", "pattern": "*"},
             {"op": "nope", "key": "a"},
             {"op": "kv_set"},
+            {"op": "kv_hscan", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 5 op(s), 1 audited, 4 not audited.", text)
+        self.assertIn("Plan: 6 op(s), 1 audited, 5 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
         self.assertIn("op 4: op is missing a key", text)
+        self.assertIn("op 5: kv_hscan is a read, not a write", text)
 
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
