@@ -484,6 +484,19 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zrandmember",
+        "description": "A random member (or members) of a sorted set: ZRANDMEMBER key [count [WITHSCORES]]. Without a count returns one member as a string, or null when the key does not exist. With a count returns a list of member names: a positive count returns distinct members (at most the whole set), a negative count samples with replacement so members may repeat, and 0 returns an empty list. Pass withscores=true with a count for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The set is not changed. At most 1000 members per call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "count": {"type": "integer"},
+                "withscores": {"type": "boolean"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -603,7 +616,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -716,6 +729,7 @@ BATCHABLE_TOOLS = {
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
+    "kv_zrandmember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
@@ -792,6 +806,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
+    "kv_zrandmember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
@@ -938,6 +953,13 @@ def _call_batch_atomic(client, ops):
             # transaction; shape it like the standalone tool does,
             # into member/score objects.
             value = _zpop_result(reply or [])
+        elif op_name == "kv_zrandmember":
+            # ZRANDMEMBER came back as one bulk string (or nil) for
+            # a bare call, or a flat list for a count call; shape
+            # the count form like the standalone tool does,
+            # including the withscores member/score objects.
+            _key, count, withscores = _zrandmember_args(op)
+            value = _zrandmember_result(reply, count, withscores)
         elif op_name == "kv_zscore":
             # ZSCORE came back as a bulk score string (or nil) inside
             # the transaction; parse it like the standalone tool does.
@@ -1154,6 +1176,14 @@ def _op_argv(name, args):
     if name == "kv_zpopmax":
         key, count = _zpop_args(args, name)
         return ["ZPOPMAX", key] if count == 1 else ["ZPOPMAX", key, count]
+    if name == "kv_zrandmember":
+        key, count, withscores = _zrandmember_args(args)
+        cmd = ["ZRANDMEMBER", key]
+        if count is not None:
+            cmd.append(count)
+            if withscores:
+                cmd.append("WITHSCORES")
+        return cmd
     if name == "kv_lpush":
         return ["LPUSH", _require(args, "key")] + _list_elements_args(args, name)
     if name == "kv_rpush":
@@ -1740,6 +1770,67 @@ def _call_zpop(client, args, name):
     return _zpop_result(client.command(*_op_argv(name, args)) or [])
 
 
+# The most members one kv_zrandmember count call returns, in
+# either direction: a positive count is naturally capped by the
+# set's size, but a negative count samples with replacement and
+# is unbounded in cinder, so a huge one would ask it to build a
+# huge reply.
+MAX_ZRANDMEMBER_COUNT = 1000
+
+
+def _zrandmember_args(args):
+    """Validate a kv_zrandmember call: (key, count, withscores).
+    count is optional: without it the call returns one member (or
+    null for a missing key); with it, that many members. A
+    positive count returns distinct members, a negative count
+    samples with replacement, 0 returns an empty list. count is
+    at most MAX_ZRANDMEMBER_COUNT in either direction. withscores
+    needs a count: cinder reads the second argument as the count,
+    so ZRANDMEMBER key WITHSCORES is a syntax error there, not a
+    bare call with scores."""
+    key = _require(args, "key")
+    count = args.get("count")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("kv_zrandmember count must be an integer")
+        if abs(count) > MAX_ZRANDMEMBER_COUNT:
+            raise ValueError(
+                "kv_zrandmember count must be between -%d and %d"
+                % (MAX_ZRANDMEMBER_COUNT, MAX_ZRANDMEMBER_COUNT)
+            )
+    withscores = args.get("withscores", False)
+    if not isinstance(withscores, bool):
+        raise ValueError("kv_zrandmember withscores must be true or false")
+    if withscores and count is None:
+        raise ValueError("kv_zrandmember withscores needs a count")
+    return key, count, withscores
+
+
+def _zrandmember_result(reply, count, withscores):
+    """Shape a ZRANDMEMBER reply into the tool's return value: a
+    bare call returns one member string, or null for a missing
+    key; a count call returns a list of member names, or with
+    withscores a list of {"member": ..., "score": ...} objects.
+    A count of 0 returns an empty list."""
+    if count is None:
+        return reply
+    return _zrange_result(reply or [], withscores)
+
+
+def _call_zrandmember(client, args):
+    """kv_zrandmember: one random member, or `count` of them. A
+    positive count returns distinct members (at most the whole
+    set), a negative count samples with replacement, 0 returns an
+    empty list; withscores pairs each member with its score. The
+    call is read-only: the set is untouched, so the audit treats
+    it as a read op."""
+    key, count, withscores = _zrandmember_args(args)
+    return _zrandmember_result(
+        client.command(*_op_argv("kv_zrandmember", args)),
+        count, withscores,
+    )
+
+
 def _call_zrevrank(client, args):
     """kv_zrevrank: the member's rank, highest score first. Cinder
     has no ZREVRANK, so this reads ZRANK and ZCARD and returns
@@ -1871,4 +1962,6 @@ def _call_single(client, name, args):
         return _call_zrevrank(client, args)
     if name in ("kv_zpopmin", "kv_zpopmax"):
         return _call_zpop(client, args, name)
+    if name == "kv_zrandmember":
+        return _call_zrandmember(client, args)
     return client.command(*_op_argv(name, args))

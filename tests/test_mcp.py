@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -14,6 +14,7 @@ value so the per-key resource's type probing can be exercised.
 import hashlib
 import io
 import json
+import random
 import socket
 import threading
 import time
@@ -603,6 +604,53 @@ class FakeCinder(threading.Thread):
                 flat.append(member)
                 flat.append(repr(score))
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name == "ZRANDMEMBER" and len(args) in (1, 2, 3):
+            # ZRANDMEMBER key [count [WITHSCORES]]: one random
+            # member, or `count` of them — a positive count returns
+            # distinct members (at most the whole set), a negative
+            # count samples with replacement, 0 returns an empty
+            # array; WITHSCORES interleaves each score after its
+            # member. A missing key is nil for the bare form and an
+            # empty array for the count form, and an empty set
+            # answers the same way, as in real cinder.
+            withscores = False
+            if len(args) == 3:
+                if args[2].upper() != "WITHSCORES":
+                    return "-ERR syntax error\r\n"
+                withscores = True
+            count = None
+            if len(args) >= 2:
+                try:
+                    count = int(args[1])
+                except ValueError:
+                    return "-ERR value is not an integer or out of range\r\n"
+            value = self._get(args[0])
+            if value is None:
+                if count is None:
+                    return self._bulk(None)
+                return "*0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            members = value.ordered()
+            if not members:
+                if count is None:
+                    return self._bulk(None)
+                return "*0\r\n"
+            if count is None:
+                return self._bulk(random.choice(members))
+            if count == 0:
+                return "*0\r\n"
+            if count > 0:
+                picked = random.sample(members, min(count, len(members)))
+            else:
+                picked = [random.choice(members) for _ in range(-count)]
+            flat = []
+            for member in picked:
+                flat.append(member)
+                if withscores:
+                    flat.append(repr(value.members[member]))
+            return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
         elif name in ("ZRANGE", "ZREVRANGE") and len(args) in (3, 4):
             value = self._get(args[0])
             if value is None:
@@ -936,6 +984,7 @@ class McpTests(unittest.TestCase):
                     "kv_zscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
+                    "kv_zrandmember",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_sadd", "kv_smembers", "kv_scard",
@@ -3736,6 +3785,168 @@ class McpTests(unittest.TestCase):
                           {"member": "b", "score": 2.0}])
         self.assertEqual(summary["results"][2]["result"], 0)
 
+    def test_tools_call_zrandmember(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "board",
+                          "members": {"amy": 10, "bo": 20, "cy": 15}},
+        })
+        # The bare form returns one member of the set; the member
+        # is random, so the test checks membership, not identity.
+        one = self._call("tools/call", 2, {
+            "name": "kv_zrandmember", "arguments": {"key": "board"},
+        })
+        self.assertIn(
+            one["result"]["content"][0]["text"],
+            ["amy", "bo", "cy"],
+        )
+        # A positive count returns that many distinct members.
+        two = self._call("tools/call", 3, {
+            "name": "kv_zrandmember",
+            "arguments": {"key": "board", "count": 2},
+        })
+        members = json.loads(two["result"]["content"][0]["text"])
+        self.assertEqual(len(members), 2)
+        self.assertEqual(len(set(members)), 2)
+        self.assertTrue(set(members) <= {"amy", "bo", "cy"})
+        # A count past the end returns the whole set, distinct.
+        everything = self._call("tools/call", 4, {
+            "name": "kv_zrandmember",
+            "arguments": {"key": "board", "count": 5},
+        })
+        self.assertEqual(
+            set(json.loads(everything["result"]["content"][0]["text"])),
+            {"amy", "bo", "cy"},
+        )
+        # A negative count samples with replacement: five members,
+        # each in the set, and a repeat is allowed.
+        replaced = self._call("tools/call", 5, {
+            "name": "kv_zrandmember",
+            "arguments": {"key": "board", "count": -5},
+        })
+        members = json.loads(replaced["result"]["content"][0]["text"])
+        self.assertEqual(len(members), 5)
+        self.assertTrue(set(members) <= {"amy", "bo", "cy"})
+        # A count of 0 returns an empty list.
+        none = self._call("tools/call", 6, {
+            "name": "kv_zrandmember",
+            "arguments": {"key": "board", "count": 0},
+        })
+        self.assertEqual(
+            json.loads(none["result"]["content"][0]["text"]), [])
+        # WITHSCORES pairs each sampled member with its score.
+        scored = self._call("tools/call", 7, {
+            "name": "kv_zrandmember",
+            "arguments": {"key": "board", "count": 3,
+                          "withscores": True},
+        })
+        picked = json.loads(scored["result"]["content"][0]["text"])
+        self.assertEqual(len(picked), 3)
+        self.assertEqual(
+            {item["member"]: item["score"] for item in picked},
+            {"amy": 10.0, "bo": 20.0, "cy": 15.0},
+        )
+        # A missing key is null for the bare form and an empty list
+        # for the count form; the set is untouched by sampling.
+        ghost = self._call("tools/call", 8, {
+            "name": "kv_zrandmember", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost["result"]["content"][0]["text"], "null")
+        ghost_many = self._call("tools/call", 9, {
+            "name": "kv_zrandmember",
+            "arguments": {"key": "ghost", "count": 2},
+        })
+        self.assertEqual(
+            json.loads(ghost_many["result"]["content"][0]["text"]), [])
+        still_there = self._call("tools/call", 10, {
+            "name": "kv_zcard", "arguments": {"key": "board"},
+        })
+        self.assertEqual(still_there["result"]["content"][0]["text"], "3")
+
+    def test_tools_call_zrandmember_rejects_bad_arguments(self):
+        cases = [
+            {"name": "kv_zrandmember", "arguments": {}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "z", "count": "2"}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "z", "count": True}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "z", "count": 1001}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "z", "count": -1001}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "z", "withscores": True}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "z", "count": 2,
+                           "withscores": "yes"}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zrandmember_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        for i, call in enumerate([
+            {"name": "kv_zrandmember", "arguments": {"key": "queue"}},
+            {"name": "kv_zrandmember",
+             "arguments": {"key": "queue", "count": 2}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_zrandmember_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zrandmember", "key": "z", "count": 2},
+                {"op": "kv_zrandmember", "key": "z", "count": 3,
+                 "withscores": True},
+                {"op": "kv_zcard", "key": "z"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        members = summary["results"][1]["result"]
+        self.assertEqual(len(members), 2)
+        self.assertEqual(len(set(members)), 2)
+        self.assertTrue(set(members) <= {"a", "b", "c"})
+        scored = summary["results"][2]["result"]
+        self.assertEqual(len(scored), 3)
+        self.assertEqual(
+            {item["member"]: item["score"] for item in scored},
+            {"a": 1.0, "b": 2.0, "c": 3.0},
+        )
+        self.assertEqual(summary["results"][3]["result"], 3)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1, "b": 2}},
+                {"op": "kv_zrandmember", "key": "z2"},
+                {"op": "kv_zrandmember", "key": "z2", "count": 2,
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertIn(summary["results"][1]["result"], ["a", "b"])
+        scored = summary["results"][2]["result"]
+        self.assertEqual(len(scored), 2)
+        self.assertEqual(
+            {item["member"]: item["score"] for item in scored},
+            {"a": 1.0, "b": 2.0},
+        )
+
     def test_resources_list_returns_info_metrics_changes_and_key_template(self):
         listed = self._call("resources/list", 1)
         resources = listed["result"]["resources"]
@@ -4730,6 +4941,156 @@ class McpTests(unittest.TestCase):
         )
         self.assertIn(
             "op 21: kv_zpopmin 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_string_write_ops(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "soon", "value": "v", "ex": 3600},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "big", "value": "x" * 2000},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_mset", "values": {"fresh-a": "x", "fresh-b": "y"}},
+            {"op": "kv_mset", "values": {"forever": "x", "fresh-c": "y"}},
+            {"op": "kv_mset", "values": {"todo": "x"}},
+            {"op": "kv_mset", "values": {"big": "x"}},
+            {"op": "kv_mset", "values": {"soon": "x", "fresh-d": "y"}},
+            {"op": "kv_setnx", "key": "forever", "value": "v"},
+            {"op": "kv_setnx", "key": "ghost", "value": "v"},
+            {"op": "kv_setex", "key": "forever", "seconds": 60, "value": "v"},
+            {"op": "kv_setex", "key": "soon", "seconds": 60, "value": "v"},
+            {"op": "kv_setex", "key": "ghost", "seconds": 60, "value": "v"},
+            {"op": "kv_setex", "key": "ghost", "seconds": 0, "value": "v"},
+            {"op": "kv_getset", "key": "forever", "value": "v"},
+            {"op": "kv_getset", "key": "soon", "value": "v"},
+            {"op": "kv_getset", "key": "todo", "value": "v"},
+            {"op": "kv_getset", "key": "ghost", "value": "v"},
+            {"op": "kv_getdel", "key": "forever"},
+            {"op": "kv_getdel", "key": "soon"},
+            {"op": "kv_getdel", "key": "todo"},
+            {"op": "kv_getdel", "key": "ghost"},
+            {"op": "kv_mset", "values": {}},
+            {"op": "kv_mset", "values": {"a": 1}},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 21 op(s), 19 audited, 2 not audited.", text)
+        self.assertIn(
+            "op 19: kv_mset values must be a non-empty object", text)
+        self.assertIn(
+            "op 20: kv_mset values must map string key names to "
+            "string values", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_mset 'forever', 'fresh-c' — 'forever' overwrites "
+            "a key that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_mset 'todo' — 'todo' would replace a list of 2 "
+            "elements with a string, destroying its contents",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_mset 'big' — 'big' overwrites a key that never "
+            "expires; 'big' overwrites a large key (2000 bytes)",
+            risky,
+        )
+        self.assertIn(
+            "op 7: kv_setex 'forever' — overwrites a key that never "
+            "expires",
+            risky,
+        )
+        self.assertIn(
+            "op 10: kv_setex 'ghost' — would fail: invalid expire "
+            "time 0",
+            risky,
+        )
+        self.assertIn(
+            "op 11: kv_getset 'forever' — overwrites a key that "
+            "never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 13: kv_getset 'todo' — would fail with WRONGTYPE: "
+            "the key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 15: kv_getdel 'forever' — deletes a key that never "
+            "expires",
+            risky,
+        )
+        self.assertIn(
+            "op 17: kv_getdel 'todo' — would fail with WRONGTYPE: "
+            "the key is a list of 2 elements",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_mset 'fresh-a', 'fresh-b' — creates 2 new "
+            "key(s) with no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 4: kv_mset 'fresh-d', 'soon' — overwrites 1 existing "
+            "key(s) and creates 1 new key(s) with no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 6: kv_setnx 'ghost' — creates a new key with no "
+            "expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 8: kv_setex 'soon' — overwrites a string of 1 bytes "
+            "that expires in ",
+            caution,
+        )
+        self.assertIn(
+            "giving it an expiry of 1m",
+            caution,
+        )
+        self.assertIn(
+            "op 12: kv_getset 'soon' — overwrites a string of 1 "
+            "bytes that expires in ",
+            caution,
+        )
+        self.assertIn(
+            "and clears its TTL",
+            caution,
+        )
+        self.assertIn(
+            "op 14: kv_getset 'ghost' — creates a new key with no "
+            "expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 16: kv_getdel 'soon' — deletes a string of 1 bytes "
+            "that expires in ",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 5: kv_setnx 'forever' — no-op, the key already exists",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_setex 'ghost' — creates a new key expiring in "
+            "1m",
+            safe,
+        )
+        self.assertIn(
+            "op 18: kv_getdel 'ghost' — no-op, the key does not exist",
             safe,
         )
 

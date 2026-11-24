@@ -20,10 +20,13 @@ type breakdown, keys without TTL, soonest-expiring keys, the
 largest keys, and a short list of recommended actions. write-safety
 audits a proposed write plan — a JSON list of kv_batch-shaped ops —
 against the live keyspace before anything runs: it flags overwrites
-of keys that never expire, overwrites of large keys, SETs that
-would destroy a list, set, or hash, INCRs that would fail on a
-non-integer or a container, and EXPIREs with a bad timeout, then
-asks the model for a go/no-go per risky op. ttl-renewal plans
+of keys that never expire, overwrites of large keys, SETs, MSETs,
+SETEXes and GETSETs that would destroy a list, set, or hash, GETDELs
+that would delete a key that never expires, INCRs and DECRs that
+would fail on a non-integer or a container, and EXPIREs with a bad
+timeout, then asks the model for a go/no-go per risky op. SETNX never
+writes to a key that already exists, so the audit reports it as a
+safe no-op there and a new key with no expiry elsewhere. ttl-renewal plans
 renewing the TTLs of keys that are expiring soon or have no expiry:
 it reads live TTLs, flags keys that are already expired or missing,
 and proposes one kv_expire renewal per key up to a safety cap,
@@ -115,11 +118,12 @@ MAX_MIGRATION_FLAGGED_LISTED = 10
 # kv_batch op at all, so it lands in the unparseable list instead.
 WRITE_SAFETY_WRITE_OPS = (
     "kv_set", "kv_del", "kv_incr", "kv_expire",
+    "kv_mset", "kv_setnx", "kv_setex", "kv_getset", "kv_getdel",
     "kv_append", "kv_decr", "kv_decrby", "kv_getex",
     "kv_zpopmin", "kv_zpopmax",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
-                         "kv_strlen")
+                         "kv_strlen", "kv_zrandmember")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -226,12 +230,13 @@ PROMPTS = [
         "description": (
             "Audit a proposed write plan against the live keyspace "
             "before it runs: flag overwrites of keys that never "
-            "expire, overwrites of large keys, SETs that would "
-            "destroy a container, INCRs and DECRs that would fail, "
-            "APPENDs that would fail, GETEXes that would change or "
-            "remove a TTL, ZPOPs that would drain a sorted set, and "
-            "EXPIREs with a bad timeout, and give a go/no-go per "
-            "risky op."
+            "expire, overwrites of large keys, SETs, MSETs, SETEXes "
+            "and GETSETs that would destroy a container, GETDELs "
+            "that would delete a key that never expires, INCRs and "
+            "DECRs that would fail, APPENDs that would fail, GETEXes "
+            "that would change or remove a TTL, ZPOPs that would "
+            "drain a sorted set, and EXPIREs with a bad timeout, "
+            "and give a go/no-go per risky op."
         ),
         "arguments": [
             {
@@ -975,6 +980,94 @@ def _getex_option(op):
     return ex, px, persist
 
 
+def _format_key_list(keys):
+    """Key names quoted and comma-joined for one audit line, with
+    the rest counted when there are more than a few: a kv_mset can
+    hold many keys and the audit line still has to stay readable."""
+    keys = sorted(keys)
+    shown = keys[:5]
+    text = ", ".join(repr(k) for k in shown)
+    if len(keys) > len(shown):
+        text += ", and %d more" % (len(keys) - len(shown))
+    return text
+
+
+def _mset_values(op):
+    """The key/value pairs for a kv_mset in a write plan: a
+    non-empty object of string key names to string values, as in
+    the tool itself. Anything else raises ValueError, so the
+    caller reports the op as not audited instead of guessing."""
+    values = op.get("values")
+    if not isinstance(values, dict) or not values:
+        raise ValueError(
+            "kv_mset values must be a non-empty object: %r" % (values,)
+        )
+    for key, value in values.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                "kv_mset values must map string key names to string "
+                "values: %r" % (values,)
+            )
+    return values
+
+
+def _audit_mset(client, op):
+    """Audit one kv_mset op: every key in `values` is probed live,
+    because one MSET can overwrite several keys at once and each
+    has its own type, size, and TTL. Returns (verdict, line)."""
+    values = _mset_values(op)
+    keys = sorted(values)
+    flags = []
+    existed = 0
+    for key in keys:
+        if client.command("EXISTS", key) == 0:
+            continue
+        existed += 1
+        ttl = client.command("TTL", key)
+        if ttl == -2:
+            # The key expired while auditing; the write creates it.
+            existed -= 1
+            continue
+        try:
+            kind, size_value, size, _sample = _inspect_key(client, key)
+        except ValueError:
+            # The key expired between the TTL read and the probe.
+            existed -= 1
+            continue
+        large = (
+            (kind == "string" and size_value >= HEALTH_BIG_STRING_BYTES)
+            or (kind != "string" and size_value >= HEALTH_BIG_CONTAINER_ELEMENTS)
+        )
+        if kind != "string":
+            flags.append(
+                "%r would replace a %s of %s with a string, destroying "
+                "its contents" % (key, kind, size)
+            )
+        if ttl == -1:
+            flags.append("%r overwrites a key that never expires" % key)
+        if large:
+            flags.append("%r overwrites a large key (%s)" % (key, size))
+    if flags:
+        return "risky", "kv_mset %s — %s" % (
+            _format_key_list(keys), "; ".join(flags))
+    new = len(keys) - existed
+    if existed == 0:
+        return "caution", (
+            "kv_mset %s — creates %d new key(s) with no expiry"
+            % (_format_key_list(keys), len(keys))
+        )
+    if new:
+        return "caution", (
+            "kv_mset %s — overwrites %d existing key(s) and creates "
+            "%d new key(s) with no expiry"
+            % (_format_key_list(keys), existed, new)
+        )
+    return "caution", (
+        "kv_mset %s — overwrites %d existing key(s)"
+        % (_format_key_list(keys), existed)
+    )
+
+
 def _audit_write_op(client, op):
     """Audit one write op from a write plan against the live
     keyspace. Returns (verdict, line) where verdict is "safe",
@@ -986,22 +1079,30 @@ def _audit_write_op(client, op):
     secrets, and the audit is about the key, not its new value.
     Verdicts: "risky" destroys data that is hard to get back or
     would fail outright — overwriting or deleting a key that never
-    expires, overwriting or deleting a large key, a SET that would
-    replace a list, set, or hash with a string, an INCR or DECR on
+    expires, overwriting or deleting a large key, a SET, MSET,
+    SETEX or GETSET that would replace a list, set, or hash with a
+    string, a GETDEL on a container, an INCR or DECR on
     a non-integer or a container, an APPEND on a container, a
     GETEX or ZPOP on a container, a ZPOP that would drain a
-    never-expiring or large sorted set, or an EXPIRE or GETEX
-    with a bad timeout. "caution" changes something but the
+    never-expiring or large sorted set, or an EXPIRE, SETEX or
+    GETEX with a bad timeout. "caution" changes something but the
     damage is bounded — an overwrite or delete of a key that
-    expires soon anyway, a SET or APPEND that creates a key with
-    no expiry, a GETEX that gives a never-expiring key an expiry
-    or removes one, or a ZPOP that takes some but not all members.
-    Everything else is "safe": creating an expiring key, INCR or
-    DECR on a missing key, an EXPIRE on an existing key, a GETEX
-    that only reads a value, or a no-op on a missing key."""
+    expires soon anyway, a SET, MSET, SETNX, APPEND or GETSET
+    that creates a key with no expiry, a GETEX that gives a
+    never-expiring key an expiry or removes one, or a ZPOP that
+    takes some but not all members. SETNX on a key that already
+    exists writes nothing, so it is safe. Everything else is
+    "safe": creating an expiring key, INCR or DECR on a missing
+    key, an EXPIRE on an existing key, a GETEX that only reads a
+    value, or a no-op on a missing key.
+    kv_mset has no single key — it writes several at once — so it
+    is audited by _audit_mset instead of the single-key flow below."""
     name = op.get("op")
     if name not in WRITE_SAFETY_WRITE_OPS:
         raise ValueError("not a write op: %s" % name)
+    if name == "kv_mset":
+        # MSET writes several keys at once and has no single key.
+        return _audit_mset(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))
@@ -1067,6 +1168,46 @@ def _audit_write_op(client, op):
                 )
             return "safe", (
                 "kv_getex %r — no-op, the key does not exist" % key
+            )
+        if name == "kv_setnx":
+            if not isinstance(op.get("value"), str):
+                raise ValueError(
+                    "kv_setnx value must be a string: %r"
+                    % (op.get("value"),)
+                )
+            return "caution", (
+                "kv_setnx %r — creates a new key with no expiry" % key
+            )
+        if name == "kv_setex":
+            seconds = op.get("seconds")
+            if seconds is None:
+                raise ValueError("kv_setex is missing seconds: %r" % (op,))
+            if not isinstance(op.get("value"), str):
+                raise ValueError(
+                    "kv_setex value must be a string: %r"
+                    % (op.get("value"),)
+                )
+            if not _is_int(seconds) or int(seconds) <= 0:
+                return "risky", (
+                    "kv_setex %r — would fail: invalid expire time %r"
+                    % (key, seconds)
+                )
+            return "safe", (
+                "kv_setex %r — creates a new key expiring in %s"
+                % (key, _format_ttl(int(seconds)))
+            )
+        if name == "kv_getset":
+            if not isinstance(op.get("value"), str):
+                raise ValueError(
+                    "kv_getset value must be a string: %r"
+                    % (op.get("value"),)
+                )
+            return "caution", (
+                "kv_getset %r — creates a new key with no expiry" % key
+            )
+        if name == "kv_getdel":
+            return "safe", (
+                "kv_getdel %r — no-op, the key does not exist" % key
             )
         if name in ("kv_zpopmin", "kv_zpopmax"):
             count = op.get("count", 1)
@@ -1254,6 +1395,84 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_getex %r — returns the value and leaves its TTL alone"
             % key
+        )
+    if name == "kv_setnx":
+        if not isinstance(op.get("value"), str):
+            raise ValueError(
+                "kv_setnx value must be a string: %r" % (op.get("value"),)
+            )
+        # SETNX never writes to a key that already exists, whatever
+        # it holds, so there is nothing to flag about it.
+        return "safe", (
+            "kv_setnx %r — no-op, the key already exists" % key
+        )
+    if name == "kv_setex":
+        seconds = op.get("seconds")
+        if seconds is None:
+            raise ValueError("kv_setex is missing seconds: %r" % (op,))
+        if not isinstance(op.get("value"), str):
+            raise ValueError(
+                "kv_setex value must be a string: %r" % (op.get("value"),)
+            )
+        if not _is_int(seconds) or int(seconds) <= 0:
+            return "risky", (
+                "kv_setex %r — would fail: invalid expire time %r"
+                % (key, seconds)
+            )
+        flags = []
+        if kind != "string":
+            flags.append(
+                "would replace a %s of %s with a string, destroying "
+                "its contents" % (kind, size)
+            )
+        if ttl == -1:
+            flags.append("overwrites a key that never expires")
+        if large:
+            flags.append("overwrites a large key (%s)" % size)
+        if flags:
+            return "risky", "kv_setex %r — %s" % (key, "; ".join(flags))
+        return "caution", (
+            "kv_setex %r — overwrites a %s of %s that %s, giving it "
+            "an expiry of %s"
+            % (key, kind, size, ttl_text, _format_ttl(int(seconds)))
+        )
+    if name == "kv_getset":
+        if not isinstance(op.get("value"), str):
+            raise ValueError(
+                "kv_getset value must be a string: %r" % (op.get("value"),)
+            )
+        if kind != "string":
+            return "risky", (
+                "kv_getset %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        flags = []
+        if ttl == -1:
+            flags.append("overwrites a key that never expires")
+        if large:
+            flags.append("overwrites a large key (%s)" % size)
+        if flags:
+            return "risky", "kv_getset %r — %s" % (key, "; ".join(flags))
+        return "caution", (
+            "kv_getset %r — overwrites a %s of %s that %s and clears "
+            "its TTL" % (key, kind, size, ttl_text)
+        )
+    if name == "kv_getdel":
+        if kind != "string":
+            return "risky", (
+                "kv_getdel %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        flags = []
+        if ttl == -1:
+            flags.append("deletes a key that never expires")
+        if large:
+            flags.append("deletes a large key (%s)" % size)
+        if flags:
+            return "risky", "kv_getdel %r — %s" % (key, "; ".join(flags))
+        return "caution", (
+            "kv_getdel %r — deletes a %s of %s that %s"
+            % (key, kind, size, ttl_text)
         )
     if name in ("kv_zpopmin", "kv_zpopmax"):
         count = op.get("count", 1)
