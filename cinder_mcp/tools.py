@@ -134,6 +134,74 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_mget",
+        "description": "Get the string values of several keys at once: MGET key [key ...]. Takes `keys` as a list of key names. Returns the values in the same order, with null for a key that does not exist — and for a key holding a non-string, which is real Redis behaviour: unlike kv_get, MGET does not fail on a wrong type. At most 1000 keys per call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keys": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["keys"],
+        },
+    },
+    {
+        "name": "kv_mset",
+        "description": "Set several keys to string values at once: MSET key value [key value ...]. Takes `values` as an object mapping key names to values. Returns \"OK\". Overwrites any type, as in Redis, and a key given twice takes the last value.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "values": {"type": "object"},
+            },
+            "required": ["values"],
+        },
+    },
+    {
+        "name": "kv_getdel",
+        "description": "Get the string value of a key and delete it: GETDEL key. Returns the old value, or null when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_setnx",
+        "description": "Set a key to a string value only if it does not already exist: SETNX key value. Returns 1 if the key was set, 0 if it already existed — whatever it holds, a list or hash counts as existing too.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "kv_setex",
+        "description": "Set a key to a string value with a TTL in seconds: SETEX key seconds value. Returns \"OK\". The seconds must be more than 0; overwrites any type, like a plain SET.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "seconds": {"type": "integer"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "seconds", "value"],
+        },
+    },
+    {
+        "name": "kv_getset",
+        "description": "Set a key to a string value and return its old value: GETSET key value. Returns the old value, or null when the key did not exist. Clears the key's TTL, like a plain SET.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
         "name": "kv_hset",
         "description": "Set fields on a hash: HSET key field value [field value ...]. Takes `fields` as an object mapping field names to values. Returns the number of fields that were newly added (updating an existing field returns 0 for it).",
         "inputSchema": {
@@ -452,7 +520,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -469,6 +537,9 @@ TOOLS = [
                             "px": {"type": "integer"},
                             "by": {"type": "integer"},
                             "seconds": {"type": "integer"},
+                            "milliseconds": {"type": "integer"},
+                            "keys": {"type": "array", "items": {"type": "string"}},
+                            "values": {"type": "object"},
                             "field": {"type": "string"},
                             # `fields` is an object for kv_hset and a list
                             # of field names for kv_hdel.
@@ -555,6 +626,7 @@ def call_tool(client, name, args):
 BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
+    "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
@@ -628,6 +700,7 @@ def _call_batch(client, args):
 ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
+    "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
@@ -920,6 +993,19 @@ def _op_argv(name, args):
                 % milliseconds
             )
         return ["PEXPIRE", _require(args, "key"), milliseconds]
+    if name == "kv_mget":
+        return ["MGET"] + _mget_keys_args(args)
+    if name == "kv_mset":
+        return ["MSET"] + _mset_values_args(args)
+    if name == "kv_getdel":
+        return ["GETDEL", _require(args, "key")]
+    if name == "kv_setnx":
+        return ["SETNX", _require(args, "key"), _require(args, "value")]
+    if name == "kv_setex":
+        key, seconds, value = _setex_args(args)
+        return ["SETEX", key, seconds, value]
+    if name == "kv_getset":
+        return ["GETSET", _require(args, "key"), _require(args, "value")]
     if name == "kv_hset":
         return ["HSET", _require(args, "key")] + _hset_field_args(args)
     if name == "kv_hget":
@@ -1024,6 +1110,66 @@ def _op_argvs(name, args):
         key, member = _zrevrank_args(args)
         return [["ZRANK", key, member], ["ZCARD", key]]
     return [_op_argv(name, args)]
+
+
+# The most keys one kv_mget call reads; a wider call fails instead of
+# dumping a huge slice of the keyspace into one tool result.
+MAX_MGET_KEYS = 1000
+
+
+def _mget_keys_args(args):
+    """The key names for an MGET, as an argv list. `keys` must be a
+    non-empty list of strings, at most MAX_MGET_KEYS; anything else
+    fails the call instead of sending a half-formed MGET."""
+    keys = args.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError("kv_mget keys must be a non-empty list")
+    if len(keys) > MAX_MGET_KEYS:
+        raise ValueError(
+            "kv_mget reads at most %d keys; narrow the list"
+            % MAX_MGET_KEYS
+        )
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError("kv_mget keys must be strings")
+    return list(keys)
+
+
+def _mset_values_args(args):
+    """The key/value pairs for an MSET, as a flat argv list.
+    `values` must be a non-empty object of string key names to
+    string values; anything else fails the call instead of sending
+    a half-formed MSET. Pairs are sent in sorted key order so the
+    argv is deterministic."""
+    values = args.get("values")
+    if not isinstance(values, dict) or not values:
+        raise ValueError("kv_mset values must be a non-empty object")
+    argv = []
+    for key in sorted(values):
+        value = values[key]
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                "kv_mset values must map string key names to string values"
+            )
+        argv += [key, value]
+    return argv
+
+
+def _setex_args(args):
+    """Validate a kv_setex call: (key, seconds, value). The seconds
+    must be an integer greater than 0 — cinder rejects 0 or a
+    negative time as a server error, so fail here as invalid params
+    instead."""
+    key = _require(args, "key")
+    seconds = _require(args, "seconds")
+    value = _require(args, "value")
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("kv_setex seconds must be an integer")
+    if seconds <= 0:
+        raise ValueError(
+            "kv_setex seconds must be more than 0, got %d" % seconds
+        )
+    return key, seconds, value
 
 
 def _hset_field_args(args):

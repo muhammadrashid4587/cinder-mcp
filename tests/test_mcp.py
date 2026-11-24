@@ -1,7 +1,8 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, LLEN, SCARD, HLEN,
+GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
+GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
@@ -192,6 +193,55 @@ class FakeCinder(threading.Thread):
                     i += 1
             self.store[key] = (value, expires)
             return "+OK\r\n"
+        elif name == "MSET" and len(args) >= 2 and len(args) % 2 == 0:
+            # Overwrites any type, as in real cinder; a duplicate key
+            # in one call takes the last value.
+            for i in range(0, len(args), 2):
+                self.store[args[i]] = (args[i + 1], None)
+            return "+OK\r\n"
+        elif name == "MGET" and len(args) >= 1:
+            # Unlike GET, a key holding a non-string is nil here, not
+            # a WRONGTYPE error — that is real Redis behaviour.
+            out = "*%d\r\n" % len(args)
+            for key in args:
+                value = self._get(key)
+                out += self._bulk(value if isinstance(value, str) else None)
+            return out
+        elif name == "GETDEL" and len(args) == 1:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                return self._bulk(None)
+            del self.store[args[0]]
+            return self._bulk(value)
+        elif name == "SETNX" and len(args) == 2:
+            # Returns 0 when the key already exists, whatever it
+            # holds — that is real Redis behaviour, not a WRONGTYPE
+            # error.
+            if self._get(args[0]) is not None or args[0] in self.store:
+                return ":0\r\n"
+            self.store[args[0]] = (args[1], None)
+            return ":1\r\n"
+        elif name == "SETEX" and len(args) == 3:
+            try:
+                seconds = int(args[1])
+            except ValueError:
+                return "-ERR invalid expire time in 'setex' command\r\n"
+            if seconds <= 0:
+                return "-ERR invalid expire time in 'setex' command\r\n"
+            # Overwrites any type, like SET.
+            self.store[args[0]] = (args[2], time.time() + seconds)
+            return "+OK\r\n"
+        elif name == "GETSET" and len(args) == 2:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            # GETSET clears the TTL, like a plain SET.
+            self.store[args[0]] = (args[1], None)
+            return self._bulk(value)
         elif name == "GET" and len(args) == 1:
             value = self._get(args[0])
             if value is not None and not isinstance(value, str):
@@ -776,6 +826,8 @@ class McpTests(unittest.TestCase):
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
                     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire",
                     "kv_pexpire",
+                    "kv_mget", "kv_mset", "kv_getdel", "kv_setnx",
+                    "kv_setex", "kv_getset",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
@@ -1710,6 +1762,215 @@ class McpTests(unittest.TestCase):
         self.assertEqual(bad["error"]["code"], -32602)
         untouched = self._call("tools/call", 4, {
             "name": "kv_exists", "arguments": {"key": "h3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_string_mget_mset_getdel_setnx_setex_getset(self):
+        # MSET sets several keys at once; MGET reads them back in
+        # order, with null for a missing key.
+        set_many = self._call("tools/call", 1, {
+            "name": "kv_mset",
+            "arguments": {"values": {"a": "1", "b": "2"}},
+        })
+        self.assertEqual(set_many["result"]["content"][0]["text"], "OK")
+        got = self._call("tools/call", 2, {
+            "name": "kv_mget",
+            "arguments": {"keys": ["a", "b", "missing"]},
+        })
+        self.assertEqual(
+            json.loads(got["result"]["content"][0]["text"]),
+            ["1", "2", None],
+        )
+        # SETNX sets a new key and refuses one that already exists.
+        fresh = self._call("tools/call", 3, {
+            "name": "kv_setnx",
+            "arguments": {"key": "c", "value": "3"},
+        })
+        self.assertEqual(fresh["result"]["content"][0]["text"], "1")
+        taken = self._call("tools/call", 4, {
+            "name": "kv_setnx",
+            "arguments": {"key": "a", "value": "9"},
+        })
+        self.assertEqual(taken["result"]["content"][0]["text"], "0")
+        still = self._call("tools/call", 5, {
+            "name": "kv_get", "arguments": {"key": "a"},
+        })
+        self.assertEqual(still["result"]["content"][0]["text"], "1")
+        # SETEX sets a value with a TTL; GETSET swaps a value and
+        # returns the old one, clearing the TTL.
+        expiring = self._call("tools/call", 6, {
+            "name": "kv_setex",
+            "arguments": {"key": "d", "seconds": 100, "value": "hello"},
+        })
+        self.assertEqual(expiring["result"]["content"][0]["text"], "OK")
+        ttl = self._call("tools/call", 7, {
+            "name": "kv_ttl", "arguments": {"key": "d"},
+        })
+        self.assertTrue(0 < int(ttl["result"]["content"][0]["text"]) <= 100)
+        swapped = self._call("tools/call", 8, {
+            "name": "kv_getset",
+            "arguments": {"key": "d", "value": "v2"},
+        })
+        self.assertEqual(swapped["result"]["content"][0]["text"], "hello")
+        no_ttl = self._call("tools/call", 9, {
+            "name": "kv_ttl", "arguments": {"key": "d"},
+        })
+        self.assertEqual(no_ttl["result"]["content"][0]["text"], "-1")
+        # GETSET on a missing key returns null and still sets it.
+        new_key = self._call("tools/call", 10, {
+            "name": "kv_getset",
+            "arguments": {"key": "e", "value": "first"},
+        })
+        self.assertEqual(new_key["result"]["content"][0]["text"], "null")
+        # GETDEL returns the value and removes the key; a second
+        # call finds nothing.
+        taken_away = self._call("tools/call", 11, {
+            "name": "kv_getdel", "arguments": {"key": "b"},
+        })
+        self.assertEqual(taken_away["result"]["content"][0]["text"], "2")
+        gone = self._call("tools/call", 12, {
+            "name": "kv_exists", "arguments": {"key": "b"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        already_gone = self._call("tools/call", 13, {
+            "name": "kv_getdel", "arguments": {"key": "b"},
+        })
+        self.assertEqual(already_gone["result"]["content"][0]["text"], "null")
+
+    def test_tools_call_string_tools_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_mget", "arguments": {}},
+            {"name": "kv_mget", "arguments": {"keys": []}},
+            {"name": "kv_mget", "arguments": {"keys": "a"}},
+            {"name": "kv_mget", "arguments": {"keys": ["a", 7]}},
+            {"name": "kv_mget",
+             "arguments": {"keys": ["k"] * 1001}},
+            {"name": "kv_mset", "arguments": {}},
+            {"name": "kv_mset", "arguments": {"values": {}}},
+            {"name": "kv_mset", "arguments": {"values": "a"}},
+            {"name": "kv_mset", "arguments": {"values": {"a": 7}}},
+            {"name": "kv_getdel", "arguments": {}},
+            {"name": "kv_setnx", "arguments": {"key": "a"}},
+            {"name": "kv_setnx", "arguments": {"value": "v"}},
+            {"name": "kv_setex", "arguments": {"key": "a", "value": "v"}},
+            {"name": "kv_setex",
+             "arguments": {"key": "a", "seconds": "100", "value": "v"}},
+            {"name": "kv_setex",
+             "arguments": {"key": "a", "seconds": 0, "value": "v"}},
+            {"name": "kv_setex",
+             "arguments": {"key": "a", "seconds": -5, "value": "v"}},
+            {"name": "kv_getset", "arguments": {"key": "a"}},
+            {"name": "kv_getset", "arguments": {"value": "v"}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_string_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        # GETDEL and GETSET fail on a container key, as in Redis.
+        for i, call in enumerate([
+            {"name": "kv_getdel", "arguments": {"key": "queue"}},
+            {"name": "kv_getset",
+             "arguments": {"key": "queue", "value": "v"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+        # MGET does not fail on a container key: it returns null for
+        # it, which is real Redis behaviour.
+        mixed = self._call("tools/call", 4, {
+            "name": "kv_mget",
+            "arguments": {"keys": ["queue", "missing"]},
+        })
+        self.assertEqual(
+            json.loads(mixed["result"]["content"][0]["text"]),
+            [None, None],
+        )
+        # SETNX refuses a key that exists whatever it holds, and
+        # MSET overwrites a container with a string, as in Redis.
+        busy = self._call("tools/call", 5, {
+            "name": "kv_setnx",
+            "arguments": {"key": "queue", "value": "v"},
+        })
+        self.assertEqual(busy["result"]["content"][0]["text"], "0")
+        overwritten = self._call("tools/call", 6, {
+            "name": "kv_mset",
+            "arguments": {"values": {"queue": "now-a-string"}},
+        })
+        self.assertEqual(overwritten["result"]["content"][0]["text"], "OK")
+        read_back = self._call("tools/call", 7, {
+            "name": "kv_get", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(read_back["result"]["content"][0]["text"],
+                         "now-a-string")
+
+    def test_tools_call_string_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_mset",
+                 "values": {"x": "1", "y": "2"}},
+                {"op": "kv_mget", "keys": ["x", "y", "ghost"]},
+                {"op": "kv_setnx", "key": "z", "value": "3"},
+                {"op": "kv_setnx", "key": "x", "value": "9"},
+                {"op": "kv_setex", "key": "w", "seconds": 100,
+                 "value": "hi"},
+                {"op": "kv_getset", "key": "x", "value": "10"},
+                {"op": "kv_getdel", "key": "y"},
+                {"op": "kv_get", "key": "y"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 8)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertEqual(summary["results"][1]["result"], ["1", "2", None])
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        self.assertEqual(summary["results"][4]["result"], "OK")
+        self.assertEqual(summary["results"][5]["result"], "1")
+        self.assertEqual(summary["results"][6]["result"], "2")
+        self.assertIsNone(summary["results"][7]["result"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_mset",
+                 "values": {"p": "5", "q": "6"}},
+                {"op": "kv_mget", "keys": ["p", "q"]},
+                {"op": "kv_setnx", "key": "r", "value": "7"},
+                {"op": "kv_getset", "key": "p", "value": "50"},
+                {"op": "kv_getdel", "key": "q"},
+                {"op": "kv_setex", "key": "s", "seconds": 60,
+                 "value": "soon"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 6)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertEqual(summary["results"][1]["result"], ["5", "6"])
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], "5")
+        self.assertEqual(summary["results"][4]["result"], "6")
+        self.assertEqual(summary["results"][5]["result"], "OK")
+        # Bad string arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_mset", "values": {"t": "1"}},
+                {"op": "kv_setex", "key": "t", "seconds": 0,
+                 "value": "v"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "t"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 

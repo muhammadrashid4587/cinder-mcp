@@ -80,6 +80,12 @@ threshold it crossed, so the client sees it without polling
 | `kv_exists` | `EXISTS key` | 1 if the key exists, 0 otherwise |
 | `kv_expire` | `EXPIRE key seconds` | 1 if the timeout was set, 0 if the key is missing |
 | `kv_pexpire` | `PEXPIRE key milliseconds` | 1 if the timeout was set, 0 if the key is missing; milliseconds must be 0 or more |
+| `kv_mget` | `MGET key [key ...]` | `keys` is a list of key names; returns the values in the same order, with `null` for a missing key — and for a key holding a non-string, which is real Redis behaviour (unlike `kv_get`, MGET does not fail on a wrong type). At most 1000 keys per call |
+| `kv_mset` | `MSET key value [key value ...]` | `values` is an object of key names to values; returns `OK`. Overwrites any type, as in Redis |
+| `kv_getdel` | `GETDEL key` | Returns the old value and deletes the key; `null` when the key does not exist |
+| `kv_setnx` | `SETNX key value` | 1 if the key was set, 0 if it already existed — whatever it holds, a list or hash counts as existing too |
+| `kv_setex` | `SETEX key seconds value` | Returns `OK`; seconds must be more than 0. Overwrites any type, like a plain SET |
+| `kv_getset` | `GETSET key value` | Returns the old value, or `null` when the key did not exist; clears the key's TTL, like a plain SET |
 | `kv_hset` | `HSET key field value [field value ...]` | `fields` is an object of field names to values; returns the number of fields newly added (updating an existing field counts 0) |
 | `kv_hget` | `HGET key field` | Returns `null` when the key or the field is missing |
 | `kv_hgetall` | `HGETALL key` | Every field as an object of field names to values; `{}` when the key is missing |
@@ -233,6 +239,7 @@ sorted key order.
 - ~~Set tools (`kv_sadd`, `kv_smembers`, `kv_scard`): expose cinder's SADD/SMEMBERS/SCARD — `kv_sadd` takes a `members` list and returns the number of members newly added (adding a member already present counts 0), `kv_smembers` returns the members in cinder's order and fails instead of truncating when the set holds more than 1000 members, `kv_scard` returns 0 for a missing key. All three are batchable, plain and atomic~~ (done, v0.30.0)
 - ~~More set tools (`kv_srem`, `kv_sismember`): expose cinder's SREM/SISMEMBER, completing the set family — `kv_srem` takes a `members` list and returns the number of members actually removed (removing a member that is not present counts 0; removing the last member deletes the key, as in Redis), `kv_sismember` takes a `member` and returns 1 if it is present, 0 if it is not or the key does not exist. Both are batchable, plain and atomic~~ (done, v0.31.0)
 - ~~More hash tools (`kv_hdel`, `kv_hexists`, `kv_hlen`): expose cinder's HDEL/HEXISTS/HLEN, completing the hash family — `kv_hdel` takes a `fields` list and returns the number of fields actually removed (removing a field that is not present counts 0; removing the last field deletes the key, as in Redis), `kv_hexists` takes a `field` and returns 1 if it is present, 0 if it is not or the key does not exist, `kv_hlen` returns the number of fields (0 for a missing key). All three are batchable, plain and atomic~~ (done, v0.32.0)
+- ~~String read/write tools (`kv_mget`, `kv_mset`, `kv_getdel`, `kv_setnx`, `kv_setex`, `kv_getset`): expose cinder's MGET/MSET/GETDEL/SETNX/SETEX/GETSET — `kv_mget` takes a `keys` list and returns the values in order with null for missing keys (and for keys holding a non-string, which is real Redis behaviour, not a wrong-type error), `kv_mset` takes a `values` object and returns OK (overwrites any type, as in Redis), `kv_getdel` returns the old value and deletes the key (null for a missing key), `kv_setnx` returns 1 if the key was set, 0 if it already existed whatever it holds, `kv_setex` sets a value with a TTL in seconds (seconds must be more than 0), `kv_getset` returns the old value and clears the TTL (null for a missing key). All six are batchable, plain and atomic; MGET is capped at 1000 keys~~ (done, v0.33.0)
 
 ## Next
 
