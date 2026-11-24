@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1320,6 +1320,56 @@ class FakeCinder(threading.Thread):
             if not value.members:
                 del self.store[args[0]]
             return ":%d\r\n" % len(doomed)
+        elif name == "ZREMRANGEBYLEX" and len(args) == 3:
+            # ZREMRANGEBYLEX key min max: remove the members whose
+            # names fall in the lex range, with the same bounds as
+            # ZRANGEBYLEX: "-" is -inf (min only), "+" is +inf (max
+            # only), "[x" inclusive and "(x" exclusive. A bare
+            # member, the wrong infinity, or an empty bracket is a
+            # syntax error. There is no REV: the removed set does
+            # not depend on order. A missing key removes nothing,
+            # and removing the last member deletes the key, as in
+            # real cinder.
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+
+            def parse_lex(text):
+                if text == "-":
+                    return (-1, None, False)
+                if text == "+":
+                    return (1, None, False)
+                if text.startswith(("[", "(")) and len(text) > 1:
+                    return (0, text[1:], text.startswith("("))
+                return None
+
+            parsed_lo = parse_lex(args[1])
+            parsed_hi = parse_lex(args[2])
+            if parsed_lo is None or parsed_hi is None:
+                return "-ERR syntax error\r\n"
+            lo_kind, lo_bound, lo_excl = parsed_lo
+            hi_kind, hi_bound, hi_excl = parsed_hi
+            if lo_kind == 1 or hi_kind == -1:
+                return "-ERR syntax error\r\n"
+            doomed = []
+            for member in sorted(value.members):
+                if lo_kind == 0:
+                    if member < lo_bound or (
+                            member == lo_bound and lo_excl):
+                        continue
+                if hi_kind == 0:
+                    if member > hi_bound or (
+                            member == hi_bound and hi_excl):
+                        continue
+                doomed.append(member)
+            for member in doomed:
+                del value.members[member]
+            if not value.members:
+                del self.store[args[0]]
+            return ":%d\r\n" % len(doomed)
         elif name == "ZINCRBY" and len(args) == 3:
             try:
                 incr = float(args[1])
@@ -1997,6 +2047,7 @@ class McpTests(unittest.TestCase):
                     "kv_zscore", "kv_zmscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem",
                     "kv_zremrangebyscore", "kv_zremrangebyrank",
+                    "kv_zremrangebylex",
                     "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
                     "kv_zrandmember", "kv_zscan",
@@ -7583,6 +7634,124 @@ class McpTests(unittest.TestCase):
         self.assertEqual(summary["results"][1]["result"], 2)
         self.assertEqual(summary["results"][2]["result"], 1)
 
+    def test_tools_call_zremrangebylex(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "board",
+                          "members": {"a": 1, "b": 2, "c": 3, "d": 4,
+                                      "e": 5}},
+        })
+        # Inclusive bounds remove the middle three, by name
+        # regardless of their scores.
+        removed = self._call("tools/call", 2, {
+            "name": "kv_zremrangebylex",
+            "arguments": {"key": "board", "min": "[b", "max": "[d"},
+        })
+        self.assertEqual(
+            json.loads(removed["result"]["content"][0]["text"]), 3)
+        left = self._call("tools/call", 3, {
+            "name": "kv_zrange", "arguments": {"key": "board"},
+        })
+        self.assertEqual(
+            json.loads(left["result"]["content"][0]["text"]), ["a", "e"])
+        # Exclusive bounds remove nothing here: a and e are
+        # outside (a, e).
+        none = self._call("tools/call", 4, {
+            "name": "kv_zremrangebylex",
+            "arguments": {"key": "board", "min": "(a", "max": "(e"},
+        })
+        self.assertEqual(
+            json.loads(none["result"]["content"][0]["text"]), 0)
+        # A finite min above the max removes nothing, and neither
+        # does a range over a missing key.
+        self.assertEqual(
+            json.loads(self._call("tools/call", 5, {
+                "name": "kv_zremrangebylex",
+                "arguments": {"key": "board", "min": "[d", "max": "[b"},
+            })["result"]["content"][0]["text"]), 0)
+        self.assertEqual(
+            json.loads(self._call("tools/call", 6, {
+                "name": "kv_zremrangebylex",
+                "arguments": {"key": "ghost"},
+            })["result"]["content"][0]["text"]), 0)
+        # -/+ drains the set and deletes the key.
+        drained = self._call("tools/call", 7, {
+            "name": "kv_zremrangebylex",
+            "arguments": {"key": "board"},
+        })
+        self.assertEqual(
+            json.loads(drained["result"]["content"][0]["text"]), 2)
+        gone = self._call("tools/call", 8, {
+            "name": "kv_exists", "arguments": {"key": "board"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_zremrangebylex_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_zremrangebylex", "arguments": {}},
+            {"name": "kv_zremrangebylex",
+             "arguments": {"key": "z", "min": "a"}},
+            {"name": "kv_zremrangebylex",
+             "arguments": {"key": "z", "max": "e"}},
+            {"name": "kv_zremrangebylex",
+             "arguments": {"key": "z", "min": "+"}},
+            {"name": "kv_zremrangebylex",
+             "arguments": {"key": "z", "max": "-"}},
+            {"name": "kv_zremrangebylex",
+             "arguments": {"key": "z", "min": "["}},
+            {"name": "kv_zremrangebylex",
+             "arguments": {"key": "z", "min": 1}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zremrangebylex_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zremrangebylex",
+            "arguments": {"key": "queue", "min": "-", "max": "+"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+
+    def test_tools_call_zremrangebylex_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3, "d": 4}},
+                {"op": "kv_zremrangebylex", "key": "z",
+                 "min": "[b", "max": "[c"},
+                {"op": "kv_zrange", "key": "z"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 4)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], ["a", "d"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zremrangebylex", "key": "z2",
+                 "min": "(a", "max": "+"},
+                {"op": "kv_zcard", "key": "z2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 1)
+
     def test_tools_call_zrandmember(self):
         self._call("tools/call", 1, {
             "name": "kv_zadd",
@@ -9058,6 +9227,69 @@ class McpTests(unittest.TestCase):
         self.assertIn(
             "op 9: kv_zremrangebyrank 'ghost' — no-op, the key does "
             "not exist",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_zremrangebylex(self):
+        board = ZSet()
+        board.members = {"amy": 10.0, "bo": 20.0}
+        self.fake.store["board"] = (board, None)
+        soon_board = ZSet()
+        soon_board.members = {"amy": 10.0, "bo": 20.0}
+        self.fake.store["soon-board"] = (soon_board, time.time() + 3600)
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_zremrangebylex", "key": "board",
+             "min": "[amy", "max": "[amy"},
+            {"op": "kv_zremrangebylex", "key": "board"},
+            {"op": "kv_zremrangebylex", "key": "todo"},
+            {"op": "kv_zremrangebylex", "key": "ghost"},
+            {"op": "kv_zremrangebylex", "key": "ghost", "min": "amy"},
+            {"op": "kv_zremrangebylex", "key": "ghost", "min": "+"},
+            {"op": "kv_zremrangebylex", "key": "board",
+             "min": "[c", "max": "[z"},
+            {"op": "kv_zremrangebylex", "key": "soon-board"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 8 op(s), 6 audited, 2 not audited.", text)
+        self.assertIn(
+            "op 4: kv_zremrangebylex min bound 'amy' is not a valid "
+            "lex bound: use \"-\", \"+\", \"[member\" or \"(member\"",
+            text)
+        self.assertIn(
+            "op 5: kv_zremrangebylex min bound must not be \"+\"",
+            text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_zremrangebylex 'board' — removes every "
+            "member, deleting a sorted set that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_zremrangebylex 'todo' — would fail with "
+            "WRONGTYPE: the key is a list of 2 elements",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_zremrangebylex 'board' — removes 1 of 2 "
+            "members",
+            caution,
+        )
+        self.assertIn(
+            "op 7: kv_zremrangebylex 'soon-board' — removes every "
+            "member of a sorted set of 2 elements that expires in ",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_zremrangebylex 'ghost' — no-op, the key does "
+            "not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 6: kv_zremrangebylex 'board' — no-op, the range is "
+            "empty",
             safe,
         )
 

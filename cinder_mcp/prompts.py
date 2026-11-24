@@ -129,7 +129,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_setbit", "kv_bitop", "kv_bitfield",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
-    "kv_zremrangebyscore", "kv_zremrangebyrank",
+    "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
@@ -260,7 +260,9 @@ PROMPTS = [
             "would fail on a container or with a bad offset or a bad "
             "value, GETEXes that "
             "would change or remove a TTL, "
-            "ZPOPs that would drain a sorted set, LPUSHXes and "
+            "ZPOPs that would drain a sorted set, ZREMRANGEBYSCOREs, "
+            "ZREMRANGEBYRANKs and ZREMRANGEBYLEXes that would drain "
+            "one, LPUSHXes and "
             "RPUSHXes that would fail on a container, LTRIMs that "
             "would delete a list outright, LMOVEs that would fail "
             "on a container or drain a source list, and EXPIREs with "
@@ -1731,6 +1733,41 @@ def _zremrangebyrank_audit_ranks(op):
     return ranks[0], ranks[1]
 
 
+def _zremrangebylex_audit_bounds(op):
+    """The min/max bounds for a kv_zremrangebylex op in a write
+    plan, validated like the tool's own: "-" / "+" or "[x" / "(x",
+    defaulting to "-" / "+". A bare member, the wrong infinity,
+    an empty bracket, or anything that is not a string raises
+    ValueError, so a bad bound fails the audit instead of being
+    reported as a safe no-op."""
+    name = "kv_zremrangebylex"
+    bounds = []
+    for arg, default in (("min", "-"), ("max", "+")):
+        value = op.get(arg, default)
+        if not isinstance(value, str):
+            raise ValueError(
+                "%s %s bound must be a string: %r" % (name, arg, value)
+            )
+        if value == "-":
+            if arg != "min":
+                raise ValueError(
+                    "%s max bound must not be \"-\"" % name
+                )
+        elif value == "+":
+            if arg != "max":
+                raise ValueError(
+                    "%s min bound must not be \"+\"" % name
+                )
+        elif not (value.startswith(("[", "(")) and len(value) > 1):
+            raise ValueError(
+                "%s %s bound %r is not a valid lex bound: use \"-\", "
+                "\"+\", \"[member\" or \"(member\""
+                % (name, arg, value)
+            )
+        bounds.append(value)
+    return bounds[0], bounds[1]
+
+
 def _zremrange_window(start, stop, length):
     """How many members a [start, stop] rank range covers in a
     sorted set of `length` members, resolving negative indices
@@ -1785,7 +1822,7 @@ def _audit_write_op(client, op):
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
-    members, a ZREMRANGEBYSCORE or ZREMRANGEBYRANK that removes
+    members, a ZREMRANGEBYSCORE, ZREMRANGEBYRANK or ZREMRANGEBYLEX that removes
     some but not all members, an LSET that replaces one element
     of a list, or an
     LINSERT that adds one element to a list, an LPUSHX or RPUSHX
@@ -2062,6 +2099,14 @@ def _audit_write_op(client, op):
             _zremrangebyrank_audit_ranks(op)
             return "safe", (
                 "kv_zremrangebyrank %r — no-op, the key does not exist"
+                % key
+            )
+        if name == "kv_zremrangebylex":
+            # A bad bound fails the audit instead of being
+            # reported as a safe no-op on a missing key.
+            _zremrangebylex_audit_bounds(op)
+            return "safe", (
+                "kv_zremrangebylex %r — no-op, the key does not exist"
                 % key
             )
         if name == "kv_lset":
@@ -2773,6 +2818,58 @@ def _audit_write_op(client, op):
             )
         return "caution", (
             "kv_zremrangebyrank %r — removes %d of %d members"
+            % (key, removed, size_value)
+        )
+    if name == "kv_zremrangebylex":
+        min_b, max_b = _zremrangebylex_audit_bounds(op)
+        if kind != "zset":
+            return "risky", (
+                "kv_zremrangebylex %r — would fail with WRONGTYPE: "
+                "the key is a %s of %s" % (key, kind, size)
+            )
+        # The count comes from the server: fetch the range with
+        # one extra member, so a range wider than the audit's
+        # read bound is reported as more than 1000 instead of a
+        # silently truncated count.
+        members = client.command(
+            "ZRANGEBYLEX", key, min_b, max_b,
+            "LIMIT", 0, 1001,
+        ) or []
+        if len(members) > 1000:
+            return "risky", (
+                "kv_zremrangebylex %r — removes more than 1000 "
+                "members of a sorted set of %s" % (key, size)
+            )
+        removed = len(members)
+        if removed == 0:
+            return "safe", (
+                "kv_zremrangebylex %r — no-op, the range is empty"
+                % key
+            )
+        if removed >= size_value:
+            # Removing every member deletes the key outright.
+            flags = []
+            if ttl == -1:
+                flags.append(
+                    "removes every member, deleting a sorted set "
+                    "that never expires"
+                )
+            if large:
+                flags.append(
+                    "removes every member of a large sorted set (%s)"
+                    % size
+                )
+            if flags:
+                return "risky", (
+                    "kv_zremrangebylex %r — %s" % (key, "; ".join(flags))
+                )
+            return "caution", (
+                "kv_zremrangebylex %r — removes every member of a "
+                "sorted set of %s that %s"
+                % (key, size, ttl_text)
+            )
+        return "caution", (
+            "kv_zremrangebylex %r — removes %d of %d members"
             % (key, removed, size_value)
         )
     # kv_expire on an existing key.
