@@ -167,6 +167,39 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_hdel",
+        "description": "Remove fields from a hash: HDEL key field [field ...]. Takes `fields` as a list of field names. Returns the number of fields actually removed (removing a field that is not present counts 0). Removing the last field deletes the key, as in Redis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "fields"],
+        },
+    },
+    {
+        "name": "kv_hexists",
+        "description": "Test whether a field exists in a hash: HEXISTS key field. Returns 1 if the field is present, 0 if it is not or the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "field": {"type": "string"},
+            },
+            "required": ["key", "field"],
+        },
+    },
+    {
+        "name": "kv_hlen",
+        "description": "The number of fields in a hash: HLEN key. Returns 0 when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -419,7 +452,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -437,7 +470,9 @@ TOOLS = [
                             "by": {"type": "integer"},
                             "seconds": {"type": "integer"},
                             "field": {"type": "string"},
-                            "fields": {"type": "object"},
+                            # `fields` is an object for kv_hset and a list
+                            # of field names for kv_hdel.
+                            "fields": {"type": ["object", "array"]},
                             "members": {"type": ["object", "array"]},
                             "member": {"type": "string"},
                             "increment": {"type": "number"},
@@ -520,7 +555,7 @@ def call_tool(client, name, args):
 BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
-    "kv_hset", "kv_hget", "kv_hgetall",
+    "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
@@ -593,7 +628,7 @@ def _call_batch(client, args):
 ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
-    "kv_hset", "kv_hget", "kv_hgetall",
+    "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
@@ -891,6 +926,12 @@ def _op_argv(name, args):
         return ["HGET", _require(args, "key"), _require(args, "field")]
     if name == "kv_hgetall":
         return ["HGETALL", _require(args, "key")]
+    if name == "kv_hdel":
+        return ["HDEL", _require(args, "key")] + _hash_fields_args(args, name)
+    if name == "kv_hexists":
+        return ["HEXISTS", _require(args, "key"), _require(args, "field")]
+    if name == "kv_hlen":
+        return ["HLEN", _require(args, "key")]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -1009,6 +1050,19 @@ def _hgetall_result(flat):
     """Shape a flat HGETALL reply [field, value, ...] into a dict.
     A missing key replies as an empty list, which becomes {}."""
     return {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+
+
+def _hash_fields_args(args, name):
+    """The field names for an HDEL, as an argv list. `fields` must
+    be a non-empty list of strings; anything else fails the call
+    instead of sending a half-formed HDEL."""
+    fields = args.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise ValueError("%s fields must be a non-empty list" % name)
+    for field in fields:
+        if not isinstance(field, str):
+            raise ValueError("%s fields must be strings" % name)
+    return list(fields)
 
 
 # The most members one kv_zrange call returns; a wider range fails

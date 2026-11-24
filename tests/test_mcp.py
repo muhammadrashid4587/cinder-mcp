@@ -2,7 +2,7 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -307,6 +307,30 @@ class FakeCinder(threading.Thread):
                         "wrong kind of value\r\n")
             flat = [x for pair in value.items() for x in pair]
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name == "HDEL" and len(args) >= 2:
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            removed = 0
+            for field in args[1:]:
+                if field in value:
+                    removed += 1
+                value.pop(field, None)
+            if not value:
+                # A hash emptied by removing is gone, as in Redis.
+                del self.store[args[0]]
+            return ":%d\r\n" % removed
+        elif name == "HEXISTS" and len(args) == 2:
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return ":1\r\n" if args[1] in value else ":0\r\n"
         elif name == "ZADD" and len(args) >= 3:
             # Options come after the key and before the first score,
             # as in cinder 0.25.0: NX | XX | GT | LT | CH | INCR.
@@ -753,6 +777,7 @@ class McpTests(unittest.TestCase):
                     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire",
                     "kv_pexpire",
                     "kv_hset", "kv_hget", "kv_hgetall",
+                    "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
@@ -1531,6 +1556,162 @@ class McpTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 2)
         self.assertEqual(summary["results"][0]["result"], 1)
         self.assertEqual(summary["results"][1]["result"], {"x": "9"})
+
+    def test_tools_call_hash_delete_exists_and_length(self):
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "user:1",
+                          "fields": {"name": "mo", "city": "philly",
+                                     "age": "24"}},
+        })
+        # A present field exists, an absent one does not, and the
+        # hash holds three fields.
+        present = self._call("tools/call", 2, {
+            "name": "kv_hexists",
+            "arguments": {"key": "user:1", "field": "city"},
+        })
+        self.assertEqual(present["result"]["content"][0]["text"], "1")
+        absent = self._call("tools/call", 3, {
+            "name": "kv_hexists",
+            "arguments": {"key": "user:1", "field": "nope"},
+        })
+        self.assertEqual(absent["result"]["content"][0]["text"], "0")
+        length = self._call("tools/call", 4, {
+            "name": "kv_hlen", "arguments": {"key": "user:1"},
+        })
+        self.assertEqual(length["result"]["content"][0]["text"], "3")
+        # Removing a present field counts 1 for it; a field that is
+        # not present counts 0, and the rest still remove.
+        removed = self._call("tools/call", 5, {
+            "name": "kv_hdel",
+            "arguments": {"key": "user:1",
+                          "fields": ["city", "ghost"]},
+        })
+        self.assertEqual(removed["result"]["content"][0]["text"], "1")
+        gone = self._call("tools/call", 6, {
+            "name": "kv_hexists",
+            "arguments": {"key": "user:1", "field": "city"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        shorter = self._call("tools/call", 7, {
+            "name": "kv_hlen", "arguments": {"key": "user:1"},
+        })
+        self.assertEqual(shorter["result"]["content"][0]["text"], "2")
+        # Deleting from a missing key removes 0, and membership and
+        # length on a missing key are 0.
+        ghost_removed = self._call("tools/call", 8, {
+            "name": "kv_hdel",
+            "arguments": {"key": "ghost", "fields": ["a"]},
+        })
+        self.assertEqual(ghost_removed["result"]["content"][0]["text"], "0")
+        ghost_exists = self._call("tools/call", 9, {
+            "name": "kv_hexists",
+            "arguments": {"key": "ghost", "field": "a"},
+        })
+        self.assertEqual(ghost_exists["result"]["content"][0]["text"], "0")
+        ghost_len = self._call("tools/call", 10, {
+            "name": "kv_hlen", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost_len["result"]["content"][0]["text"], "0")
+        # Removing the last field deletes the key, as in Redis.
+        last = self._call("tools/call", 11, {
+            "name": "kv_hdel",
+            "arguments": {"key": "user:1", "fields": ["name", "age"]},
+        })
+        self.assertEqual(last["result"]["content"][0]["text"], "2")
+        gone_key = self._call("tools/call", 12, {
+            "name": "kv_exists", "arguments": {"key": "user:1"},
+        })
+        self.assertEqual(gone_key["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_hash_delete_tools_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_hdel", "arguments": {"key": "h"}},
+            {"name": "kv_hdel", "arguments": {"fields": ["a"]}},
+            {"name": "kv_hdel",
+             "arguments": {"key": "h", "fields": []}},
+            {"name": "kv_hdel",
+             "arguments": {"key": "h", "fields": "a"}},
+            {"name": "kv_hdel",
+             "arguments": {"key": "h", "fields": ["a", 7]}},
+            {"name": "kv_hexists", "arguments": {"key": "h"}},
+            {"name": "kv_hexists", "arguments": {"field": "a"}},
+            {"name": "kv_hexists", "arguments": {}},
+            {"name": "kv_hlen", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_hash_delete_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for i, call in enumerate([
+            {"name": "kv_hdel",
+             "arguments": {"key": "plain", "fields": ["f"]}},
+            {"name": "kv_hexists",
+             "arguments": {"key": "plain", "field": "f"}},
+            {"name": "kv_hlen", "arguments": {"key": "plain"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_hash_delete_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_hset", "key": "h",
+                 "fields": {"a": "1", "b": "2", "c": "3"}},
+                {"op": "kv_hexists", "key": "h", "field": "b"},
+                {"op": "kv_hdel", "key": "h",
+                 "fields": ["b", "ghost"]},
+                {"op": "kv_hexists", "key": "h", "field": "b"},
+                {"op": "kv_hlen", "key": "h"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        self.assertEqual(summary["results"][4]["result"], 2)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h2",
+                 "fields": {"x": "9", "y": "8"}},
+                {"op": "kv_hexists", "key": "h2", "field": "x"},
+                {"op": "kv_hdel", "key": "h2", "fields": ["x"]},
+                {"op": "kv_hlen", "key": "h2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        # Bad hash arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h3",
+                 "fields": {"a": "1"}},
+                {"op": "kv_hdel", "key": "h3", "fields": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "h3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
     def test_tools_call_list_push_range_len_pop(self):
         pushed = self._call("tools/call", 1, {
