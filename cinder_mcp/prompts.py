@@ -127,6 +127,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
     "kv_lset", "kv_linsert",
+    "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
                          "kv_strlen", "kv_hscan", "kv_hkeys", "kv_hvals",
@@ -245,7 +246,10 @@ PROMPTS = [
             "would fail on a non-float field or a container, "
             "HSETNXes that would fail on a container, APPENDs that "
             "would fail, GETEXes that would change or remove a TTL, "
-            "ZPOPs that would drain a sorted set, and EXPIREs with "
+            "ZPOPs that would drain a sorted set, LPUSHXes and "
+            "RPUSHXes that would fail on a container, LTRIMs that "
+            "would delete a list outright, LMOVEs that would fail "
+            "on a container or drain a source list, and EXPIREs with "
             "a bad timeout, and give a go/no-go per risky op."
         ),
         "arguments": [
@@ -1025,6 +1029,78 @@ def _linsert_audit_args(op):
     return where.lower()
 
 
+def _lpushx_audit_elements(op):
+    """The elements for a kv_lpushx / kv_rpushx op in a write plan,
+    validated like the tool's own argument: a non-empty list of
+    strings. Anything else raises ValueError, so the caller reports
+    the op as not audited instead of guessing."""
+    name = op.get("op")
+    elements = op.get("elements")
+    if not isinstance(elements, list) or not elements:
+        raise ValueError(
+            "%s elements must be a non-empty list: %r" % (name, elements)
+        )
+    for element in elements:
+        if not isinstance(element, str):
+            raise ValueError(
+                "%s elements must be strings: %r" % (name, elements)
+            )
+    return elements
+
+
+def _ltrim_audit_args(op):
+    """The start and stop for a kv_ltrim op in a write plan,
+    validated like the tool's own arguments: both must be integers.
+    Anything else raises ValueError, so the caller reports the op
+    as not audited instead of guessing."""
+    start = op.get("start")
+    if start is None:
+        raise ValueError("kv_ltrim is missing start: %r" % (op,))
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError(
+            "kv_ltrim start is not an integer: %r" % (start,)
+        )
+    stop = op.get("stop")
+    if stop is None:
+        raise ValueError("kv_ltrim is missing stop: %r" % (op,))
+    if isinstance(stop, bool) or not isinstance(stop, int):
+        raise ValueError(
+            "kv_ltrim stop is not an integer: %r" % (stop,)
+        )
+    return start, stop
+
+
+def _lmove_audit_args(op):
+    """The source, destination, and sides for a kv_lmove op in a
+    write plan, validated like the tool's own arguments: `from`
+    and `to` are "left" or "right" in any case. Anything else
+    raises ValueError, so the caller reports the op as not audited
+    instead of guessing."""
+    source = op.get("source")
+    if not isinstance(source, str):
+        raise ValueError(
+            "kv_lmove source must be a string: %r" % (source,)
+        )
+    destination = op.get("destination")
+    if not isinstance(destination, str):
+        raise ValueError(
+            "kv_lmove destination must be a string: %r" % (destination,)
+        )
+    from_side = op.get("from")
+    if not isinstance(from_side, str) \
+            or from_side.lower() not in ("left", "right"):
+        raise ValueError(
+            "kv_lmove from must be \"left\" or \"right\": %r" % (from_side,)
+        )
+    to_side = op.get("to")
+    if not isinstance(to_side, str) \
+            or to_side.lower() not in ("left", "right"):
+        raise ValueError(
+            "kv_lmove to must be \"left\" or \"right\": %r" % (to_side,)
+        )
+    return source, destination, from_side.lower(), to_side.lower()
+
+
 def _is_float(text):
     """True when `text` parses as a finite float. Cinder's float
     parser accepts "inf" as a value, but adding anything to it
@@ -1172,6 +1248,87 @@ def _audit_mset(client, op):
     )
 
 
+def _audit_lmove(client, op):
+    """Audit one kv_lmove op: the source and the destination are
+    both probed live, because the move reads the source, writes the
+    destination, and deletes the source when its last element
+    leaves. Cinder errors on a wrong-type destination before
+    touching the source, and a missing source moves nothing, so
+    both are checked in that order. Returns (verdict, line)."""
+    source, destination, _from, _to = _lmove_audit_args(op)
+    if client.command("EXISTS", source) == 0:
+        return "safe", (
+            "kv_lmove %r — no-op, the source key does not exist"
+            % source
+        )
+    ttl = client.command("TTL", source)
+    if ttl == -2:
+        return "safe", (
+            "kv_lmove %r — no-op, the source expired while auditing"
+            % source
+        )
+    try:
+        kind, size_value, size, _sample = _inspect_key(client, source)
+    except ValueError:
+        return "safe", (
+            "kv_lmove %r — no-op, the source expired while auditing"
+            % source
+        )
+    if kind != "list":
+        return "risky", (
+            "kv_lmove %r — would fail with WRONGTYPE: the source is "
+            "a %s of %s" % (source, kind, size)
+        )
+    dest_exists = client.command("EXISTS", destination) != 0
+    dest_text = "into %r" % destination
+    if dest_exists:
+        try:
+            dest_kind, _dv, dest_size, _ds = _inspect_key(
+                client, destination)
+        except ValueError:
+            # The destination expired while auditing; the move
+            # creates it.
+            dest_exists = False
+            dest_text = "creating %r" % destination
+        else:
+            if dest_kind != "list":
+                return "risky", (
+                    "kv_lmove %r — would fail with WRONGTYPE: the "
+                    "destination %r is a %s of %s"
+                    % (source, destination, dest_kind, dest_size)
+                )
+    else:
+        dest_text = "creating %r" % destination
+    if source == destination:
+        # A move within one key is a rotation: the element stays
+        # in the same list, so nothing is added or removed.
+        return "safe", (
+            "kv_lmove %r — rotates one element within the list; "
+            "nothing is added or removed" % source
+        )
+    if size_value <= 1:
+        # The only element leaves: the source key is deleted.
+        if ttl == -1:
+            return "risky", (
+                "kv_lmove %r — moves the only element out of a list "
+                "that never expires, deleting the key" % source
+            )
+        return "caution", (
+            "kv_lmove %r — moves the only element out, deleting the "
+            "source key" % source
+        )
+    if ttl == -1:
+        return "caution", (
+            "kv_lmove %r — moves one element from a list of %s that "
+            "never expires, %s" % (source, size, dest_text)
+        )
+    return "safe", (
+        "kv_lmove %r — moves one element from a list of %s that %s, "
+        "%s" % (source, size,
+                "expires in %s" % _format_ttl(ttl), dest_text)
+    )
+
+
 def _audit_write_op(client, op):
     """Audit one write op from a write plan against the live
     keyspace. Returns (verdict, line) where verdict is "safe",
@@ -1191,7 +1348,11 @@ def _audit_write_op(client, op):
     container, a HSETNX on a container, an APPEND on a
     container, a GETEX or ZPOP on a container, an LSET or LINSERT
     on a container, an LSET on a missing key or with an index out
-    of range, a ZPOP that would drain a never-expiring or large
+    of range, an LPUSHX or RPUSHX on a container, an LTRIM that
+    would delete a never-expiring or large list outright, an
+    LMOVE out of a container, into a container, or that would
+    delete a never-expiring source by taking its only element,
+    a ZPOP that would drain a never-expiring or large
     sorted set, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
@@ -1201,7 +1362,12 @@ def _audit_write_op(client, op):
     never expires, a GETEX that gives a never-expiring key an
     expiry or removes one, a ZPOP that takes some but not all
     members, an LSET that replaces one element of a list, or an
-    LINSERT that adds one element to a list. SETNX on a key that
+    LINSERT that adds one element to a list, an LPUSHX or RPUSHX
+    that adds elements to a list that never expires, an LTRIM
+    that shortens a list that never expires or deletes a list
+    that expires soon, or an LMOVE that moves one element out of
+    a list with more to spare or empties a source that expires
+    soon. SETNX on a key that
     already exists writes nothing, so it is safe, and so is HSETNX
     on a field that already exists, an LSET that writes the value
     the element already holds, and an LINSERT whose pivot is not
@@ -1209,15 +1375,23 @@ def _audit_write_op(client, op):
     INCR or DECR on a missing key, HINCRBY on a missing key or a
     missing field, HINCRBYFLOAT on a missing key or a missing
     field, an EXPIRE on an existing key, a GETEX that
-    only reads a value, or a no-op on a missing key.
+    only reads a value, an LPUSHX, RPUSHX, or LTRIM on a missing
+    key, an LMOVE out of a missing key or within one key, or a
+    no-op on a missing key.
     kv_mset has no single key — it writes several at once — so it
-    is audited by _audit_mset instead of the single-key flow below."""
+    is audited by _audit_mset instead of the single-key flow below.
+    kv_lmove has two keys — a source and a destination — so it is
+    audited by _audit_lmove instead."""
     name = op.get("op")
     if name not in WRITE_SAFETY_WRITE_OPS:
         raise ValueError("not a write op: %s" % name)
     if name == "kv_mset":
         # MSET writes several keys at once and has no single key.
         return _audit_mset(client, op)
+    if name == "kv_lmove":
+        # LMOVE writes two keys at once — a source and a
+        # destination — so it is audited on its own.
+        return _audit_lmove(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))
@@ -1382,6 +1556,20 @@ def _audit_write_op(client, op):
             _linsert_audit_args(op)
             return "safe", (
                 "kv_linsert %r — no-op, the key does not exist" % key
+            )
+        if name in ("kv_lpushx", "kv_rpushx"):
+            # LPUSHX/RPUSHX on a missing key answers 0 and never
+            # creates the list, as in Redis.
+            _lpushx_audit_elements(op)
+            return "safe", (
+                "%s %r — no-op, the key does not exist" % (name, key)
+            )
+        if name == "kv_ltrim":
+            # LTRIM on a missing key answers OK and changes
+            # nothing, as in Redis.
+            _ltrim_audit_args(op)
+            return "safe", (
+                "kv_ltrim %r — no-op, the key does not exist" % key
             )
         # kv_expire on a missing key.
         seconds = op.get("seconds")
@@ -1780,6 +1968,71 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_linsert %r — inserts an element %s the pivot in a "
             "list of %s that %s" % (key, where, size, ttl_text)
+        )
+    if name in ("kv_lpushx", "kv_rpushx"):
+        elements = _lpushx_audit_elements(op)
+        if kind != "list":
+            return "risky", (
+                "%s %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (name, key, kind, size)
+            )
+        if ttl == -1:
+            return "caution", (
+                "%s %r — adds %d element(s) to a list that never "
+                "expires" % (name, key, len(elements))
+            )
+        return "safe", (
+            "%s %r — adds %d element(s) to a list of %s that %s"
+            % (name, key, len(elements), size, ttl_text)
+        )
+    if name == "kv_ltrim":
+        start, stop = _ltrim_audit_args(op)
+        if kind != "list":
+            return "risky", (
+                "kv_ltrim %r — would fail with WRONGTYPE: the key "
+                "is a %s of %s" % (key, kind, size)
+            )
+        # Resolve the range like cinder does: negative bounds count
+        # from the end, then clamp to the list.
+        lo = start if start >= 0 else start + size_value
+        hi = stop if stop >= 0 else stop + size_value
+        if lo < 0:
+            lo = 0
+        if hi >= size_value:
+            hi = size_value - 1
+        if lo > hi or lo >= size_value:
+            # An empty range deletes the key, as in Redis.
+            flags = []
+            if ttl == -1:
+                flags.append(
+                    "trims away the whole list, deleting a key "
+                    "that never expires"
+                )
+            if large:
+                flags.append(
+                    "trims away a large list (%s)" % size
+                )
+            if flags:
+                return "risky", "kv_ltrim %r — %s" % (key, "; ".join(flags))
+            return "caution", (
+                "kv_ltrim %r — trims away the whole list, deleting "
+                "the key" % key
+            )
+        kept = hi - lo + 1
+        if kept == size_value:
+            # The range keeps the whole list: nothing changes.
+            return "safe", (
+                "kv_ltrim %r — no-op, the range keeps the whole list"
+                % key
+            )
+        if ttl == -1:
+            return "caution", (
+                "kv_ltrim %r — trims a list that never expires from "
+                "%s to %d elements" % (key, size, kept)
+            )
+        return "safe", (
+            "kv_ltrim %r — trims a list of %s that %s to %d elements"
+            % (key, size, ttl_text, kept)
         )
     if name in ("kv_zpopmin", "kv_zpopmax"):
         count = op.get("count", 1)

@@ -3,7 +3,7 @@
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -382,6 +382,90 @@ class FakeCinder(threading.Thread):
                 pos += 1
             value.insert(pos, args[3])
             return ":%d\r\n" % len(value)
+        elif name in ("LPUSHX", "RPUSHX") and len(args) >= 2:
+            # Unlike LPUSH/RPUSH, a missing key is 0 and the list
+            # is never created.
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            for element in args[1:]:
+                if name == "LPUSHX":
+                    value.insert(0, element)
+                else:
+                    value.append(element)
+            return ":%d\r\n" % len(value)
+        elif name == "LTRIM" and len(args) == 3:
+            value = self._get(args[0])
+            if value is None:
+                return "+OK\r\n"
+            if not isinstance(value, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            start, stop = int(args[1]), int(args[2])
+            n = len(value)
+            if start < 0:
+                start += n
+            if stop < 0:
+                stop += n
+            if start < 0:
+                start = 0
+            if stop >= n:
+                stop = n - 1
+            if start > stop or start >= n:
+                # An empty range deletes the key, as in real cinder.
+                del self.store[args[0]]
+            else:
+                self.store[args[0]] = (
+                    value[start:stop + 1], self.store[args[0]][1])
+            return "+OK\r\n"
+        elif name == "LMOVE" and len(args) == 4:
+            if args[2].upper() not in ("LEFT", "RIGHT") \
+                    or args[3].upper() not in ("LEFT", "RIGHT"):
+                return "-ERR syntax error\r\n"
+            source = self._get(args[0])
+            if source is None:
+                return self._bulk(None)
+            if not isinstance(source, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if not source:
+                return self._bulk(None)
+            if args[0] == args[1]:
+                # Same key: a rotation within the list, so the
+                # element never leaves it and the key is never
+                # deleted, even for a one-element list.
+                element = source.pop(0) if args[2].upper() == "LEFT" \
+                    else source.pop()
+                if args[3].upper() == "LEFT":
+                    source.insert(0, element)
+                else:
+                    source.append(element)
+                return self._bulk(element)
+            dest = self._get(args[1])
+            if dest is not None and not isinstance(dest, list):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            # Cinder pushes onto the destination first, so a
+            # wrong-type destination errors before the source is
+            # touched; the pop below only runs once the push would
+            # succeed. With source and destination the same key
+            # this is a rotation.
+            element = source.pop(0) if args[2].upper() == "LEFT" \
+                else source.pop()
+            if not source:
+                # A list emptied by the move is gone, as in Redis.
+                del self.store[args[0]]
+            if dest is None:
+                dest = []
+                self.store[args[1]] = (dest, None)
+            if args[3].upper() == "LEFT":
+                dest.insert(0, element)
+            else:
+                dest.append(element)
+            return self._bulk(element)
         elif name == "SMEMBERS" and len(args) == 1:
             return self._container_items(args[0], set)
         elif name == "SADD" and len(args) >= 2:
@@ -1181,6 +1265,7 @@ class McpTests(unittest.TestCase):
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
+                    "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
                     "kv_sadd", "kv_smembers", "kv_scard",
                     "kv_srem", "kv_sismember",
                     "kv_batch"]
@@ -3226,6 +3311,11 @@ class McpTests(unittest.TestCase):
             ("kv_lset", {"key": "plain", "index": 0, "value": "x"}),
             ("kv_linsert", {"key": "plain", "where": "before",
                             "pivot": "a", "element": "x"}),
+            ("kv_lpushx", {"key": "plain", "elements": ["a"]}),
+            ("kv_rpushx", {"key": "plain", "elements": ["a"]}),
+            ("kv_ltrim", {"key": "plain", "start": 0, "stop": -1}),
+            ("kv_lmove", {"source": "plain", "destination": "dst",
+                          "from": "left", "to": "right"}),
         ):
             reply = self._call("tools/call", 2, {
                 "name": tool, "arguments": arguments,
@@ -3438,6 +3528,226 @@ class McpTests(unittest.TestCase):
                 {"op": "kv_rpush", "key": "q3", "elements": ["a"]},
                 {"op": "kv_linsert", "key": "q3", "where": "beside",
                  "pivot": "a", "element": "x"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "q3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_list_pushx_trim_move(self):
+        self._call("tools/call", 1, {
+            "name": "kv_rpush",
+            "arguments": {"key": "queue", "elements": ["a", "b", "c"]},
+        })
+        # LPUSHX/RPUSHX push onto an existing list, in the same
+        # order LPUSH/RPUSH do, and return the new length.
+        head = self._call("tools/call", 2, {
+            "name": "kv_lpushx",
+            "arguments": {"key": "queue", "elements": ["x", "y"]},
+        })
+        self.assertEqual(head["result"]["content"][0]["text"], "5")
+        tail = self._call("tools/call", 3, {
+            "name": "kv_rpushx",
+            "arguments": {"key": "queue", "elements": ["d"]},
+        })
+        self.assertEqual(tail["result"]["content"][0]["text"], "6")
+        whole = self._call("tools/call", 4, {
+            "name": "kv_lrange", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(
+            json.loads(whole["result"]["content"][0]["text"]),
+            ["y", "x", "a", "b", "c", "d"],
+        )
+        # Pushing onto a missing key is 0 and creates nothing.
+        ghost = self._call("tools/call", 5, {
+            "name": "kv_lpushx",
+            "arguments": {"key": "ghost", "elements": ["z"]},
+        })
+        self.assertEqual(ghost["result"]["content"][0]["text"], "0")
+        exists = self._call("tools/call", 6, {
+            "name": "kv_exists", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+        # LTRIM keeps the range, with negative indices from the end.
+        trimmed = self._call("tools/call", 7, {
+            "name": "kv_ltrim",
+            "arguments": {"key": "queue", "start": 1, "stop": -2},
+        })
+        self.assertEqual(trimmed["result"]["content"][0]["text"], "OK")
+        kept = self._call("tools/call", 8, {
+            "name": "kv_lrange", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(
+            json.loads(kept["result"]["content"][0]["text"]),
+            ["x", "a", "b", "c"],
+        )
+        # A range that keeps nothing deletes the key; a missing
+        # key is a no-op that still returns OK.
+        emptied = self._call("tools/call", 9, {
+            "name": "kv_ltrim",
+            "arguments": {"key": "queue", "start": 5, "stop": 9},
+        })
+        self.assertEqual(emptied["result"]["content"][0]["text"], "OK")
+        gone = self._call("tools/call", 10, {
+            "name": "kv_exists", "arguments": {"key": "queue"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        no_list = self._call("tools/call", 11, {
+            "name": "kv_ltrim",
+            "arguments": {"key": "ghost", "start": 0, "stop": -1},
+        })
+        self.assertEqual(no_list["result"]["content"][0]["text"], "OK")
+        # LMOVE moves one element between lists, creating the
+        # destination when it does not exist.
+        self._call("tools/call", 12, {
+            "name": "kv_rpush",
+            "arguments": {"key": "src", "elements": ["1", "2", "3"]},
+        })
+        moved = self._call("tools/call", 13, {
+            "name": "kv_lmove",
+            "arguments": {"source": "src", "destination": "dst",
+                          "from": "left", "to": "right"},
+        })
+        self.assertEqual(moved["result"]["content"][0]["text"], "1")
+        after = self._call("tools/call", 14, {
+            "name": "kv_lrange", "arguments": {"key": "src"},
+        })
+        self.assertEqual(
+            json.loads(after["result"]["content"][0]["text"]), ["2", "3"])
+        dst = self._call("tools/call", 15, {
+            "name": "kv_lrange", "arguments": {"key": "dst"},
+        })
+        self.assertEqual(
+            json.loads(dst["result"]["content"][0]["text"]), ["1"])
+        # Right to left, into an existing list.
+        moved2 = self._call("tools/call", 16, {
+            "name": "kv_lmove",
+            "arguments": {"source": "src", "destination": "dst",
+                          "from": "RIGHT", "to": "LEFT"},
+        })
+        self.assertEqual(moved2["result"]["content"][0]["text"], "3")
+        dst2 = self._call("tools/call", 17, {
+            "name": "kv_lrange", "arguments": {"key": "dst"},
+        })
+        self.assertEqual(
+            json.loads(dst2["result"]["content"][0]["text"]), ["3", "1"])
+        # Moving the last element out deletes the source key.
+        last = self._call("tools/call", 18, {
+            "name": "kv_lmove",
+            "arguments": {"source": "src", "destination": "dst",
+                          "from": "left", "to": "right"},
+        })
+        self.assertEqual(last["result"]["content"][0]["text"], "2")
+        gone_src = self._call("tools/call", 19, {
+            "name": "kv_exists", "arguments": {"key": "src"},
+        })
+        self.assertEqual(gone_src["result"]["content"][0]["text"], "0")
+        # A missing source moves nothing (null).
+        no_src = self._call("tools/call", 20, {
+            "name": "kv_lmove",
+            "arguments": {"source": "ghost", "destination": "dst",
+                          "from": "left", "to": "right"},
+        })
+        self.assertEqual(no_src["result"]["content"][0]["text"], "null")
+        # Same key rotates the element within the list.
+        rotated = self._call("tools/call", 21, {
+            "name": "kv_lmove",
+            "arguments": {"source": "dst", "destination": "dst",
+                          "from": "left", "to": "right"},
+        })
+        self.assertEqual(rotated["result"]["content"][0]["text"], "3")
+        rot = self._call("tools/call", 22, {
+            "name": "kv_lrange", "arguments": {"key": "dst"},
+        })
+        self.assertEqual(
+            json.loads(rot["result"]["content"][0]["text"]),
+            ["1", "2", "3"])
+
+    def test_tools_call_list_pushx_trim_move_rejects_bad_arguments(self):
+        for i, call in enumerate([
+            {"name": "kv_lpushx",
+             "arguments": {"key": "q", "elements": []}},
+            {"name": "kv_lpushx",
+             "arguments": {"key": "q", "elements": [7]}},
+            {"name": "kv_rpushx",
+             "arguments": {"key": "q", "elements": "a"}},
+            {"name": "kv_ltrim",
+             "arguments": {"key": "q", "start": 0}},
+            {"name": "kv_ltrim",
+             "arguments": {"key": "q", "start": "0", "stop": -1}},
+            {"name": "kv_ltrim",
+             "arguments": {"key": "q", "start": 0, "stop": 1.5}},
+            {"name": "kv_lmove",
+             "arguments": {"source": "a", "destination": "b",
+                           "from": "up", "to": "right"}},
+            {"name": "kv_lmove",
+             "arguments": {"source": "a", "destination": "b",
+                           "from": "left", "to": "down"}},
+            {"name": "kv_lmove",
+             "arguments": {"source": "a", "destination": "b",
+                           "from": "left"}},
+            {"name": "kv_lmove",
+             "arguments": {"destination": "b", "from": "left",
+                           "to": "right"}},
+        ]):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_list_pushx_trim_move_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_rpush", "key": "q",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_lpushx", "key": "q", "elements": ["z"]},
+                {"op": "kv_rpushx", "key": "q", "elements": ["d"]},
+                {"op": "kv_ltrim", "key": "q", "start": 0, "stop": 2},
+                {"op": "kv_lmove", "source": "q", "destination": "r",
+                 "from": "left", "to": "right"},
+                {"op": "kv_lrange", "key": "q"},
+                {"op": "kv_lrange", "key": "r"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 7)
+        self.assertEqual(summary["results"][1]["result"], 4)
+        self.assertEqual(summary["results"][2]["result"], 5)
+        self.assertEqual(summary["results"][3]["result"], "OK")
+        self.assertEqual(summary["results"][4]["result"], "z")
+        self.assertEqual(summary["results"][5]["result"], ["a", "b"])
+        self.assertEqual(summary["results"][6]["result"], ["z"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_rpush", "key": "q2",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_lpushx", "key": "q2", "elements": ["z"]},
+                {"op": "kv_ltrim", "key": "q2", "start": 0, "stop": 1},
+                {"op": "kv_lmove", "source": "q2", "destination": "r2",
+                 "from": "right", "to": "left"},
+                {"op": "kv_lrange", "key": "q2"},
+                {"op": "kv_lrange", "key": "r2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 6)
+        self.assertEqual(summary["results"][1]["result"], 4)
+        self.assertEqual(summary["results"][2]["result"], "OK")
+        self.assertEqual(summary["results"][3]["result"], "a")
+        self.assertEqual(summary["results"][4]["result"], ["z"])
+        self.assertEqual(summary["results"][5]["result"], ["a"])
+        # A bad side fails an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_rpush", "key": "q3", "elements": ["a"]},
+                {"op": "kv_lmove", "source": "q3", "destination": "r3",
+                 "from": "up", "to": "right"},
             ]},
         })
         self.assertIn("error", bad)
@@ -5953,6 +6263,152 @@ class McpTests(unittest.TestCase):
         self.assertIn(
             "op 9: kv_linsert 'soon-list' — inserts an element after "
             "the pivot in a list of 2 elements that expires in ",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_pushx_trim_move_ops(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        self.fake.store["soon-list"] = (["a", "b"], time.time() + 3600)
+        self.fake.store["solo"] = (["only"], None)
+        self.fake.store["soon-solo"] = (["only"], time.time() + 3600)
+        plan = [
+            {"op": "kv_lpushx", "key": "todo", "elements": ["x"]},
+            {"op": "kv_rpushx", "key": "soon-list",
+             "elements": ["c"]},
+            {"op": "kv_lpushx", "key": "ghost", "elements": ["x"]},
+            {"op": "kv_lpushx", "key": "plain", "elements": ["x"]},
+            {"op": "kv_rpushx", "key": "todo", "elements": []},
+            {"op": "kv_ltrim", "key": "todo", "start": 0, "stop": 0},
+            {"op": "kv_ltrim", "key": "todo", "start": 0, "stop": -1},
+            {"op": "kv_ltrim", "key": "todo", "start": 5, "stop": 9},
+            {"op": "kv_ltrim", "key": "soon-list",
+             "start": 5, "stop": 9},
+            {"op": "kv_ltrim", "key": "ghost", "start": 0, "stop": -1},
+            {"op": "kv_ltrim", "key": "plain", "start": 0, "stop": -1},
+            {"op": "kv_ltrim", "key": "todo",
+             "start": "0", "stop": -1},
+            {"op": "kv_lmove", "source": "todo",
+             "destination": "soon-list", "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "soon-list",
+             "destination": "new-list", "from": "right", "to": "left"},
+            {"op": "kv_lmove", "source": "solo", "destination": "dst",
+             "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "soon-solo",
+             "destination": "dst", "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "todo", "destination": "todo",
+             "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "ghost", "destination": "dst",
+             "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "plain", "destination": "dst",
+             "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "todo", "destination": "plain",
+             "from": "left", "to": "right"},
+            {"op": "kv_lmove", "source": "todo", "destination": "dst",
+             "from": "up", "to": "right"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 21 op(s), 18 audited, 3 not audited.", text)
+        self.assertIn(
+            "op 4: kv_rpushx elements must be a non-empty list: []",
+            text)
+        self.assertIn(
+            "op 11: kv_ltrim start is not an integer: '0'", text)
+        self.assertIn(
+            "op 20: kv_lmove from must be \"left\" or \"right\": 'up'",
+            text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_lpushx 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 7: kv_ltrim 'todo' — trims away the whole list, "
+            "deleting a key that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 10: kv_ltrim 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_lmove 'solo' — moves the only element out "
+            "of a list that never expires, deleting the key",
+            risky,
+        )
+        self.assertIn(
+            "op 18: kv_lmove 'plain' — would fail with WRONGTYPE: "
+            "the source is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 19: kv_lmove 'todo' — would fail with WRONGTYPE: "
+            "the destination 'plain' is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_lpushx 'todo' — adds 1 element(s) to a list "
+            "that never expires",
+            caution,
+        )
+        self.assertIn(
+            "op 5: kv_ltrim 'todo' — trims a list that never "
+            "expires from 2 elements to 1 elements",
+            caution,
+        )
+        self.assertIn(
+            "op 8: kv_ltrim 'soon-list' — trims away the whole "
+            "list, deleting the key",
+            caution,
+        )
+        self.assertIn(
+            "op 12: kv_lmove 'todo' — moves one element from a "
+            "list of 2 elements that never expires, into "
+            "'soon-list'",
+            caution,
+        )
+        self.assertIn(
+            "op 15: kv_lmove 'soon-solo' — moves the only element "
+            "out, deleting the source key",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_rpushx 'soon-list' — adds 1 element(s) to a "
+            "list of 2 elements that expires in ",
+            safe,
+        )
+        self.assertIn(
+            "op 2: kv_lpushx 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 6: kv_ltrim 'todo' — no-op, the range keeps the "
+            "whole list",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_ltrim 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 13: kv_lmove 'soon-list' — moves one element from "
+            "a list of 2 elements that expires in ",
+            safe,
+        )
+        self.assertIn(
+            "op 16: kv_lmove 'todo' — rotates one element within "
+            "the list; nothing is added or removed",
+            safe,
+        )
+        self.assertIn(
+            "op 17: kv_lmove 'ghost' — no-op, the source key does "
+            "not exist",
             safe,
         )
 

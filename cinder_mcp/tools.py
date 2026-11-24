@@ -686,6 +686,57 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_lpushx",
+        "description": "Push elements onto the head of an existing list: LPUSHX key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push, or 0 when the key does not exist — unlike kv_lpush it never creates the list. Several elements at once are pushed left one at a time, so the last element ends up at the head.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "elements": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "elements"],
+        },
+    },
+    {
+        "name": "kv_rpushx",
+        "description": "Push elements onto the tail of an existing list: RPUSHX key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push, or 0 when the key does not exist — unlike kv_rpush it never creates the list. Several elements at once are appended in order.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "elements": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "elements"],
+        },
+    },
+    {
+        "name": "kv_ltrim",
+        "description": "Trim a list to an index range: LTRIM key start stop. Negative indices count from the end, as in Redis. Returns OK. A range that keeps nothing deletes the key, as in Redis; a missing key is a no-op that still returns OK.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "start": {"type": "integer"},
+                "stop": {"type": "integer"},
+            },
+            "required": ["key", "start", "stop"],
+        },
+    },
+    {
+        "name": "kv_lmove",
+        "description": "Move one element between lists: LMOVE source destination LEFT|RIGHT LEFT|RIGHT. Takes `source` and `destination` as key names and `from` / `to` as \"left\" or \"right\". Removes the element from one end of the source and puts it at one end of the destination, creating the destination when it does not exist, and returns the moved element. Returns null when the source does not exist or is empty; moving the last element out deletes the source key, as in Redis. When source and destination are the same key the element is rotated within the list.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string"},
+                "destination": {"type": "string"},
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+            },
+            "required": ["source", "destination", "from", "to"],
+        },
+    },
+    {
         "name": "kv_sadd",
         "description": "Add members to a set: SADD key member [member ...]. Takes `members` as a list of member names. Returns the number of members that were newly added (adding a member already present returns 0 for it). Creates the set when the key does not exist.",
         "inputSchema": {
@@ -741,7 +792,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -788,6 +839,14 @@ TOOLS = [
                             "full": {"type": "boolean"},
                             "seed": {"type": "string"},
                             "elements": {"type": "array", "items": {"type": "string"}},
+                            "index": {"type": "integer"},
+                            "where": {"type": "string"},
+                            "pivot": {"type": "string"},
+                            "element": {"type": "string"},
+                            "source": {"type": "string"},
+                            "destination": {"type": "string"},
+                            "from": {"type": "string"},
+                            "to": {"type": "string"},
                             "batch_size": {"type": "integer"},
                             "cursor": {"type": "string"},
                         },
@@ -859,6 +918,7 @@ BATCHABLE_TOOLS = {
     "kv_zrandmember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
+    "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
 
@@ -939,6 +999,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zrandmember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
+    "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
 
@@ -1420,6 +1481,16 @@ def _op_argv(name, args):
     if name == "kv_linsert":
         key, where, pivot, element = _linsert_args(args)
         return ["LINSERT", key, where, pivot, element]
+    if name == "kv_lpushx":
+        return ["LPUSHX", _require(args, "key")] + _list_elements_args(args, name)
+    if name == "kv_rpushx":
+        return ["RPUSHX", _require(args, "key")] + _list_elements_args(args, name)
+    if name == "kv_ltrim":
+        key, start, stop = _ltrim_args(args)
+        return ["LTRIM", key, start, stop]
+    if name == "kv_lmove":
+        source, destination, from_side, to_side = _lmove_args(args)
+        return ["LMOVE", source, destination, from_side, to_side]
     if name == "kv_sadd":
         return ["SADD", _require(args, "key")] + _set_members_args(args, name)
     if name == "kv_smembers":
@@ -2149,6 +2220,44 @@ def _linsert_args(args):
     if not isinstance(element, str):
         raise ValueError("kv_linsert element must be a string")
     return key, where.upper(), pivot, element
+
+
+def _ltrim_args(args):
+    """Validate a kv_ltrim call: (key, start, stop). Both bounds
+    are required — cinder takes no defaults — and must be integers;
+    negative ones count from the end, as in Redis. Bad types fail
+    the call instead of sending a half-formed LTRIM."""
+    key = _require(args, "key")
+    start = _require(args, "start")
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError("kv_ltrim start must be an integer")
+    stop = _require(args, "stop")
+    if isinstance(stop, bool) or not isinstance(stop, int):
+        raise ValueError("kv_ltrim stop must be an integer")
+    return key, start, stop
+
+
+def _lmove_args(args):
+    """Validate a kv_lmove call: (source, destination, from, to).
+    `from` and `to` are "left" or "right" in any case — cinder
+    compares them case-insensitively — and are sent as LEFT or
+    RIGHT. Bad values fail the call instead of sending a
+    half-formed LMOVE."""
+    source = _require(args, "source")
+    if not isinstance(source, str):
+        raise ValueError("kv_lmove source must be a string")
+    destination = _require(args, "destination")
+    if not isinstance(destination, str):
+        raise ValueError("kv_lmove destination must be a string")
+    from_side = _require(args, "from")
+    if not isinstance(from_side, str) \
+            or from_side.lower() not in ("left", "right"):
+        raise ValueError("kv_lmove from must be \"left\" or \"right\"")
+    to_side = _require(args, "to")
+    if not isinstance(to_side, str) \
+            or to_side.lower() not in ("left", "right"):
+        raise ValueError("kv_lmove to must be \"left\" or \"right\"")
+    return source, destination, from_side.upper(), to_side.upper()
 
 
 def _lrange_args(args):
