@@ -779,6 +779,18 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zunion",
+        "description": "The union of several sorted sets: ZUNION numkeys key [key ...] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. A member in several sets appears once, with the sum of its scores, lowest score first, member name breaking ties. A missing key counts as an empty set. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The union holds at most 1000 members; a wider union fails instead of returning a truncated list. Cinder has no WEIGHTS, AGGREGATE, or STORE variants, so the tool does not offer them.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keys": {"type": "array", "items": {"type": "string"}},
+                "withscores": {"type": "boolean"},
+            },
+            "required": ["keys"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1002,7 +1014,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1134,7 +1146,7 @@ BATCHABLE_TOOLS = {
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
-    "kv_zrandmember", "kv_zscan",
+    "kv_zrandmember", "kv_zscan", "kv_zunion",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1221,7 +1233,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
-    "kv_zrandmember", "kv_zscan",
+    "kv_zrandmember", "kv_zscan", "kv_zunion",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1442,6 +1454,22 @@ def _call_batch_atomic(client, ops):
             # nils) inside the transaction; shape it like the
             # standalone tool does.
             value = _zmscore_result(reply)
+        elif op_name == "kv_zunion":
+            # ZUNION came back as a flat list inside the
+            # transaction; shape it like the standalone tool does,
+            # including the withscores member/score objects. A union
+            # wider than the cap is recorded as this op's error, in
+            # place, like an EXEC-time failure — the rest still run.
+            members = _zrange_result(reply or [],
+                                     _zunion_args(op)[1])
+            if len(members) > MAX_ZRANGE_MEMBERS:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_zunion returns at most %d members; "
+                              "the union is larger"
+                              % MAX_ZRANGE_MEMBERS})
+                continue
+            value = members
         elif op_name == "kv_zincrby":
             # ZINCRBY came back as a bulk score string inside the
             # transaction; parse it like the standalone tool does.
@@ -1789,6 +1817,12 @@ def _op_argv(name, args):
         key, pattern, batch_size, cursor, withscores = _zscan_args(args)
         cmd = ["ZSCAN", key, cursor or "0", "MATCH", pattern,
                "COUNT", batch_size]
+        if withscores:
+            cmd.append("WITHSCORES")
+        return cmd
+    if name == "kv_zunion":
+        keys, withscores = _zunion_args(args)
+        cmd = ["ZUNION", len(keys)] + list(keys)
         if withscores:
             cmd.append("WITHSCORES")
         return cmd
@@ -2595,6 +2629,63 @@ def _call_zmscore(client, args):
     return _zmscore_result(client.command(*_op_argv("kv_zmscore", args)))
 
 
+# The most keys one kv_zunion call reads; a wider call fails
+# instead of sending a half-formed ZUNION with a huge argv.
+MAX_ZUNION_KEYS = 1000
+
+
+def _zunion_args(args):
+    """Validate a kv_zunion call: (keys, withscores). `keys` must
+    be a non-empty list of string key names, at most
+    MAX_ZUNION_KEYS; `withscores` must be a boolean. Anything else
+    fails the call instead of sending a half-formed ZUNION."""
+    keys = args.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError("kv_zunion keys must be a non-empty list")
+    if len(keys) > MAX_ZUNION_KEYS:
+        raise ValueError(
+            "kv_zunion reads at most %d keys; narrow the list"
+            % MAX_ZUNION_KEYS
+        )
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError("kv_zunion keys must be strings")
+    withscores = args.get("withscores", False)
+    if not isinstance(withscores, bool):
+        raise ValueError("kv_zunion withscores must be true or false")
+    return list(keys), withscores
+
+
+def _zunion_result(flat, withscores):
+    """Shape a flat ZUNION reply into the tool's return value, a
+    list of member names in score order, or with withscores a list
+    of {"member": ..., "score": ...} objects, and fail when the
+    union holds more than MAX_ZRANGE_MEMBERS members — cinder has
+    no LIMIT for ZUNION, so the reply is checked after the fact
+    instead of asking for one member too many, as kv_zrangebyscore
+    does. The caller must union fewer or smaller sets instead of
+    getting a silently truncated list."""
+    members = _zrange_result(flat, withscores)
+    if len(members) > MAX_ZRANGE_MEMBERS:
+        raise ValueError(
+            "kv_zunion returns at most %d members; the union is larger"
+            % MAX_ZRANGE_MEMBERS
+        )
+    return members
+
+
+def _call_zunion(client, args):
+    """kv_zunion: the union of several sorted sets, a member in
+    several sets appearing once with the sum of its scores, lowest
+    score first. A missing key counts as an empty set, as in
+    cinder. The call is read-only: the sets are untouched, so the
+    audit treats it as a read op."""
+    return _zunion_result(
+        client.command(*_op_argv("kv_zunion", args)) or [],
+        _zunion_args(args)[1],
+    )
+
+
 def _call_zincrby(client, args):
     """kv_zincrby: the member's new score as a number. Cinder
     replies with the score as a bulk string."""
@@ -3222,6 +3313,8 @@ def _call_single(client, name, args):
         return _call_zscore(client, args)
     if name == "kv_zmscore":
         return _call_zmscore(client, args)
+    if name == "kv_zunion":
+        return _call_zunion(client, args)
     if name == "kv_zincrby":
         return _call_zincrby(client, args)
     if name == "kv_zrange":

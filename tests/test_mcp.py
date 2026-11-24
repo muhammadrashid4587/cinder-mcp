@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1214,6 +1214,50 @@ class FakeCinder(threading.Thread):
                            else repr(value.members[m]))
                 for m in args[1:]
             )
+        elif name == "ZUNION" and len(args) >= 2:
+            # ZUNION numkeys key [key ...] [WITHSCORES]: the union
+            # of several sorted sets, a member in several sets
+            # appearing once with the sum of its scores, lowest
+            # score first, member name breaking ties, as in real
+            # cinder. A missing key counts as an empty set; the
+            # type of every input key is checked before any set is
+            # read, so a non-sorted-set key is WRONGTYPE. There
+            # are no WEIGHTS, AGGREGATE, or STORE variants.
+            try:
+                numkeys = int(args[0])
+            except ValueError:
+                return ("-ERR at least 1 input key is needed for "
+                        "'zunion' command\r\n")
+            if numkeys < 1 or len(args) < 1 + numkeys:
+                return ("-ERR wrong number of arguments for 'zunion' "
+                        "command\r\n")
+            if len(args) == 2 + numkeys:
+                if args[1 + numkeys].upper() != "WITHSCORES":
+                    return "-ERR syntax error\r\n"
+                withscores = True
+            elif len(args) > 2 + numkeys:
+                return "-ERR syntax error\r\n"
+            else:
+                withscores = False
+            keys = args[1:1 + numkeys]
+            totals = {}
+            for key in keys:
+                value = self._get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, ZSet):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                for member, score in value.members.items():
+                    totals[member] = totals.get(member, 0.0) + score
+            ordered = sorted(totals, key=lambda m: (totals[m], m))
+            out = "*%d\r\n" % (len(ordered) * 2 if withscores
+                               else len(ordered))
+            for member in ordered:
+                out += self._bulk(member)
+                if withscores:
+                    out += self._bulk(repr(totals[member]))
+            return out
         elif name == "ZRANK" and len(args) == 2:
             value = self._get(args[0])
             if value is None:
@@ -2050,7 +2094,7 @@ class McpTests(unittest.TestCase):
                     "kv_zremrangebylex",
                     "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
-                    "kv_zrandmember", "kv_zscan",
+                    "kv_zrandmember", "kv_zscan", "kv_zunion",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -3995,6 +4039,181 @@ class McpTests(unittest.TestCase):
             "name": "kv_exists", "arguments": {"key": "z3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def _zunion_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zunion", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_zunion_returns_union_with_summed_scores(self):
+        self._seed_zset("za", 5)
+        self._seed_zset("zb", 5)
+        # A member in both sets appears once, with the sum of its
+        # scores; the union is ordered lowest score first. za holds
+        # m:000..m:004 at 0..4 and zb the same members at 0..4, so
+        # every member scores double.
+        self.assertEqual(
+            self._zunion_result({"keys": ["za", "zb"]}),
+            ["m:%03d" % i for i in range(5)])
+        self.assertEqual(
+            self._zunion_result({"keys": ["za", "zb"],
+                                 "withscores": True}),
+            [{"member": "m:%03d" % i, "score": float(2 * i)}
+             for i in range(5)])
+        # Scores that only overlap on some members: seed two sets
+        # with different members and check the sums and the order.
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "u1",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_zadd",
+            "arguments": {"key": "u2",
+                          "members": {"b": 10, "d": 20}},
+        })
+        self.assertEqual(
+            self._zunion_result({"keys": ["u1", "u2"],
+                                 "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0},
+             {"member": "b", "score": 12.0},
+             {"member": "d", "score": 20.0}])
+        # A missing key counts as an empty set, and a union of
+        # only missing keys is empty.
+        self.assertEqual(
+            self._zunion_result({"keys": ["u1", "ghost"],
+                                 "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        self.assertEqual(
+            self._zunion_result({"keys": ["ghost", "alsogone"]}), [])
+        self.assertEqual(
+            self._zunion_result({"keys": ["ghost"],
+                                 "withscores": True}), [])
+        # One key unions with itself: the same members, in score
+        # order.
+        self.assertEqual(
+            self._zunion_result({"keys": ["u1"]}),
+            ["a", "b", "c"])
+
+    def test_kv_zunion_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"keys": []}, {"keys": "z"}, {"keys": [1]},
+                    {"keys": ["z", 2]},
+                    {"keys": ["z"] * 1001},
+                    {"keys": ["z"], "withscores": "yes"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zunion",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zunion", "arguments": {},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_kv_zunion_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zunion",
+            "arguments": {"keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_zunion_union_wider_than_cap_fails(self):
+        self._seed_zset("big", 1001)
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zunion", "arguments": {"keys": ["big"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # Exactly 1000 members still comes back whole.
+        self._seed_zset("edge", 1000)
+        self.assertEqual(
+            len(self._zunion_result({"keys": ["edge"]})), 1000)
+
+    def test_kv_zunion_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zunion", "keys": ["z", "ghost"],
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"],
+                         [{"member": "m:%03d" % i, "score": float(i)}
+                          for i in range(5)])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zunion", "keys": ["z2", "z"],
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        # a, b, c score 1, 2, 3 in z2 and are not in z; the union
+        # is ordered lowest score first, with the member name
+        # breaking ties, so "a" sorts before "m:001" at score 1.
+        self.assertEqual(summary["results"][1]["result"],
+                         [{"member": "m:000", "score": 0.0},
+                          {"member": "a", "score": 1.0},
+                          {"member": "m:001", "score": 1.0},
+                          {"member": "b", "score": 2.0},
+                          {"member": "m:002", "score": 2.0},
+                          {"member": "c", "score": 3.0},
+                          {"member": "m:003", "score": 3.0},
+                          {"member": "m:004", "score": 4.0}])
+        # Bad zunion arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zunion", "keys": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "z3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # A union wider than the cap inside an atomic batch is
+        # recorded as that op's error, in place, and the rest
+        # still run.
+        self._seed_zset("big", 1001)
+        wide = self._call("tools/call", 5, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zunion", "keys": ["big"]},
+                {"op": "kv_zcard", "key": "big"},
+            ]},
+        })
+        summary = json.loads(wide["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("at most 1000 members",
+                      summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 1001)
 
     def test_tools_call_string_mget_mset_getdel_setnx_setex_getset(self):
         # MSET sets several keys at once; MGET reads them back in
@@ -8733,9 +8952,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_sscan", "key": "a"},
             {"op": "kv_zmscore", "key": "a", "members": ["m"]},
             {"op": "kv_dbsize"},
+            {"op": "kv_zunion", "keys": ["a", "b"]},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 15 op(s), 1 audited, 14 not audited.", text)
+        self.assertIn("Plan: 16 op(s), 1 audited, 15 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -8750,6 +8970,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 12: kv_sscan is a read, not a write", text)
         self.assertIn("op 13: kv_zmscore is a read, not a write", text)
         self.assertIn("op 14: kv_dbsize is a read, not a write", text)
+        self.assertIn("op 15: kv_zunion is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
@@ -11722,6 +11943,128 @@ class LiveCinderMigrationTests(unittest.TestCase):
             reply = self._call("tools/call", 99, call)
             self.assertIn("error", reply, call)
             self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_live_zunion(self):
+        """kv_zunion against a real cinder 0.51.0: the union of
+        several sorted sets, a member in several sets appearing
+        once with the sum of its scores, lowest score first with
+        the member name breaking ties, WITHSCORES member/score
+        objects, a missing key counting as an empty set, an empty
+        union for only-missing keys, inf scores round-tripping,
+        WRONGTYPE on a string key, the 1000-member cap, and the
+        syntax errors cinder returns for WEIGHTS / AGGREGATE /
+        STORE, which the tool never sends."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zu:a",
+                "members": {"a": 1, "b": 2, "c": 3}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zu:b",
+                "members": {"b": 10, "d": 20}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:a", "zu:b"]}),
+            ["a", "c", "b", "d"])
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:a", "zu:b"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0},
+             {"member": "b", "score": 12.0},
+             {"member": "d", "score": 20.0}])
+        # A missing key counts as an empty set; only-missing keys
+        # union to nothing; one key unions with itself.
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:a", "zu:ghost"]}),
+            ["a", "b", "c"])
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:ghost", "zu:gone"]}),
+            [])
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:a"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        # Ties break by member name, and inf scores round-trip.
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zu:tie",
+                "members": {"x": 5, "y": 5, "a": 5,
+                            "top": float("inf")}}),
+            4)
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:tie"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 5.0},
+             {"member": "x", "score": 5.0},
+             {"member": "y", "score": 5.0},
+             {"member": "top", "score": float("inf")}])
+        # The same key twice doubles every score, as in Redis.
+        self.assertEqual(
+            self._tool("kv_zunion", {"keys": ["zu:a", "zu:a"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 2.0},
+             {"member": "b", "score": 4.0},
+             {"member": "c", "score": 6.0}])
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zu:str", "value": "hello"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zunion",
+            "arguments": {"keys": ["zu:a", "zu:str"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        for arguments in ({"keys": []}, {"keys": "zu:a"},
+                          {"keys": ["zu:a"], "withscores": "yes"}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zunion", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+        # A union wider than the 1000-member cap fails instead of
+        # returning a truncated list; exactly 1000 comes back
+        # whole. Members go in in chunks: one ZADD carrying 1001
+        # members (2003 args) makes cinder close the connection,
+        # so no single call adds the whole set.
+        for start in range(0, 1001, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "zu:big",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       min(start + 200,
+                                                           1001))}}),
+                min(start + 200, 1001) - start)
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zunion", "arguments": {"keys": ["zu:big"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        for start in range(0, 1000, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "zu:edge",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       start + 200)}}),
+                200)
+        self.assertEqual(
+            len(self._tool("kv_zunion", {"keys": ["zu:edge"]})), 1000)
+        # Cinder has no WEIGHTS, AGGREGATE, or STORE for ZUNION:
+        # ask it directly and confirm the syntax errors, so the
+        # tool's choice not to offer them stays grounded.
+        from cinder_mcp.resp import RespError
+        client = RespClient("127.0.0.1", self.PORT)
+        for extra in (("WEIGHTS", 2), ("AGGREGATE", "MIN"),
+                      ("STORE", "zu:dest")):
+            with self.assertRaises(RespError) as caught:
+                client.command("ZUNION", 1, "zu:a", *extra)
+            self.assertIn("syntax error", str(caught.exception))
 
     def test_live_dbsize(self):
         """kv_dbsize against a real cinder 0.49.0: the key count of
