@@ -127,6 +127,114 @@ class FakeCinder(threading.Thread):
             return None
         return value
 
+    def _parse_bitfield(self, type_name, offset_text):
+        """Parse a BITFIELD type and offset, as in real cinder:
+        i1..i64 or u1..u63 (u64 rejected), and a bit offset or
+        '#n' for the n-th field of that width. Returns (is_signed,
+        bits, bit_offset), or None when either is invalid. A field
+        must end inside 2^32 bits."""
+        text = type_name.lower()
+        if len(text) < 2 or text[0] not in ("i", "u") \
+                or not text[1:].isdigit():
+            return None
+        bits = int(text[1:])
+        if bits < 1 or bits > 64 or (text[0] == "u" and bits == 64):
+            return None
+        max_off = (1 << 32) - bits
+        if offset_text.startswith("#") and offset_text[1:].isdigit():
+            n = int(offset_text[1:])
+            if n > max_off // bits:
+                return None
+            return text[0] == "i", bits, n * bits
+        try:
+            offset = int(offset_text)
+        except ValueError:
+            return None
+        if offset < 0 or offset > max_off:
+            return None
+        return text[0] == "i", bits, offset
+
+    def _bitfield_raw(self, value, offset, bits):
+        """The raw bits of a field, bit 0 the high bit of byte 0
+        and the field's first bit its most significant bit, as in
+        real cinder. Bits past the end of the string read 0."""
+        raw = 0
+        for i in range(bits):
+            pos = offset + i
+            bit = 0
+            if pos // 8 < len(value):
+                bit = (ord(value[pos // 8]) >> (7 - pos % 8)) & 1
+            raw = (raw << 1) | bit
+        return raw
+
+    def _bitfield_signed(self, raw, bits, is_signed):
+        """The raw bits of a field as a signed value when the field
+        is signed, or as-is when it is unsigned."""
+        if not is_signed:
+            return raw
+        if bits == 64:
+            return raw - (1 << 64) if raw >= (1 << 63) else raw
+        if raw & (1 << (bits - 1)):
+            return raw - (1 << bits)
+        return raw
+
+    def _bitfield_read(self, value, offset, bits, is_signed):
+        return self._bitfield_signed(
+            self._bitfield_raw(value, offset, bits), bits, is_signed)
+
+    def _bitfield_write(self, value, offset, bits, raw):
+        """Set a field's bits in a string, returning the new string.
+        The string is already grown to hold the field."""
+        chars = list(value)
+        for i in range(bits):
+            pos = offset + i
+            byte = pos // 8
+            bit = (raw >> (bits - 1 - i)) & 1
+            mask = 0x80 >> (pos % 8)
+            if bit:
+                chars[byte] = chr(ord(chars[byte]) | mask)
+            else:
+                chars[byte] = chr(ord(chars[byte]) & ~mask)
+        return "".join(chars)
+
+    def _bitfield_set(self, v, is_signed, bits, policy):
+        """Apply the overflow policy to a SET candidate value.
+        Returns (raw, failed): failed is True when the policy is
+        FAIL and v is out of range for the field."""
+        mask = (1 << bits) - 1
+        if is_signed:
+            lo = -(1 << 63) if bits == 64 else -(1 << (bits - 1))
+            hi = (1 << 63) - 1 if bits == 64 else (1 << (bits - 1)) - 1
+        else:
+            lo, hi = 0, mask
+        if policy == "FAIL" and (v < lo or v > hi):
+            return 0, True
+        if policy == "SAT":
+            v = max(lo, min(hi, v))
+        return v & mask, False
+
+    def _bitfield_incr(self, old_raw, inc, is_signed, bits, policy):
+        """Apply the overflow policy to an INCRBY: the field
+        currently holds old_raw, and inc is added. Returns
+        (raw, failed): WRAP adds modulo 2**bits, SAT clamps to the
+        field's range, FAIL fails when the sum leaves it."""
+        mask = (1 << bits) - 1
+        if policy == "WRAP":
+            return (old_raw + inc) & mask, False
+        if is_signed:
+            lo = -(1 << 63) if bits == 64 else -(1 << (bits - 1))
+            hi = (1 << 63) - 1 if bits == 64 else (1 << (bits - 1)) - 1
+            old = self._bitfield_signed(old_raw, bits, True)
+        else:
+            lo, hi = 0, mask
+            old = old_raw
+        total = old + inc
+        if total < lo or total > hi:
+            if policy == "FAIL":
+                return 0, True
+            total = lo if total < lo else hi
+        return total & mask, False
+
     def _handle(self, conn):
         f = conn.makefile("rb")
         in_multi = False
@@ -437,6 +545,118 @@ class FakeCinder(threading.Thread):
             # TTL, as in real cinder.
             self.store[dest] = ("".join(chr(b) for b in result), None)
             return ":%d\r\n" % maxlen
+        elif name == "BITFIELD" and len(args) >= 1:
+            # BITFIELD key [GET type offset | SET type offset value
+            # | INCRBY type offset value | OVERFLOW WRAP|SAT|FAIL
+            # ...]: packed integer fields of a string, as in real
+            # cinder. Every subcommand is parsed first, so a syntax
+            # error anywhere means nothing executes. Bit 0 is the
+            # high bit of byte 0, and a field's first bit is its
+            # most significant bit, as in real cinder.
+            key = args[0]
+            ops = []
+            overflow = "WRAP"
+            i = 1
+            bad = None
+            while i < len(args):
+                sub = args[i].upper()
+                if sub == "GET":
+                    if i + 2 >= len(args):
+                        bad = "syntax error"
+                        break
+                    parsed = self._parse_bitfield(args[i + 1], args[i + 2])
+                    if parsed is None:
+                        bad = "bad type or offset"
+                        break
+                    ops.append(("GET", parsed[0], parsed[1], parsed[2],
+                                None, None))
+                    i += 3
+                elif sub in ("SET", "INCRBY"):
+                    if i + 3 >= len(args):
+                        bad = "syntax error"
+                        break
+                    parsed = self._parse_bitfield(args[i + 1], args[i + 2])
+                    if parsed is None:
+                        bad = "bad type or offset"
+                        break
+                    try:
+                        value = int(args[i + 3])
+                    except ValueError:
+                        return ("-ERR value is not an integer or out of "
+                                "range\r\n")
+                    if value < -(1 << 63) or value > (1 << 63) - 1:
+                        return ("-ERR value is not an integer or out of "
+                                "range\r\n")
+                    ops.append((sub, parsed[0], parsed[1], parsed[2],
+                                value, overflow))
+                    i += 4
+                elif sub == "OVERFLOW":
+                    if i + 1 >= len(args):
+                        bad = "syntax error"
+                        break
+                    policy = args[i + 1].upper()
+                    if policy not in ("WRAP", "SAT", "FAIL"):
+                        return "-ERR Invalid OVERFLOW type\r\n"
+                    overflow = policy
+                    i += 2
+                else:
+                    bad = "syntax error"
+                    break
+            if bad == "bad type or offset":
+                return "-ERR Invalid bitfield type or offset\r\n"
+            if bad is not None:
+                return "-ERR syntax error\r\n"
+            value = self._get(key)
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            # A write creates the key zero-padded to the farthest
+            # field and grows it with zero bytes when a field runs
+            # past the end, preserving the TTL — even a write that
+            # then answers nil under OVERFLOW FAIL leaves the grown
+            # string behind, as in real cinder.
+            expires = self.store[key][1] if key in self.store else None
+            if value is None:
+                value = ""
+            needed = 0
+            for _sub, _signed, bits, offset, _v, _o in ops:
+                if _sub == "GET":
+                    continue
+                needed = max(needed, (offset + bits + 7) // 8)
+            has_write = any(o[0] in ("SET", "INCRBY") for o in ops)
+            if has_write and needed > len(value):
+                value = value + "\x00" * (needed - len(value))
+            out = "*%d\r\n" % sum(
+                1 for o in ops if o[0] in ("GET", "SET", "INCRBY"))
+            for sub, is_signed, bits, offset, inc, policy in ops:
+                if sub == "GET":
+                    out += ":%d\r\n" % self._bitfield_read(
+                        value, offset, bits, is_signed)
+                    continue
+                old_raw = self._bitfield_raw(value, offset, bits)
+                if sub == "SET":
+                    new_raw, failed = self._bitfield_set(
+                        inc, is_signed, bits, policy)
+                    if failed:
+                        out += "$-1\r\n"
+                        continue
+                    value = self._bitfield_write(value, offset, bits,
+                                                 new_raw)
+                    out += ":%d\r\n" % self._bitfield_signed(
+                        old_raw, bits, is_signed)
+                else:  # INCRBY
+                    new_raw, failed = self._bitfield_incr(
+                        old_raw, inc, is_signed, bits, policy)
+                    if failed:
+                        out += "$-1\r\n"
+                        continue
+                    value = self._bitfield_write(value, offset, bits,
+                                                 new_raw)
+                    out += ":%d\r\n" % self._bitfield_signed(
+                        new_raw, bits, is_signed)
+            if has_write:
+                self.store[key] = (value, expires)
+            return out
         elif name == "GETEX" and len(args) >= 1:
             # GETEX key [EX s | PX ms | PERSIST]: returns the value
             # and sets, refreshes, or removes its TTL; no option
@@ -1614,6 +1834,7 @@ class McpTests(unittest.TestCase):
                     "kv_getex",
                     "kv_getrange", "kv_setrange",
                     "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop",
+                    "kv_bitfield",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
@@ -4218,6 +4439,281 @@ class McpTests(unittest.TestCase):
                 {"op": "kv_set", "key": "t", "value": "v"},
                 {"op": "kv_bitop", "operation": "not",
                  "destination": "d", "sources": ["a", "b"]},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "t"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def _bitfield(self, msg_id, key, ops):
+        reply = self._call("tools/call", msg_id, {
+            "name": "kv_bitfield",
+            "arguments": {"key": key, "ops": ops},
+        })
+        self.assertNotIn("error", reply, (key, ops))
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_tools_call_bitfield(self):
+        # GET on a missing key reads 0 and creates nothing.
+        self.assertEqual(self._bitfield(1, "bf", [
+            {"op": "get", "type": "u8", "offset": 0}]), [0])
+        missing = self._call("tools/call", 2, {
+            "name": "kv_exists", "arguments": {"key": "bf"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "0")
+        # SET returns the old value, GET reads it back, and a
+        # '#' offset addresses the n-th field of that width.
+        self.assertEqual(self._bitfield(3, "bf", [
+            {"op": "set", "type": "u8", "offset": 0, "value": 200}]), [0])
+        self.assertEqual(self._bitfield(4, "bf", [
+            {"op": "get", "type": "u8", "offset": 0}]), [200])
+        self.assertEqual(self._bitfield(5, "bf", [
+            {"op": "set", "type": "i8", "offset": "#1", "value": 5}]), [0])
+        self.assertEqual(self._bitfield(6, "bf", [
+            {"op": "get", "type": "i8", "offset": "#1"}]), [5])
+        self.assertEqual(self._bitfield(7, "bf", [
+            {"op": "get", "type": "u8", "offset": 8}]), [5])
+        # Signed fields read back negative, and the same bits read
+        # unsigned give the two's-complement value.
+        self.assertEqual(self._bitfield(8, "bf2", [
+            {"op": "set", "type": "i8", "offset": 0, "value": -1}]), [0])
+        self.assertEqual(self._bitfield(9, "bf2", [
+            {"op": "get", "type": "i8", "offset": 0}]), [-1])
+        self.assertEqual(self._bitfield(10, "bf2", [
+            {"op": "get", "type": "u8", "offset": 0}]), [255])
+        # INCRBY returns the new value and counts down with a
+        # negative increment.
+        self.assertEqual(self._bitfield(11, "bf3", [
+            {"op": "set", "type": "i8", "offset": 0, "value": 10}]), [0])
+        self.assertEqual(self._bitfield(12, "bf3", [
+            {"op": "incrby", "type": "i8", "offset": 0, "value": -3}]), [7])
+        # OVERFLOW SAT clamps, FAIL answers null and writes
+        # nothing, WRAP wraps — and OVERFLOW applies only to the
+        # SET / INCRBY ops that follow it in the call.
+        self.assertEqual(self._bitfield(13, "bf4", [
+            {"op": "set", "type": "u8", "offset": 0, "value": 250}]), [0])
+        self.assertEqual(self._bitfield(14, "bf4", [
+            {"op": "overflow", "policy": "sat"},
+            {"op": "set", "type": "u8", "offset": 0, "value": 300}]), [250])
+        self.assertEqual(self._bitfield(15, "bf4", [
+            {"op": "get", "type": "u8", "offset": 0}]), [255])
+        self.assertEqual(self._bitfield(16, "bf4", [
+            {"op": "overflow", "policy": "fail"},
+            {"op": "set", "type": "u8", "offset": 0, "value": 300}]), [None])
+        self.assertEqual(self._bitfield(17, "bf4", [
+            {"op": "get", "type": "u8", "offset": 0}]), [255])
+        self.assertEqual(self._bitfield(18, "bf4", [
+            {"op": "overflow", "policy": "fail"},
+            {"op": "incrby", "type": "u8", "offset": 0, "value": 10}]), [None])
+        self.assertEqual(self._bitfield(19, "bf4", [
+            {"op": "set", "type": "u8", "offset": 0, "value": 300},
+            {"op": "overflow", "policy": "sat"},
+            {"op": "set", "type": "u8", "offset": 0, "value": 300}]), [255, 44])
+        self.assertEqual(self._bitfield(20, "bf4", [
+            {"op": "get", "type": "u8", "offset": 0}]), [255])
+        # A write that answers null under OVERFLOW FAIL still
+        # creates the key, grown zero-padded to the field.
+        self.assertEqual(self._bitfield(21, "bf-fail", [
+            {"op": "overflow", "policy": "fail"},
+            {"op": "set", "type": "u8", "offset": 100, "value": 300}]), [None])
+        exists = self._call("tools/call", 22, {
+            "name": "kv_exists", "arguments": {"key": "bf-fail"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "1")
+        length = self._call("tools/call", 23, {
+            "name": "kv_strlen", "arguments": {"key": "bf-fail"},
+        })
+        self.assertEqual(length["result"]["content"][0]["text"], "14")
+        # WRAP wraps a signed value too: 200 in an i8 is -56.
+        self.assertEqual(self._bitfield(24, "bf5", [
+            {"op": "set", "type": "i8", "offset": 0, "value": 200}]), [0])
+        self.assertEqual(self._bitfield(25, "bf5", [
+            {"op": "get", "type": "i8", "offset": 0}]), [-56])
+        # Several subcommands in one call answer in order, one
+        # result per GET / SET / INCRBY — OVERFLOW answers nothing.
+        self.assertEqual(self._bitfield(26, "bf6", [
+            {"op": "get", "type": "u8", "offset": 0},
+            {"op": "set", "type": "i8", "offset": 8, "value": 5},
+            {"op": "incrby", "type": "i8", "offset": 16, "value": 1},
+            {"op": "get", "type": "i8", "offset": 16},
+        ]), [0, 0, 1, 1])
+        # i64 and u63 hold the full signed 64-bit range, and a u1
+        # wraps 1 + 1 back to 0.
+        self.assertEqual(self._bitfield(27, "bf7", [
+            {"op": "set", "type": "i64", "offset": 0, "value": -1}]), [0])
+        self.assertEqual(self._bitfield(28, "bf7", [
+            {"op": "get", "type": "i64", "offset": 0}]), [-1])
+        self.assertEqual(self._bitfield(29, "bf8", [
+            {"op": "set", "type": "u63", "offset": 0,
+             "value": 9223372036854775807}]), [0])
+        self.assertEqual(self._bitfield(30, "bf8", [
+            {"op": "get", "type": "u63", "offset": 0}]),
+            [9223372036854775807])
+        self.assertEqual(self._bitfield(31, "bf9", [
+            {"op": "set", "type": "u1", "offset": 1, "value": 1}]), [0])
+        self.assertEqual(self._bitfield(32, "bf9", [
+            {"op": "incrby", "type": "u1", "offset": 1, "value": 1}]), [0])
+        # Types are case-insensitive, and a write preserves the TTL.
+        self.assertEqual(self._bitfield(33, "bf10", [
+            {"op": "set", "type": "U8", "offset": 0, "value": 7}]), [0])
+        self.assertEqual(self._bitfield(34, "bf10", [
+            {"op": "get", "type": "U8", "offset": 0}]), [7])
+        self._call("tools/call", 35, {
+            "name": "kv_setex",
+            "arguments": {"key": "bf-ttl", "seconds": 100, "value": "abcdef"},
+        })
+        self.assertEqual(self._bitfield(36, "bf-ttl", [
+            {"op": "set", "type": "u8", "offset": 0, "value": 65}]), [97])
+        ttl = self._call("tools/call", 37, {
+            "name": "kv_ttl", "arguments": {"key": "bf-ttl"},
+        })
+        self.assertTrue(0 < int(ttl["result"]["content"][0]["text"]) <= 100)
+
+    def test_tools_call_bitfield_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_bitfield", "arguments": {}},
+            {"name": "kv_bitfield", "arguments": {"key": "a"}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": []}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": "get"}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": ["get"]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [{}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "foo", "type": "u8", "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u64", "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "x8", "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "i0", "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "i65", "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": 8, "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u8", "offset": -1}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u8", "offset": 4294967289}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u8", "offset": "#536870912"}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u8", "offset": "#x"}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u8", "offset": "0"}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "get", "type": "u8", "offset": True}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "set", "type": "u8", "offset": 0}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "set", "type": "u8", "offset": 0, "value": "5"}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "set", "type": "u8", "offset": 0, "value": True}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "set", "type": "u8", "offset": 0,
+                  "value": 1 << 63}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "set", "type": "u8", "offset": 0,
+                  "value": -(1 << 63) - 1}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "incrby", "type": "u8", "offset": 0,
+                  "value": 1.5}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "overflow", "policy": "bogus"}]}},
+            {"name": "kv_bitfield",
+             "arguments": {"key": "a", "ops": [
+                 {"op": "overflow"}]}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_bitfield_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_bitfield",
+            "arguments": {"key": "queue", "ops": [
+                {"op": "get", "type": "u8", "offset": 0}]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+
+    def test_tools_call_bitfield_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_bitfield", "key": "b", "ops": [
+                    {"op": "set", "type": "u8", "offset": 0,
+                     "value": 200}]},
+                {"op": "kv_bitfield", "key": "b", "ops": [
+                    {"op": "get", "type": "u8", "offset": 0}]},
+                {"op": "kv_bitfield", "key": "b", "ops": [
+                    {"op": "incrby", "type": "u8", "offset": 0,
+                     "value": 3}]},
+                {"op": "kv_bitfield", "key": "b", "ops": [
+                    {"op": "overflow", "policy": "fail"},
+                    {"op": "set", "type": "u8", "offset": 0,
+                     "value": 300}]},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], [0])
+        self.assertEqual(summary["results"][1]["result"], [200])
+        self.assertEqual(summary["results"][2]["result"], [203])
+        self.assertEqual(summary["results"][3]["result"], [None])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_bitfield", "key": "b2", "ops": [
+                    {"op": "set", "type": "i8", "offset": "#1",
+                     "value": -5}]},
+                {"op": "kv_bitfield", "key": "b2", "ops": [
+                    {"op": "get", "type": "i8", "offset": "#1"},
+                    {"op": "get", "type": "u8", "offset": 8}]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], [0])
+        self.assertEqual(summary["results"][1]["result"], [-5, 251])
+        # A bad bitfield argument fails an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "t", "value": "v"},
+                {"op": "kv_bitfield", "key": "t", "ops": [
+                    {"op": "get", "type": "u64", "offset": 0}]},
             ]},
         })
         self.assertIn("error", bad)
@@ -7582,6 +8078,92 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 14: kv_getbit is a read, not a write", text)
         self.assertIn("op 15: kv_bitcount is a read, not a write", text)
 
+    def test_prompts_get_write_safety_bitfield(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "bits", "value": "foobar"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set",
+            "arguments": {"key": "big-bits", "value": "x" * 2000},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_bitfield", "key": "bits", "ops": [
+                {"op": "get", "type": "u8", "offset": 0}]},
+            {"op": "kv_bitfield", "key": "bits", "ops": [
+                {"op": "set", "type": "u8", "offset": 0, "value": 65}]},
+            {"op": "kv_bitfield", "key": "big-bits", "ops": [
+                {"op": "set", "type": "u8", "offset": 0, "value": 65}]},
+            {"op": "kv_bitfield", "key": "todo", "ops": [
+                {"op": "set", "type": "u8", "offset": 0, "value": 65}]},
+            {"op": "kv_bitfield", "key": "ghost-bits", "ops": [
+                {"op": "set", "type": "u8", "offset": 0, "value": 1}]},
+            {"op": "kv_bitfield", "key": "ghost-bits2", "ops": [
+                {"op": "set", "type": "u8", "offset": 16, "value": 1}]},
+            {"op": "kv_bitfield", "key": "ghost-bits3", "ops": [
+                {"op": "overflow", "policy": "fail"},
+                {"op": "set", "type": "u8", "offset": 100,
+                 "value": 300}]},
+            {"op": "kv_bitfield", "key": "bits", "ops": [
+                {"op": "set", "type": "u8", "offset": 4294967289,
+                 "value": 1}]},
+            {"op": "kv_bitfield", "key": "bits", "ops": [
+                {"op": "set", "type": "u8", "offset": 0,
+                 "value": 1 << 63}]},
+            {"op": "kv_bitfield", "key": "bits", "ops": [
+                {"op": "set", "type": "u64", "offset": 0, "value": 1}]},
+            {"op": "kv_bitfield", "key": "bits", "ops": []},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 11 op(s), 9 audited, 2 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_bitfield 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 7: kv_bitfield 'bits' — would fail: bit offset is out "
+            "of range",
+            risky,
+        )
+        self.assertIn(
+            "op 8: kv_bitfield 'bits' — would fail: value is not an "
+            "integer or out of range",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_bitfield 'big-bits' — changes fields of a large "
+            "string of 2000 bytes that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 4: kv_bitfield 'ghost-bits' — creates a new string key "
+            "with no expiry, zero-padded to 1 byte(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 5: kv_bitfield 'ghost-bits2' — creates a new string "
+            "key with no expiry, zero-padded to 3 byte(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 6: kv_bitfield 'ghost-bits3' — creates a new string "
+            "key with no expiry, zero-padded to 14 byte(s)",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_bitfield 'bits' — reads fields, changes nothing",
+            safe,
+        )
+        self.assertIn(
+            "op 1: kv_bitfield 'bits' — changes fields of a string of "
+            "6 bytes that no expiry",
+            safe,
+        )
+
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
             {"op": "kv_set", "key": "k%d" % i, "value": "v"} for i in range(55)
@@ -9865,6 +10447,180 @@ class LiveCinderMigrationTests(unittest.TestCase):
                       "arguments": {"operation": "nand",
                                     "destination": "bit:d",
                                     "sources": ["bit:x", "bit:y"]}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_live_bitfield(self):
+        """kv_bitfield against a real cinder 0.46.0: GET reads 0 on
+        a missing key and creates nothing, SET returns the old
+        value and INCRBY the new one, '#' offsets address the
+        n-th field of that width, signed fields read back
+        negative, OVERFLOW SAT clamps, FAIL answers null and
+        writes nothing, WRAP wraps, OVERFLOW applies only to the
+        SET / INCRBY ops that follow it, a write that answers
+        null under OVERFLOW FAIL still creates the key grown
+        zero-padded, writes preserve the TTL, and the command is
+        WRONGTYPE on a container key."""
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:a",
+                "ops": [{"op": "get", "type": "u8", "offset": 0}]}),
+            [0])
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "bf:a"}), 0)
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:a",
+                "ops": [{"op": "set", "type": "u8", "offset": 0,
+                         "value": 200}]}),
+            [0])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:a",
+                "ops": [{"op": "get", "type": "u8", "offset": 0}]}),
+            [200])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:a",
+                "ops": [{"op": "set", "type": "i8", "offset": "#1",
+                         "value": 5}]}),
+            [0])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:a",
+                "ops": [{"op": "get", "type": "i8", "offset": "#1"},
+                        {"op": "get", "type": "u8", "offset": 8}]}),
+            [5, 5])
+        # Signed fields read back negative; the same bits read
+        # unsigned give the two's-complement value.
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:b",
+                "ops": [{"op": "set", "type": "i8", "offset": 0,
+                         "value": -1}]}),
+            [0])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:b",
+                "ops": [{"op": "get", "type": "i8", "offset": 0},
+                        {"op": "get", "type": "u8", "offset": 0}]}),
+            [-1, 255])
+        # INCRBY returns the new value and counts down.
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:c",
+                "ops": [{"op": "set", "type": "i8", "offset": 0,
+                         "value": 10},
+                        {"op": "incrby", "type": "i8", "offset": 0,
+                         "value": -3}]}),
+            [0, 7])
+        # OVERFLOW SAT clamps at 255, FAIL answers null and leaves
+        # the value alone, WRAP wraps 300 to 44.
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:d",
+                "ops": [{"op": "set", "type": "u8", "offset": 0,
+                         "value": 250},
+                        {"op": "overflow", "policy": "sat"},
+                        {"op": "set", "type": "u8", "offset": 0,
+                         "value": 300}]}),
+            [0, 250])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:d",
+                "ops": [{"op": "get", "type": "u8", "offset": 0}]}),
+            [255])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:d",
+                "ops": [{"op": "overflow", "policy": "fail"},
+                        {"op": "set", "type": "u8", "offset": 0,
+                         "value": 300},
+                        {"op": "incrby", "type": "u8", "offset": 0,
+                         "value": 10}]}),
+            [None, None])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:d",
+                "ops": [{"op": "get", "type": "u8", "offset": 0}]}),
+            [255])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:d",
+                "ops": [{"op": "set", "type": "u8", "offset": 0,
+                         "value": 300},
+                        {"op": "overflow", "policy": "sat"},
+                        {"op": "set", "type": "u8", "offset": 0,
+                         "value": 300}]}),
+            [255, 44])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:d",
+                "ops": [{"op": "get", "type": "u8", "offset": 0}]}),
+            [255])
+        # A write that answers null under OVERFLOW FAIL still
+        # creates the key, grown zero-padded to the field.
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:fail",
+                "ops": [{"op": "overflow", "policy": "fail"},
+                        {"op": "set", "type": "u8", "offset": 100,
+                         "value": 300}]}),
+            [None])
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "bf:fail"}), 1)
+        self.assertEqual(
+            self._tool("kv_strlen", {"key": "bf:fail"}), 14)
+        # i64 and u63 hold the full signed 64-bit range, and a
+        # write preserves the TTL.
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:e",
+                "ops": [{"op": "set", "type": "i64", "offset": 0,
+                         "value": -1},
+                        {"op": "get", "type": "i64", "offset": 0}]}),
+            [0, -1])
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:f",
+                "ops": [{"op": "set", "type": "u63", "offset": 0,
+                         "value": 9223372036854775807},
+                        {"op": "get", "type": "u63", "offset": 0}]}),
+            [0, 9223372036854775807])
+        self.assertEqual(
+            self._tool("kv_setex", {"key": "bf:ttl", "seconds": 100,
+                                   "value": "abcdef"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_bitfield", {
+                "key": "bf:ttl",
+                "ops": [{"op": "set", "type": "u8", "offset": 0,
+                         "value": 65}]}),
+            [97])
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "bf:ttl"}), 0)
+        # WRONGTYPE on a list key, u64 is rejected by cinder, and
+        # bad arguments fail as invalid params.
+        self.assertEqual(
+            self._tool("kv_rpush", {"key": "bf:list",
+                                   "elements": ["a"]}),
+            1)
+        reply = self._call("tools/call", 99, {
+            "name": "kv_bitfield",
+            "arguments": {"key": "bf:list", "ops": [
+                {"op": "get", "type": "u8", "offset": 0}]},
+        })
+        self.assertIn("error", reply)
+        for call in ({"name": "kv_bitfield",
+                      "arguments": {"key": "bf:a", "ops": [
+                          {"op": "get", "type": "u64", "offset": 0}]}},
+                     {"name": "kv_bitfield",
+                      "arguments": {"key": "bf:a", "ops": [
+                          {"op": "get", "type": "u8",
+                           "offset": 4294967289}]}},
+                     {"name": "kv_bitfield",
+                      "arguments": {"key": "bf:a", "ops": []}}):
             reply = self._call("tools/call", 99, call)
             self.assertIn("error", reply, call)
             self.assertEqual(reply["error"]["code"], -32602, call)

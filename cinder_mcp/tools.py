@@ -343,6 +343,18 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_bitfield",
+        "description": "Read and write packed integer fields of the string stored at a key: BITFIELD key [GET type offset | SET type offset value | INCRBY type offset increment | OVERFLOW WRAP|SAT|FAIL ...]. `ops` is a list of subcommands in order: {\"op\": \"get\", \"type\": \"i8\", \"offset\": 0}, {\"op\": \"set\", ...} with a \"value\", {\"op\": \"incrby\", ...} with a \"value\" to add, and {\"op\": \"overflow\", \"policy\": \"wrap\"|\"sat\"|\"fail\"} which sets the overflow policy for the SET / INCRBY ops that follow it (default WRAP). Types are i1..i64 and u1..u63 (u64 is not supported: a u64 field cannot come back as a signed 64-bit integer); offsets are bit offsets, or \"#n\" for the n-th field of that width; a field must end within 2^32 bits. Returns one result per GET / SET / INCRBY, in order: GET returns the field's current value (0 when the key does not exist or the field is past the end), SET returns the old value, INCRBY returns the new value; a SET or INCRBY that overflows under OVERFLOW FAIL answers null and writes nothing. A syntax error anywhere in the ops fails the whole call before anything runs. A write creates the key zero-padded when it does not exist and preserves the TTL — even a write that answers null under OVERFLOW FAIL leaves the grown string behind, as in Redis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "ops": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["key", "ops"],
+        },
+    },
+    {
         "name": "kv_hset",
         "description": "Set fields on a hash: HSET key field value [field value ...]. Takes `fields` as an object mapping field names to values. Returns the number of fields that were newly added (updating an existing field returns 0 for it).",
         "inputSchema": {
@@ -915,7 +927,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1036,7 +1048,7 @@ BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_getrange", "kv_setrange",
-    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop",
+    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop", "kv_bitfield",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
@@ -1120,7 +1132,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_getrange", "kv_setrange",
-    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop",
+    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop", "kv_bitfield",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
@@ -1593,6 +1605,8 @@ def _op_argv(name, args):
     if name == "kv_bitop":
         operation, destination, sources = _bitop_args(args)
         return ["BITOP", operation, destination] + list(sources)
+    if name == "kv_bitfield":
+        return _bitfield_argv(args)
     if name == "kv_hset":
         return ["HSET", _require(args, "key")] + _hset_field_args(args)
     if name == "kv_hget":
@@ -2019,6 +2033,144 @@ def _bitop_args(args):
             "kv_bitop %s takes at least two source keys" % operation
         )
     return operation, destination, sources
+
+
+# BITFIELD field widths: signed i1..i64, unsigned u1..u63 — cinder
+# rejects u64 because a u64 field cannot come back as a signed
+# 64-bit RESP integer. A field must end inside a 512 MB string:
+# offset + bits <= 2^32, as in Redis.
+MAX_BITFIELD_END = 4294967296
+
+INT64_MIN = -(1 << 63)
+INT64_MAX = (1 << 63) - 1
+
+
+def _parse_bitfield_type(type_name):
+    """Validate a BITFIELD encoding: i1..i64 or u1..u63, any case.
+    Returns (is_signed, bits, canonical_type). cinder rejects
+    anything else as a server error, so fail here as invalid
+    params instead."""
+    if not isinstance(type_name, str):
+        raise ValueError(
+            "kv_bitfield type must be a string like 'i8' or 'u8', "
+            "got %r" % (type_name,)
+        )
+    text = type_name.lower()
+    if len(text) < 2 or text[0] not in ("i", "u") \
+            or not text[1:].isdigit():
+        raise ValueError(
+            "kv_bitfield type must be like 'i8' or 'u8', got %r"
+            % (type_name,)
+        )
+    bits = int(text[1:])
+    if bits < 1 or bits > 64:
+        raise ValueError(
+            "kv_bitfield type must be i1..i64 or u1..u63, got %r"
+            % (type_name,)
+        )
+    if text[0] == "u" and bits == 64:
+        raise ValueError(
+            "kv_bitfield type 'u64' is not supported: a u64 field "
+            "cannot come back as a signed 64-bit integer"
+        )
+    return text[0] == "i", bits, text
+
+
+def _parse_bitfield_offset(offset, bits):
+    """Validate a BITFIELD offset for a field of `bits` width: a
+    plain integer is a bit offset; '#n' is the n-th field of that
+    width, so its bit offset is n * bits. Returns (bit_offset,
+    argv_text). The field must end inside 2^32 bits — cinder
+    rejects anything else as a server error, so fail here as
+    invalid params instead."""
+    max_off = MAX_BITFIELD_END - bits
+    if isinstance(offset, bool):
+        raise ValueError(
+            "kv_bitfield offset must be an integer or '#n', got %r"
+            % (offset,)
+        )
+    if isinstance(offset, int):
+        if offset < 0 or offset > max_off:
+            raise ValueError(
+                "kv_bitfield offset must be between 0 and %d for a "
+                "%d-bit field, got %d" % (max_off, bits, offset)
+            )
+        return offset, str(offset)
+    if isinstance(offset, str) and offset.startswith("#") \
+            and offset[1:].isdigit():
+        n = int(offset[1:])
+        if n > max_off // bits:
+            raise ValueError(
+                "kv_bitfield offset '#%d' runs past 2^32 bits for a "
+                "%d-bit field" % (n, bits)
+            )
+        return n * bits, "#%d" % n
+    raise ValueError(
+        "kv_bitfield offset must be an integer or '#n', got %r"
+        % (offset,)
+    )
+
+
+def _bitfield_argv(args):
+    """Validate a kv_bitfield call and build its BITFIELD argv: the
+    key plus one argv chunk per op, in order. Each op is an object
+    with "op" naming "get", "set", "incrby" or "overflow": get
+    takes a type and an offset, set and incrby take a type, an
+    offset and a value, overflow takes a "policy" ("wrap", "sat"
+    or "fail") that applies to the SET / INCRBY ops that follow
+    it. The value must fit a signed 64-bit integer, as cinder's
+    integer parse rejects anything wider. At least one op is
+    required: an empty call would only ever return []."""
+    key = _require(args, "key")
+    ops = args.get("ops")
+    if not isinstance(ops, list) or not ops:
+        raise ValueError("kv_bitfield requires a non-empty ops list")
+    argv = ["BITFIELD", key]
+    for op in ops:
+        if not isinstance(op, dict):
+            raise ValueError(
+                "kv_bitfield ops must be objects, got %r" % (op,)
+            )
+        kind = op.get("op")
+        if not isinstance(kind, str):
+            raise ValueError(
+                "kv_bitfield op needs an 'op': %r" % (op,)
+            )
+        kind = kind.lower()
+        if kind == "overflow":
+            policy = op.get("policy")
+            if not isinstance(policy, str) \
+                    or policy.lower() not in ("wrap", "sat", "fail"):
+                raise ValueError(
+                    "kv_bitfield overflow policy must be 'wrap', "
+                    "'sat' or 'fail', got %r" % (policy,)
+                )
+            argv += ["OVERFLOW", policy.upper()]
+            continue
+        if kind not in ("get", "set", "incrby"):
+            raise ValueError(
+                "kv_bitfield op must be 'get', 'set', 'incrby' or "
+                "'overflow', got %r" % (kind,)
+            )
+        _is_signed, bits, type_name = _parse_bitfield_type(op.get("type"))
+        _offset, offset_text = _parse_bitfield_offset(
+            op.get("offset"), bits)
+        if kind == "get":
+            argv += ["GET", type_name, offset_text]
+            continue
+        value = _require(op, "value")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                "kv_bitfield %s value must be an integer, got %r"
+                % (kind, value)
+            )
+        if value < INT64_MIN or value > INT64_MAX:
+            raise ValueError(
+                "kv_bitfield %s value is not an integer or out of "
+                "range: %d" % (kind, value)
+            )
+        argv += [kind.upper(), type_name, offset_text, value]
+    return argv
 
 
 def _hincrby_args(args):

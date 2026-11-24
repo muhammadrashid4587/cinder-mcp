@@ -126,7 +126,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_set", "kv_del", "kv_incr", "kv_expire",
     "kv_mset", "kv_setnx", "kv_setex", "kv_getset", "kv_getdel",
     "kv_append", "kv_decr", "kv_decrby", "kv_getex", "kv_setrange",
-    "kv_setbit", "kv_bitop",
+    "kv_setbit", "kv_bitop", "kv_bitfield",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
     "kv_lset", "kv_linsert",
@@ -253,7 +253,9 @@ PROMPTS = [
             "HSETNXes that would fail on a container, APPENDs that "
             "would fail, SETBITs that would fail on a container or "
             "with a bad offset, BITOPs that would fail on a container "
-            "or overwrite a key that never expires, GETEXes that "
+            "or overwrite a key that never expires, BITFIELDs that "
+            "would fail on a container or with a bad offset or a bad "
+            "value, GETEXes that "
             "would change or remove a TTL, "
             "ZPOPs that would drain a sorted set, LPUSHXes and "
             "RPUSHXes that would fail on a container, LTRIMs that "
@@ -1263,6 +1265,119 @@ def _bitop_audit_args(op):
     return operation, destination, sources
 
 
+def _bitfield_audit_args(op):
+    """The parsed ops for a kv_bitfield op in a write plan,
+    validated like the tool's own arguments: each op is an object
+    with "op" naming "get", "set", "incrby" or "overflow"; get /
+    set / incrby take a type (i1..i64, u1..u63) and an offset (an
+    integer or '#n'); set / incrby take an integer value; overflow
+    takes a policy ("wrap", "sat" or "fail"). Returns a list of
+    (kind, bits, bit_offset, value) tuples — bits and bit_offset
+    None for overflow, value None for get / overflow. An offset
+    that would run a field past 2^32 bits, or a value outside the
+    signed 64-bit range, is returned as-is — the caller reports it
+    as risky (it would fail in cinder) rather than not audited.
+    Anything else raises ValueError, so the caller reports the op
+    as not audited instead of guessing."""
+    ops = op.get("ops")
+    if not isinstance(ops, list) or not ops:
+        raise ValueError(
+            "kv_bitfield requires a non-empty ops list: %r" % (op,)
+        )
+    parsed = []
+    for sub in ops:
+        if not isinstance(sub, dict):
+            raise ValueError(
+                "kv_bitfield ops must be objects: %r" % (sub,)
+            )
+        kind = sub.get("op")
+        if not isinstance(kind, str):
+            raise ValueError(
+                "kv_bitfield op needs an 'op': %r" % (sub,)
+            )
+        kind = kind.lower()
+        if kind == "overflow":
+            policy = sub.get("policy")
+            if not isinstance(policy, str) \
+                    or policy.lower() not in ("wrap", "sat", "fail"):
+                raise ValueError(
+                    "kv_bitfield overflow policy must be 'wrap', "
+                    "'sat' or 'fail': %r" % (sub,)
+                )
+            parsed.append(("overflow", None, None, None))
+            continue
+        if kind not in ("get", "set", "incrby"):
+            raise ValueError(
+                "kv_bitfield op must be 'get', 'set', 'incrby' or "
+                "'overflow': %r" % (sub,)
+            )
+        type_name = sub.get("type")
+        if not isinstance(type_name, str):
+            raise ValueError(
+                "kv_bitfield type must be a string like 'i8' or "
+                "'u8': %r" % (sub,)
+            )
+        text = type_name.lower()
+        if len(text) < 2 or text[0] not in ("i", "u") \
+                or not text[1:].isdigit():
+            raise ValueError(
+                "kv_bitfield type must be like 'i8' or 'u8': %r"
+                % (sub,)
+            )
+        bits = int(text[1:])
+        if bits < 1 or bits > 64 or (text[0] == "u" and bits == 64):
+            raise ValueError(
+                "kv_bitfield type must be i1..i64 or u1..u63: %r"
+                % (sub,)
+            )
+        offset = sub.get("offset")
+        if isinstance(offset, bool):
+            raise ValueError(
+                "kv_bitfield offset must be an integer or '#n': %r"
+                % (sub,)
+            )
+        if isinstance(offset, int):
+            bit_offset = offset
+        elif isinstance(offset, str) and offset.startswith("#") \
+                and offset[1:].isdigit():
+            bit_offset = int(offset[1:]) * bits
+        else:
+            raise ValueError(
+                "kv_bitfield offset must be an integer or '#n': %r"
+                % (sub,)
+            )
+        value = None
+        if kind in ("set", "incrby"):
+            value = sub.get("value")
+            if value is None:
+                raise ValueError(
+                    "kv_bitfield %s needs a value: %r" % (kind, sub)
+                )
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    "kv_bitfield %s value must be an integer: %r"
+                    % (kind, sub)
+                )
+        parsed.append((kind, bits, bit_offset, value))
+    return parsed
+
+
+def _bitfield_audit_problem(parsed):
+    """The first thing a parsed kv_bitfield op would fail on in
+    cinder, or None: an offset that would run a field past 2^32
+    bits, or a SET / INCRBY value outside the signed 64-bit
+    range."""
+    for kind, bits, bit_offset, value in parsed:
+        if kind == "overflow":
+            continue
+        if bit_offset < 0 or bit_offset + bits > 4294967296:
+            return "bit offset is out of range"
+        if kind in ("set", "incrby") and (
+                value < -(1 << 63) or value > (1 << 63) - 1):
+            return "value is not an integer or out of range"
+    return None
+
+
 def _format_key_list(keys):
     """Key names quoted and comma-joined for one audit line, with
     the rest counted when there are more than a few: a kv_mset can
@@ -1568,7 +1683,8 @@ def _audit_write_op(client, op):
     container, a HSETNX on a container, an APPEND or SETRANGE on a
     container, a SETRANGE with a negative offset, a SETBIT on a
     container or with an offset out of range, a BITOP on a
-    container source or destination, a GETEX or ZPOP
+    container source or destination, a BITFIELD on a container or
+    with a bad offset or a bad value, a GETEX or ZPOP
     on a container, an LSET or LINSERT
     on a container, an LSET on a missing key or with an index out
     of range, an LPUSHX or RPUSHX on a container, an LTRIM that
@@ -1603,7 +1719,8 @@ def _audit_write_op(client, op):
     key, an LMOVE out of a missing key or within one key, a
     SETRANGE that overwrites part of a string or writes an empty
     value, a SETBIT that flips one bit of a string or finds the
-    bit already set, a BITOP over missing sources with no
+    bit already set, a BITFIELD that changes fields of a string
+    in place or reads fields and changes nothing, a BITOP over missing sources with no
     destination to delete, or a no-op on a missing key.
     kv_mset has no single key — it writes several at once — so it
     is audited by _audit_mset instead of the single-key flow below.
@@ -1772,6 +1889,29 @@ def _audit_write_op(client, op):
                 "kv_setbit %r — creates a new string key with no "
                 "expiry, zero-padded to %d byte(s)"
                 % (key, offset // 8 + 1)
+            )
+        if name == "kv_bitfield":
+            # BITFIELD on a missing key: a GET-only call reads 0
+            # and creates nothing, as in Redis — any SET / INCRBY
+            # creates the key zero-padded to the farthest field,
+            # even one that then answers nil under OVERFLOW FAIL.
+            parsed = _bitfield_audit_args(op)
+            problem = _bitfield_audit_problem(parsed)
+            if problem:
+                return "risky", (
+                    "kv_bitfield %r — would fail: %s" % (key, problem)
+                )
+            writes = [p for p in parsed if p[0] in ("set", "incrby")]
+            if not writes:
+                return "safe", (
+                    "kv_bitfield %r — no-op, a GET-only call reads 0 "
+                    "and creates nothing" % key
+                )
+            end = max(p[2] + p[1] for p in writes)
+            return "caution", (
+                "kv_bitfield %r — creates a new string key with no "
+                "expiry, zero-padded to %d byte(s)"
+                % (key, (end + 7) // 8)
             )
         if name == "kv_getdel":
             return "safe", (
@@ -2020,6 +2160,37 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_setbit %r — flips bit %d of a string of %s that %s"
             % (key, offset, size, ttl_text)
+        )
+    if name == "kv_bitfield":
+        # BITFIELD rewrites fields in place and keeps the key's
+        # TTL, like SETBIT — it never replaces the key, so a
+        # never-expiring string is not on its own a risk. A
+        # GET-only call changes nothing at all.
+        parsed = _bitfield_audit_args(op)
+        problem = _bitfield_audit_problem(parsed)
+        if problem:
+            return "risky", (
+                "kv_bitfield %r — would fail: %s" % (key, problem)
+            )
+        if kind != "string":
+            return "risky", (
+                "kv_bitfield %r — would fail with WRONGTYPE: the key "
+                "is a %s of %s" % (key, kind, size)
+            )
+        writes = [p for p in parsed if p[0] in ("set", "incrby")]
+        if not writes:
+            return "safe", (
+                "kv_bitfield %r — reads fields, changes nothing"
+                % key
+            )
+        if large:
+            return "caution", (
+                "kv_bitfield %r — changes fields of a large string "
+                "of %s that %s" % (key, size, ttl_text)
+            )
+        return "safe", (
+            "kv_bitfield %r — changes fields of a string of %s "
+            "that %s" % (key, size, ttl_text)
         )
     if name in ("kv_decr", "kv_decrby"):
         if name == "kv_decrby" and "by" not in op:
