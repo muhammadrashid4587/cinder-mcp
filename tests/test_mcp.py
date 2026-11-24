@@ -2,7 +2,7 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -238,6 +238,20 @@ class FakeCinder(threading.Thread):
             return self._bulk(element)
         elif name == "SMEMBERS" and len(args) == 1:
             return self._container_items(args[0], set)
+        elif name == "SADD" and len(args) >= 2:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, set):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                value = set()
+                self.store[args[0]] = (value, None)
+            added = 0
+            for member in args[1:]:
+                if member not in value:
+                    added += 1
+                value.add(member)
+            return ":%d\r\n" % added
         elif name == "HSET" and len(args) >= 3 and len(args) % 2 == 1:
             value = self._get(args[0])
             if value is not None and not isinstance(value, dict):
@@ -721,6 +735,7 @@ class McpTests(unittest.TestCase):
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
+                    "kv_sadd", "kv_smembers", "kv_scard",
                     "kv_batch"]
         )
 
@@ -1662,6 +1677,143 @@ class McpTests(unittest.TestCase):
         self.assertIn("error", bad)
         untouched = self._call("tools/call", 4, {
             "name": "kv_exists", "arguments": {"key": "q3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_set_add_members_card(self):
+        added = self._call("tools/call", 1, {
+            "name": "kv_sadd",
+            "arguments": {"key": "tags",
+                          "members": ["a", "b", "c"]},
+        })
+        self.assertEqual(added["result"]["content"][0]["text"], "3")
+        # Re-adding a member already present adds 0 for it; a new
+        # member still counts.
+        again = self._call("tools/call", 2, {
+            "name": "kv_sadd",
+            "arguments": {"key": "tags", "members": ["b", "d"]},
+        })
+        self.assertEqual(again["result"]["content"][0]["text"], "1")
+        members = self._call("tools/call", 3, {
+            "name": "kv_smembers", "arguments": {"key": "tags"},
+        })
+        self.assertEqual(
+            sorted(json.loads(members["result"]["content"][0]["text"])),
+            ["a", "b", "c", "d"],
+        )
+        card = self._call("tools/call", 4, {
+            "name": "kv_scard", "arguments": {"key": "tags"},
+        })
+        self.assertEqual(card["result"]["content"][0]["text"], "4")
+        # A missing key has 0 members and an empty member list.
+        ghost_card = self._call("tools/call", 5, {
+            "name": "kv_scard", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost_card["result"]["content"][0]["text"], "0")
+        ghost_members = self._call("tools/call", 6, {
+            "name": "kv_smembers", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost_members["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_set_tools_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_sadd", "arguments": {"key": "s"}},
+            {"name": "kv_sadd", "arguments": {"members": ["a"]}},
+            {"name": "kv_sadd",
+             "arguments": {"key": "s", "members": []}},
+            {"name": "kv_sadd",
+             "arguments": {"key": "s", "members": "a"}},
+            {"name": "kv_sadd",
+             "arguments": {"key": "s", "members": ["a", 7]}},
+            {"name": "kv_smembers", "arguments": {}},
+            {"name": "kv_scard", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+        # A set wider than the cap fails instead of returning a
+        # silently truncated member list.
+        big = self._call("tools/call", len(cases) + 1, {
+            "name": "kv_sadd",
+            "arguments": {"key": "big",
+                          "members": ["m%d" % i for i in range(1001)]},
+        })
+        self.assertEqual(big["result"]["content"][0]["text"], "1001")
+        too_wide = self._call("tools/call", len(cases) + 2, {
+            "name": "kv_smembers", "arguments": {"key": "big"},
+        })
+        self.assertIn("error", too_wide)
+        self.assertEqual(too_wide["error"]["code"], -32602)
+        # The count itself is still readable on a huge set.
+        card = self._call("tools/call", len(cases) + 3, {
+            "name": "kv_scard", "arguments": {"key": "big"},
+        })
+        self.assertEqual(card["result"]["content"][0]["text"], "1001")
+
+    def test_tools_call_set_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for i, call in enumerate([
+            {"name": "kv_sadd",
+             "arguments": {"key": "plain", "members": ["m"]}},
+            {"name": "kv_smembers", "arguments": {"key": "plain"}},
+            {"name": "kv_scard", "arguments": {"key": "plain"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_set_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_sadd", "key": "s",
+                 "members": ["a", "b", "c"]},
+                {"op": "kv_smembers", "key": "s"},
+                {"op": "kv_scard", "key": "s"},
+                {"op": "kv_sadd", "key": "s", "members": ["b", "d"]},
+                {"op": "kv_scard", "key": "s"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(sorted(summary["results"][1]["result"]),
+                         ["a", "b", "c"])
+        self.assertEqual(summary["results"][2]["result"], 3)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        self.assertEqual(summary["results"][4]["result"], 4)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_sadd", "key": "s2",
+                 "members": ["x", "y"]},
+                {"op": "kv_smembers", "key": "s2"},
+                {"op": "kv_scard", "key": "s2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(sorted(summary["results"][1]["result"]),
+                         ["x", "y"])
+        self.assertEqual(summary["results"][2]["result"], 2)
+        # Bad set arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_sadd", "key": "s3", "members": ["a"]},
+                {"op": "kv_sadd", "key": "s3", "members": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "s3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
