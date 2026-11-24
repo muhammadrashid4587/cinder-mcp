@@ -292,6 +292,57 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_setbit",
+        "description": "Set one bit of the string stored at a key: SETBIT key offset bit. The offset must be 0 or more (at most 4294967295) and the bit 0 or 1. Returns the bit's old value (0 or 1). Creates the key zero-padded to the byte holding the offset when it does not exist — even when the bit being set is 0, the key comes into being — and preserves the key's TTL. Setting a bit that already holds the requested value changes nothing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "offset": {"type": "integer"},
+                "bit": {"type": "integer"},
+            },
+            "required": ["key", "offset", "bit"],
+        },
+    },
+    {
+        "name": "kv_getbit",
+        "description": "The bit of the string stored at a key: GETBIT key offset. The offset must be 0 or more (at most 4294967295). Returns 0 or 1; 0 when the key does not exist or the offset is past the end of the string.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "offset": {"type": "integer"},
+            },
+            "required": ["key", "offset"],
+        },
+    },
+    {
+        "name": "kv_bitcount",
+        "description": "The number of bits set to 1 in the string stored at a key: BITCOUNT key [start end]. `start` and `end` are byte indexes, both or neither; negative indexes count from the end and out-of-range ends are clamped, as in Redis. Returns 0 when the key does not exist. Cinder has no BYTE|BIT mode: the range is always in bytes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "start": {"type": "integer"},
+                "end": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_bitop",
+        "description": "Combine the strings stored at several keys bitwise and store the result: BITOP AND|OR|XOR|NOT destination key [key ...]. `operation` is \"and\", \"or\", \"xor\" or \"not\"; `sources` is the list of source keys. NOT takes exactly one source, the rest take at least two. Returns the length of the destination string in bytes — the length of the longest source. A missing source counts as empty, so when every source is missing or empty the destination is deleted and 0 is returned. Overwrites the destination wholesale and clears its TTL; the destination may also be one of the sources.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string"},
+                "destination": {"type": "string"},
+                "sources": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["operation", "destination", "sources"],
+        },
+    },
+    {
         "name": "kv_hset",
         "description": "Set fields on a hash: HSET key field value [field value ...]. Takes `fields` as an object mapping field names to values. Returns the number of fields that were newly added (updating an existing field returns 0 for it).",
         "inputSchema": {
@@ -864,7 +915,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -880,6 +931,7 @@ TOOLS = [
                             "ex": {"type": "integer"},
                             "px": {"type": "integer"},
                             "by": {"type": "integer"},
+                            "bit": {"type": "integer"},
                             "seconds": {"type": "integer"},
                             "milliseconds": {"type": "integer"},
                             "persist": {"type": "boolean"},
@@ -903,6 +955,8 @@ TOOLS = [
                             "min": {"type": ["number", "string"]},
                             "max": {"type": ["number", "string"]},
                             "offset": {"type": "integer"},
+                            "operation": {"type": "string"},
+                            "sources": {"type": "array", "items": {"type": "string"}},
                             "count": {"type": "integer"},
                             "withscores": {"type": "boolean"},
                             "rev": {"type": "boolean"},
@@ -982,6 +1036,7 @@ BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_getrange", "kv_setrange",
+    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
@@ -1065,6 +1120,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_getrange", "kv_setrange",
+    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
@@ -1523,6 +1579,20 @@ def _op_argv(name, args):
     if name == "kv_setrange":
         key, offset, value = _setrange_args(args)
         return ["SETRANGE", key, offset, value]
+    if name == "kv_setbit":
+        key, offset, bit = _setbit_args(args)
+        return ["SETBIT", key, offset, bit]
+    if name == "kv_getbit":
+        key, offset = _bit_offset_args(args, "kv_getbit")
+        return ["GETBIT", key, offset]
+    if name == "kv_bitcount":
+        key, start, end = _bitcount_args(args)
+        if start is None:
+            return ["BITCOUNT", key]
+        return ["BITCOUNT", key, start, end]
+    if name == "kv_bitop":
+        operation, destination, sources = _bitop_args(args)
+        return ["BITOP", operation, destination] + list(sources)
     if name == "kv_hset":
         return ["HSET", _require(args, "key")] + _hset_field_args(args)
     if name == "kv_hget":
@@ -1852,6 +1922,103 @@ def _setrange_args(args):
     if not isinstance(value, str):
         raise ValueError("kv_setrange value must be a string")
     return key, offset, value
+
+
+# The largest bit offset cinder accepts: 2^32 - 1, as in Redis.
+MAX_BIT_OFFSET = 4294967295
+
+
+def _bit_offset_args(args, name):
+    """Validate a kv_setbit / kv_getbit call: (key, offset). The
+    offset must be an integer from 0 to MAX_BIT_OFFSET — cinder
+    rejects anything else as a server error, so fail here as
+    invalid params instead."""
+    key = _require(args, "key")
+    offset = _require(args, "offset")
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError("%s offset must be an integer" % name)
+    if offset < 0 or offset > MAX_BIT_OFFSET:
+        raise ValueError(
+            "%s offset must be between 0 and %d, got %d"
+            % (name, MAX_BIT_OFFSET, offset)
+        )
+    return key, offset
+
+
+def _setbit_args(args):
+    """Validate a kv_setbit call: (key, offset, bit). The bit must
+    be 0 or 1 — cinder rejects anything else as a server error,
+    so fail here as invalid params instead."""
+    key, offset = _bit_offset_args(args, "kv_setbit")
+    bit = _require(args, "bit")
+    if isinstance(bit, bool) or not isinstance(bit, int):
+        raise ValueError("kv_setbit bit must be an integer")
+    if bit not in (0, 1):
+        raise ValueError("kv_setbit bit must be 0 or 1, got %d" % bit)
+    return key, offset, bit
+
+
+def _bitcount_args(args):
+    """Validate a kv_bitcount call: (key, start, end). start and
+    end are byte indexes, both or neither — cinder rejects a call
+    with only one bound as a wrong number of arguments, so fail
+    here as invalid params instead. Negative indexes count from
+    the end and out-of-range ends are clamped by cinder. There is
+    no BYTE|BIT mode in cinder: BITCOUNT key 0 -1 BIT is a wrong
+    number of arguments there, so the tool does not offer it."""
+    key = _require(args, "key")
+    start = args.get("start")
+    end = args.get("end")
+    if (start is None) != (end is None):
+        raise ValueError(
+            "kv_bitcount takes start and end together, or neither"
+        )
+    if start is not None:
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise ValueError("kv_bitcount start must be an integer")
+        if isinstance(end, bool) or not isinstance(end, int):
+            raise ValueError("kv_bitcount end must be an integer")
+    return key, start, end
+
+
+def _bitop_args(args):
+    """Validate a kv_bitop call: (operation, destination, sources).
+    `operation` is "and", "or", "xor" or "not" in any case, sent
+    uppercase; `sources` is a non-empty list of key names. NOT
+    takes exactly one source and the rest take at least two —
+    cinder rejects the wrong count as a server error, so fail
+    here as invalid params instead. An unknown operation is a
+    syntax error in cinder, so fail here too. The argument is
+    called `operation`, not `op`: inside kv_batch each op already
+    carries an "op" naming the tool, so a bitop "op" would
+    collide with it."""
+    operation = _require(args, "operation")
+    if not isinstance(operation, str) \
+            or operation.lower() not in ("and", "or", "xor", "not"):
+        raise ValueError(
+            "kv_bitop operation must be \"and\", \"or\", \"xor\" or "
+            "\"not\""
+        )
+    operation = operation.upper()
+    destination = _require(args, "destination")
+    if not isinstance(destination, str):
+        raise ValueError("kv_bitop destination must be a string")
+    sources = args.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("kv_bitop sources must be a non-empty list")
+    for source in sources:
+        if not isinstance(source, str):
+            raise ValueError("kv_bitop sources must be strings")
+    if operation == "NOT":
+        if len(sources) != 1:
+            raise ValueError(
+                "kv_bitop NOT takes exactly one source key"
+            )
+    elif len(sources) < 2:
+        raise ValueError(
+            "kv_bitop %s takes at least two source keys" % operation
+        )
+    return operation, destination, sources
 
 
 def _hincrby_args(args):

@@ -312,6 +312,131 @@ class FakeCinder(threading.Thread):
                 new_value = value[:offset] + args[2] + value[offset + len(args[2]):]
             self.store[args[0]] = (new_value, expires)
             return ":%d\r\n" % len(new_value)
+        elif name == "SETBIT" and len(args) == 3:
+            try:
+                offset = int(args[1])
+                bit = int(args[2])
+            except ValueError:
+                return "-ERR bit offset is not an integer or out of range\r\n"
+            if offset < 0 or offset > 4294967295:
+                return "-ERR bit offset is not an integer or out of range\r\n"
+            if bit not in (0, 1):
+                return "-ERR bit is not an integer or out of range\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            # SETBIT preserves the TTL, as in real cinder, and
+            # creates a missing key zero-padded to the byte holding
+            # the offset — even when the bit being set is 0.
+            expires = self.store[args[0]][1] if args[0] in self.store else None
+            if value is None:
+                value = ""
+            byte = offset // 8
+            if byte >= len(value):
+                value = value + "\x00" * (byte + 1 - len(value))
+            mask = 0x80 >> (offset % 8)
+            old = 1 if ord(value[byte]) & mask else 0
+            if bit:
+                new_byte = chr(ord(value[byte]) | mask)
+            else:
+                new_byte = chr(ord(value[byte]) & ~mask)
+            value = value[:byte] + new_byte + value[byte + 1:]
+            self.store[args[0]] = (value, expires)
+            return ":%d\r\n" % old
+        elif name == "GETBIT" and len(args) == 2:
+            try:
+                offset = int(args[1])
+            except ValueError:
+                return "-ERR bit offset is not an integer or out of range\r\n"
+            if offset < 0 or offset > 4294967295:
+                return "-ERR bit offset is not an integer or out of range\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None or offset // 8 >= len(value):
+                return ":0\r\n"
+            mask = 0x80 >> (offset % 8)
+            return ":%d\r\n" % (1 if ord(value[offset // 8]) & mask else 0)
+        elif name == "BITCOUNT" and len(args) in (1, 3):
+            if len(args) == 3:
+                try:
+                    start, end = int(args[1]), int(args[2])
+                except ValueError:
+                    return "-ERR value is not an integer or out of range\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                return ":0\r\n"
+            # Byte indexes, negative counts from the end,
+            # out-of-range ends are clamped, as in real cinder.
+            length = len(value)
+            lo, hi = 0, length - 1
+            if len(args) == 3:
+                lo = start if start >= 0 else start + length
+                hi = end if end >= 0 else end + length
+                if lo < 0:
+                    lo = 0
+                if hi >= length:
+                    hi = length - 1
+                if lo > hi or lo >= length:
+                    return ":0\r\n"
+            n = 0
+            for ch in value[lo:hi + 1]:
+                n += bin(ord(ch)).count("1")
+            return ":%d\r\n" % n
+        elif name == "BITOP" and len(args) >= 3:
+            operation = args[0].upper()
+            if operation not in ("AND", "OR", "XOR", "NOT"):
+                return "-ERR syntax error\r\n"
+            if operation == "NOT":
+                if len(args) != 3:
+                    return ("-ERR BITOP NOT must be called with a single "
+                            "source key.\r\n")
+            elif len(args) < 4:
+                return "-ERR wrong number of arguments for 'bitop' command\r\n"
+            dest, sources = args[1], args[2:]
+            dest_value = self._get(dest)
+            if dest_value is not None and not isinstance(dest_value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            vals = []
+            for source in sources:
+                value = self._get(source)
+                if value is not None and not isinstance(value, str):
+                    return ("-WRONGTYPE Operation against a key holding the "
+                            "wrong kind of value\r\n")
+                vals.append(value or "")
+            maxlen = max((len(v) for v in vals), default=0)
+            if maxlen == 0:
+                # Every source is missing: the destination is
+                # deleted, as in real cinder.
+                self.store.pop(dest, None)
+                return ":0\r\n"
+            result = bytearray(maxlen)
+            if operation == "AND":
+                for i in range(maxlen):
+                    result[i] = 0xFF
+                    for v in vals:
+                        result[i] &= ord(v[i]) if i < len(v) else 0
+            elif operation == "OR":
+                for v in vals:
+                    for i, ch in enumerate(v):
+                        result[i] |= ord(ch)
+            elif operation == "XOR":
+                for v in vals:
+                    for i, ch in enumerate(v):
+                        result[i] ^= ord(ch)
+            else:  # NOT, exactly one source
+                for i, ch in enumerate(vals[0]):
+                    result[i] = (~ord(ch)) & 0xFF
+            # Overwrites the destination wholesale and clears its
+            # TTL, as in real cinder.
+            self.store[dest] = ("".join(chr(b) for b in result), None)
+            return ":%d\r\n" % maxlen
         elif name == "GETEX" and len(args) >= 1:
             # GETEX key [EX s | PX ms | PERSIST]: returns the value
             # and sets, refreshes, or removes its TTL; no option
@@ -1488,6 +1613,7 @@ class McpTests(unittest.TestCase):
                     "kv_append", "kv_strlen", "kv_decr", "kv_decrby",
                     "kv_getex",
                     "kv_getrange", "kv_setrange",
+                    "kv_setbit", "kv_getbit", "kv_bitcount", "kv_bitop",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
@@ -3722,6 +3848,376 @@ class McpTests(unittest.TestCase):
                 {"op": "kv_set", "key": "t", "value": "v"},
                 {"op": "kv_setrange", "key": "t",
                  "offset": -1, "value": "v"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "t"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_bit_tools(self):
+        # GETBIT on a missing key is 0, and SETBIT creates the key
+        # zero-padded to the byte holding the offset.
+        missing = self._call("tools/call", 1, {
+            "name": "kv_getbit", "arguments": {"key": "bits", "offset": 7},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "0")
+        first = self._call("tools/call", 2, {
+            "name": "kv_setbit",
+            "arguments": {"key": "bits", "offset": 7, "bit": 1},
+        })
+        self.assertEqual(first["result"]["content"][0]["text"], "0")
+        read_back = self._call("tools/call", 3, {
+            "name": "kv_getbit", "arguments": {"key": "bits", "offset": 7},
+        })
+        self.assertEqual(read_back["result"]["content"][0]["text"], "1")
+        unset = self._call("tools/call", 4, {
+            "name": "kv_getbit", "arguments": {"key": "bits", "offset": 0},
+        })
+        self.assertEqual(unset["result"]["content"][0]["text"], "0")
+        # SETBIT returns the old bit: setting a bit that already
+        # holds the value reports 1, and clearing it reports 1.
+        again = self._call("tools/call", 5, {
+            "name": "kv_setbit",
+            "arguments": {"key": "bits", "offset": 7, "bit": 1},
+        })
+        self.assertEqual(again["result"]["content"][0]["text"], "1")
+        cleared = self._call("tools/call", 6, {
+            "name": "kv_setbit",
+            "arguments": {"key": "bits", "offset": 7, "bit": 0},
+        })
+        self.assertEqual(cleared["result"]["content"][0]["text"], "1")
+        # A bit past the end of the string reads 0, and setting it
+        # grows the string with zero bytes.
+        far = self._call("tools/call", 7, {
+            "name": "kv_setbit",
+            "arguments": {"key": "bits", "offset": 10, "bit": 1},
+        })
+        self.assertEqual(far["result"]["content"][0]["text"], "0")
+        length = self._call("tools/call", 8, {
+            "name": "kv_strlen", "arguments": {"key": "bits"},
+        })
+        self.assertEqual(length["result"]["content"][0]["text"], "2")
+        count = self._call("tools/call", 9, {
+            "name": "kv_bitcount", "arguments": {"key": "bits"},
+        })
+        self.assertEqual(count["result"]["content"][0]["text"], "1")
+        # Setting a 0 bit on a missing key still creates the key,
+        # holding zero bytes.
+        created = self._call("tools/call", 10, {
+            "name": "kv_setbit",
+            "arguments": {"key": "zero", "offset": 16, "bit": 0},
+        })
+        self.assertEqual(created["result"]["content"][0]["text"], "0")
+        exists = self._call("tools/call", 11, {
+            "name": "kv_exists", "arguments": {"key": "zero"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "1")
+        zero_len = self._call("tools/call", 12, {
+            "name": "kv_strlen", "arguments": {"key": "zero"},
+        })
+        self.assertEqual(zero_len["result"]["content"][0]["text"], "3")
+        zero_count = self._call("tools/call", 13, {
+            "name": "kv_bitcount", "arguments": {"key": "zero"},
+        })
+        self.assertEqual(zero_count["result"]["content"][0]["text"], "0")
+        # BITCOUNT counts set bits over the whole string, and over
+        # byte ranges with negative indexes and clamping.
+        self._call("tools/call", 14, {
+            "name": "kv_set",
+            "arguments": {"key": "foo", "value": "foobar"},
+        })
+        whole = self._call("tools/call", 15, {
+            "name": "kv_bitcount", "arguments": {"key": "foo"},
+        })
+        self.assertEqual(whole["result"]["content"][0]["text"], "26")
+        first_byte = self._call("tools/call", 16, {
+            "name": "kv_bitcount",
+            "arguments": {"key": "foo", "start": 0, "end": 0},
+        })
+        self.assertEqual(first_byte["result"]["content"][0]["text"], "4")
+        last_byte = self._call("tools/call", 17, {
+            "name": "kv_bitcount",
+            "arguments": {"key": "foo", "start": -1, "end": -1},
+        })
+        self.assertEqual(last_byte["result"]["content"][0]["text"], "4")
+        middle = self._call("tools/call", 18, {
+            "name": "kv_bitcount",
+            "arguments": {"key": "foo", "start": 1, "end": 2},
+        })
+        self.assertEqual(middle["result"]["content"][0]["text"], "12")
+        empty_range = self._call("tools/call", 19, {
+            "name": "kv_bitcount",
+            "arguments": {"key": "foo", "start": 5, "end": 2},
+        })
+        self.assertEqual(empty_range["result"]["content"][0]["text"], "0")
+        clamped = self._call("tools/call", 20, {
+            "name": "kv_bitcount",
+            "arguments": {"key": "foo", "start": 0, "end": 100},
+        })
+        self.assertEqual(clamped["result"]["content"][0]["text"], "26")
+        ghost = self._call("tools/call", 21, {
+            "name": "kv_bitcount", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost["result"]["content"][0]["text"], "0")
+        # SETBIT preserves the TTL, as in Redis.
+        self._call("tools/call", 22, {
+            "name": "kv_set",
+            "arguments": {"key": "expiring", "value": "abcdef", "ex": 100},
+        })
+        self._call("tools/call", 23, {
+            "name": "kv_setbit",
+            "arguments": {"key": "expiring", "offset": 0, "bit": 1},
+        })
+        ttl = self._call("tools/call", 24, {
+            "name": "kv_ttl", "arguments": {"key": "expiring"},
+        })
+        self.assertTrue(0 < int(ttl["result"]["content"][0]["text"]) <= 100)
+        # BITOP combines strings bitwise: 0x55 AND/OR/XOR 0x2a is
+        # 0x00 / 0x7f / 0x7f, and NOT 0x55 is 0xaa. The result is
+        # checked with BITCOUNT, since the bytes are not text.
+        self._call("tools/call", 25, {
+            "name": "kv_set",
+            "arguments": {"key": "x", "value": "\x55"},
+        })
+        self._call("tools/call", 26, {
+            "name": "kv_set",
+            "arguments": {"key": "y", "value": "\x2a"},
+        })
+        anded = self._call("tools/call", 27, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "and", "destination": "d-and",
+                          "sources": ["x", "y"]},
+        })
+        self.assertEqual(anded["result"]["content"][0]["text"], "1")
+        and_count = self._call("tools/call", 28, {
+            "name": "kv_bitcount", "arguments": {"key": "d-and"},
+        })
+        self.assertEqual(and_count["result"]["content"][0]["text"], "0")
+        ored = self._call("tools/call", 29, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "OR", "destination": "d-or",
+                          "sources": ["x", "y"]},
+        })
+        self.assertEqual(ored["result"]["content"][0]["text"], "1")
+        or_count = self._call("tools/call", 30, {
+            "name": "kv_bitcount", "arguments": {"key": "d-or"},
+        })
+        self.assertEqual(or_count["result"]["content"][0]["text"], "7")
+        xored = self._call("tools/call", 31, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "xor", "destination": "d-xor",
+                          "sources": ["x", "y"]},
+        })
+        self.assertEqual(xored["result"]["content"][0]["text"], "1")
+        xor_count = self._call("tools/call", 32, {
+            "name": "kv_bitcount", "arguments": {"key": "d-xor"},
+        })
+        self.assertEqual(xor_count["result"]["content"][0]["text"], "7")
+        noted = self._call("tools/call", 33, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "not", "destination": "d-not",
+                          "sources": ["x"]},
+        })
+        self.assertEqual(noted["result"]["content"][0]["text"], "1")
+        not_count = self._call("tools/call", 34, {
+            "name": "kv_bitcount", "arguments": {"key": "d-not"},
+        })
+        self.assertEqual(not_count["result"]["content"][0]["text"], "4")
+        # Every source missing deletes the destination and returns 0.
+        self._call("tools/call", 35, {
+            "name": "kv_set",
+            "arguments": {"key": "doomed", "value": "zz"},
+        })
+        gone = self._call("tools/call", 36, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "and", "destination": "doomed",
+                          "sources": ["ghost1", "ghost2"]},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        gone_exists = self._call("tools/call", 37, {
+            "name": "kv_exists", "arguments": {"key": "doomed"},
+        })
+        self.assertEqual(gone_exists["result"]["content"][0]["text"], "0")
+        # BITOP overwrites the destination wholesale and clears its
+        # TTL, and the destination may also be a source.
+        self._call("tools/call", 38, {
+            "name": "kv_set",
+            "arguments": {"key": "ttl-dest", "value": "old", "ex": 100},
+        })
+        self._call("tools/call", 39, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "or", "destination": "ttl-dest",
+                          "sources": ["x", "y"]},
+        })
+        ttl_after = self._call("tools/call", 40, {
+            "name": "kv_ttl", "arguments": {"key": "ttl-dest"},
+        })
+        self.assertEqual(ttl_after["result"]["content"][0]["text"], "-1")
+        self._call("tools/call", 41, {
+            "name": "kv_bitop",
+            "arguments": {"operation": "and", "destination": "x",
+                          "sources": ["x", "y"]},
+        })
+        x_count = self._call("tools/call", 42, {
+            "name": "kv_bitcount", "arguments": {"key": "x"},
+        })
+        self.assertEqual(x_count["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_bit_tools_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_setbit", "arguments": {}},
+            {"name": "kv_setbit", "arguments": {"key": "a"}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": 0}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": -1, "bit": 1}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": 4294967296, "bit": 1}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": "0", "bit": 1}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": True, "bit": 1}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": 0, "bit": 2}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": 0, "bit": -1}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": 0, "bit": "1"}},
+            {"name": "kv_setbit",
+             "arguments": {"key": "a", "offset": 0, "bit": True}},
+            {"name": "kv_getbit", "arguments": {}},
+            {"name": "kv_getbit", "arguments": {"key": "a"}},
+            {"name": "kv_getbit",
+             "arguments": {"key": "a", "offset": -1}},
+            {"name": "kv_getbit",
+             "arguments": {"key": "a", "offset": 4294967296}},
+            {"name": "kv_getbit",
+             "arguments": {"key": "a", "offset": "0"}},
+            {"name": "kv_bitcount", "arguments": {}},
+            {"name": "kv_bitcount",
+             "arguments": {"key": "a", "start": 0}},
+            {"name": "kv_bitcount",
+             "arguments": {"key": "a", "end": -1}},
+            {"name": "kv_bitcount",
+             "arguments": {"key": "a", "start": "0", "end": -1}},
+            {"name": "kv_bitcount",
+             "arguments": {"key": "a", "start": 0, "end": True}},
+            {"name": "kv_bitop", "arguments": {}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and"}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "d"}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "nand", "destination": "d",
+                           "sources": ["a", "b"]}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": 5, "destination": "d",
+                           "sources": ["a", "b"]}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "d",
+                           "sources": []}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "d",
+                           "sources": "a"}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "d",
+                           "sources": [1, "b"]}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "not", "destination": "d",
+                           "sources": ["a", "b"]}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "d",
+                           "sources": ["a"]}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "or", "destination": "d",
+                           "sources": ["a"]}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_bit_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        for i, call in enumerate([
+            {"name": "kv_setbit",
+             "arguments": {"key": "queue", "offset": 0, "bit": 1}},
+            {"name": "kv_getbit",
+             "arguments": {"key": "queue", "offset": 0}},
+            {"name": "kv_bitcount",
+             "arguments": {"key": "queue"}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "d",
+                           "sources": ["queue", "x"]}},
+            {"name": "kv_bitop",
+             "arguments": {"operation": "and", "destination": "queue",
+                           "sources": ["x", "y"]}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_bit_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_setbit", "key": "b", "offset": 0, "bit": 1},
+                {"op": "kv_setbit", "key": "b", "offset": 7, "bit": 1},
+                {"op": "kv_getbit", "key": "b", "offset": 0},
+                {"op": "kv_bitcount", "key": "b"},
+                {"op": "kv_setbit", "key": "c", "offset": 1, "bit": 1},
+                {"op": "kv_bitop", "operation": "or", "destination": "d",
+                 "sources": ["b", "c"]},
+                {"op": "kv_bitcount", "key": "d"},
+                {"op": "kv_bitop", "operation": "not", "destination": "e",
+                 "sources": ["c"]},
+                {"op": "kv_bitcount", "key": "e"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 9)
+        self.assertEqual(summary["results"][0]["result"], 0)
+        self.assertEqual(summary["results"][1]["result"], 0)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 2)
+        self.assertEqual(summary["results"][4]["result"], 0)
+        self.assertEqual(summary["results"][5]["result"], 1)
+        self.assertEqual(summary["results"][6]["result"], 3)
+        self.assertEqual(summary["results"][7]["result"], 1)
+        self.assertEqual(summary["results"][8]["result"], 7)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_setbit", "key": "b2", "offset": 3, "bit": 1},
+                {"op": "kv_getbit", "key": "b2", "offset": 3},
+                {"op": "kv_bitcount", "key": "b2"},
+                {"op": "kv_bitop", "operation": "and",
+                 "destination": "d2", "sources": ["b2", "b2"]},
+                {"op": "kv_bitcount", "key": "d2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 0)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        self.assertEqual(summary["results"][4]["result"], 1)
+        # A bad bitop argument fails an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "t", "value": "v"},
+                {"op": "kv_bitop", "operation": "not",
+                 "destination": "d", "sources": ["a", "b"]},
             ]},
         })
         self.assertIn("error", bad)
@@ -6944,9 +7440,11 @@ class McpTests(unittest.TestCase):
             {"op": "kv_zrangebylex", "key": "a"},
             {"op": "kv_zlexcount", "key": "a"},
             {"op": "kv_getrange", "key": "a"},
+            {"op": "kv_getbit", "key": "a", "offset": 0},
+            {"op": "kv_bitcount", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 10 op(s), 1 audited, 9 not audited.", text)
+        self.assertIn("Plan: 12 op(s), 1 audited, 11 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -6956,6 +7454,133 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 7: kv_zrangebylex is a read, not a write", text)
         self.assertIn("op 8: kv_zlexcount is a read, not a write", text)
         self.assertIn("op 9: kv_getrange is a read, not a write", text)
+        self.assertIn("op 10: kv_getbit is a read, not a write", text)
+        self.assertIn("op 11: kv_bitcount is a read, not a write", text)
+
+    def test_prompts_get_write_safety_bit_tools(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "bits", "value": "foobar"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set",
+            "arguments": {"key": "soon-bits", "value": "v", "ex": 3600},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "big-bits", "value": "x" * 2000},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set",
+            "arguments": {"key": "dest-forever", "value": "old"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_setbit", "key": "bits", "offset": 0, "bit": 1},
+            {"op": "kv_setbit", "key": "bits", "offset": 1, "bit": 1},
+            {"op": "kv_setbit", "key": "big-bits", "offset": 0, "bit": 1},
+            {"op": "kv_setbit", "key": "todo", "offset": 0, "bit": 1},
+            {"op": "kv_setbit", "key": "ghost-bits", "offset": 0,
+             "bit": 1},
+            {"op": "kv_setbit", "key": "ghost-bits2", "offset": 16,
+             "bit": 0},
+            {"op": "kv_setbit", "key": "bits", "offset": -1, "bit": 1},
+            {"op": "kv_setbit", "key": "bits", "offset": 0, "bit": 2},
+            {"op": "kv_bitop", "operation": "or",
+             "destination": "dest-forever",
+             "sources": ["bits", "soon-bits"]},
+            {"op": "kv_bitop", "operation": "and",
+             "destination": "new-dest",
+             "sources": ["bits", "soon-bits"]},
+            {"op": "kv_bitop", "operation": "and",
+             "destination": "dest-forever",
+             "sources": ["ghost1", "ghost2"]},
+            {"op": "kv_bitop", "operation": "and",
+             "destination": "ghost-dest",
+             "sources": ["ghost1", "ghost2"]},
+            {"op": "kv_bitop", "operation": "xor",
+             "destination": "dest-forever",
+             "sources": ["bits", "todo"]},
+            {"op": "kv_bitop", "operation": "or",
+             "destination": "todo",
+             "sources": ["bits", "soon-bits"]},
+            {"op": "kv_getbit", "key": "bits", "offset": 0},
+            {"op": "kv_bitcount", "key": "bits"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 16 op(s), 14 audited, 2 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_setbit 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 6: kv_setbit 'bits' — would fail: offset is out of "
+            "range",
+            risky,
+        )
+        self.assertIn(
+            "op 7: kv_setbit 'bits' — would fail: bit must be 0 or 1",
+            risky,
+        )
+        self.assertIn(
+            "op 8: kv_bitop 'dest-forever' — overwrites a key that "
+            "never expires; its TTL is cleared too",
+            risky,
+        )
+        self.assertIn(
+            "op 10: kv_bitop 'dest-forever' — deletes a key that "
+            "never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 12: kv_bitop 'dest-forever' — would fail with "
+            "WRONGTYPE: source 'todo' is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 13: kv_bitop 'todo' — would fail with WRONGTYPE: "
+            "the destination is a list of 2 elements",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_setbit 'big-bits' — flips one bit of a large "
+            "string of 2000 bytes that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 4: kv_setbit 'ghost-bits' — creates a new string key "
+            "with no expiry, zero-padded to 1 byte(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 5: kv_setbit 'ghost-bits2' — creates a new string "
+            "key with no expiry, zero-padded to 3 byte(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 9: kv_bitop 'new-dest' — creates a new key with no "
+            "expiry from the AND of 2 source(s)",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_setbit 'bits' — flips bit 0 of a string of "
+            "6 bytes that no expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 1: kv_setbit 'bits' — no-op, bit 1 already holds 1",
+            safe,
+        )
+        self.assertIn(
+            "op 11: kv_bitop 'ghost-dest' — no-op, every source is "
+            "missing and there is no destination to delete",
+            safe,
+        )
+        self.assertIn("op 14: kv_getbit is a read, not a write", text)
+        self.assertIn("op 15: kv_bitcount is a read, not a write", text)
 
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
@@ -9014,6 +9639,235 @@ class LiveCinderMigrationTests(unittest.TestCase):
                           "offset": -1, "value": "x"}})
         self.assertIn("error", reply)
         self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_live_bit_tools(self):
+        """kv_setbit / kv_getbit / kv_bitcount / kv_bitop against a
+        real cinder 0.45.1: SETBIT returns the old bit and creates a
+        missing key zero-padded, GETBIT reads 0 past the end,
+        BITCOUNT counts set bits over the whole string and over
+        byte ranges, BITOP combines bitwise and deletes the
+        destination when every source is missing, SETBIT preserves
+        the TTL and BITOP clears it, and the bit commands are
+        WRONGTYPE on a container key."""
+        self.assertEqual(
+            self._tool("kv_getbit", {"key": "bit:a", "offset": 7}), 0)
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:a", "offset": 0,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:a", "offset": 7,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_getbit", {"key": "bit:a", "offset": 0}), 1)
+        self.assertEqual(
+            self._tool("kv_getbit", {"key": "bit:a", "offset": 7}), 1)
+        self.assertEqual(
+            self._tool("kv_getbit", {"key": "bit:a", "offset": 1}), 0)
+        # Setting a bit that already holds the value reports 1.
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:a", "offset": 0,
+                                     "bit": 1}),
+            1)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:a"}), 2)
+        self.assertEqual(
+            self._tool("kv_strlen", {"key": "bit:a"}), 1)
+        # A bit past the end grows the string with zero bytes.
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:b", "offset": 10,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_strlen", {"key": "bit:b"}), 2)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:b"}), 1)
+        # Setting a 0 bit on a missing key still creates the key.
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:c", "offset": 16,
+                                     "bit": 0}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "bit:c"}), 1)
+        self.assertEqual(
+            self._tool("kv_strlen", {"key": "bit:c"}), 3)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:c"}), 0)
+        # BITCOUNT over "foobar": 26 set bits in all, 4 in the
+        # first and last bytes, 12 across bytes 1-2.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "bit:foo", "value": "foobar"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo"}), 26)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo",
+                                      "start": 0, "end": 0}),
+            4)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo",
+                                      "start": 0, "end": -1}),
+            26)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo",
+                                      "start": -1, "end": -1}),
+            4)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo",
+                                      "start": 1, "end": 2}),
+            12)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo",
+                                      "start": 5, "end": 2}),
+            0)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:foo",
+                                      "start": 0, "end": 100}),
+            26)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:ghost"}), 0)
+        # SETBIT preserves the TTL, as in Redis.
+        self.assertEqual(
+            self._tool("kv_setex", {"key": "bit:ttl", "seconds": 100,
+                                   "value": "abcdef"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:ttl", "offset": 0,
+                                     "bit": 1}),
+            0)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "bit:ttl"}), 0)
+        # BITOP: x is 0xc0 (bits 0, 1), y is 0xa0 (bits 0, 2), so
+        # AND is 0x80 (1 bit), OR is 0xe0 (3 bits), XOR is 0x60
+        # (2 bits), and NOT x is 0x3f (6 bits).
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:x", "offset": 0,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:x", "offset": 1,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:y", "offset": 0,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_setbit", {"key": "bit:y", "offset": 2,
+                                     "bit": 1}),
+            0)
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "and",
+                                    "destination": "bit:and",
+                                    "sources": ["bit:x", "bit:y"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:and"}), 1)
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "or",
+                                    "destination": "bit:or",
+                                    "sources": ["bit:x", "bit:y"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:or"}), 3)
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "xor",
+                                    "destination": "bit:xor",
+                                    "sources": ["bit:x", "bit:y"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:xor"}), 2)
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "NOT",
+                                    "destination": "bit:not",
+                                    "sources": ["bit:x"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:not"}), 6)
+        # Every source missing deletes the destination and
+        # returns 0.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "bit:doomed",
+                                  "value": "zz"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "and",
+                                    "destination": "bit:doomed",
+                                    "sources": ["bit:ghost1",
+                                              "bit:ghost2"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "bit:doomed"}), 0)
+        # BITOP overwrites the destination wholesale and clears
+        # its TTL, and the destination may also be a source.
+        self.assertEqual(
+            self._tool("kv_setex", {"key": "bit:ttl2", "seconds": 100,
+                                   "value": "old"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "or",
+                                    "destination": "bit:ttl2",
+                                    "sources": ["bit:x", "bit:y"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_ttl", {"key": "bit:ttl2"}), -1)
+        self.assertEqual(
+            self._tool("kv_bitop", {"operation": "and",
+                                    "destination": "bit:x",
+                                    "sources": ["bit:x", "bit:y"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_bitcount", {"key": "bit:x"}), 1)
+        # WRONGTYPE on a list key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_rpush", {"key": "bit:list",
+                                    "elements": ["a"]}),
+            1)
+        for call in ({"name": "kv_setbit",
+                      "arguments": {"key": "bit:list", "offset": 0,
+                                    "bit": 1}},
+                     {"name": "kv_getbit",
+                      "arguments": {"key": "bit:list", "offset": 0}},
+                     {"name": "kv_bitcount",
+                      "arguments": {"key": "bit:list"}},
+                     {"name": "kv_bitop",
+                      "arguments": {"operation": "and",
+                                    "destination": "bit:d",
+                                    "sources": ["bit:list", "bit:y"]}},
+                     {"name": "kv_bitop",
+                      "arguments": {"operation": "and",
+                                    "destination": "bit:list",
+                                    "sources": ["bit:x", "bit:y"]}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+        for call in ({"name": "kv_setbit",
+                      "arguments": {"key": "bit:a", "offset": -1,
+                                    "bit": 1}},
+                     {"name": "kv_setbit",
+                      "arguments": {"key": "bit:a", "offset": 4294967296,
+                                    "bit": 1}},
+                     {"name": "kv_setbit",
+                      "arguments": {"key": "bit:a", "offset": 0,
+                                    "bit": 2}},
+                     {"name": "kv_bitcount",
+                      "arguments": {"key": "bit:foo", "start": 0}},
+                     {"name": "kv_bitop",
+                      "arguments": {"operation": "and",
+                                    "destination": "bit:d",
+                                    "sources": ["bit:x"]}},
+                     {"name": "kv_bitop",
+                      "arguments": {"operation": "not",
+                                    "destination": "bit:d",
+                                    "sources": ["bit:x", "bit:y"]}},
+                     {"name": "kv_bitop",
+                      "arguments": {"operation": "nand",
+                                    "destination": "bit:d",
+                                    "sources": ["bit:x", "bit:y"]}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
 
 
 if __name__ == "__main__":

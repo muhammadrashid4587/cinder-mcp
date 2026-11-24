@@ -126,13 +126,15 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_set", "kv_del", "kv_incr", "kv_expire",
     "kv_mset", "kv_setnx", "kv_setex", "kv_getset", "kv_getdel",
     "kv_append", "kv_decr", "kv_decrby", "kv_getex", "kv_setrange",
+    "kv_setbit", "kv_bitop",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
-                         "kv_strlen", "kv_getrange", "kv_hscan",
+                         "kv_strlen", "kv_getrange", "kv_getbit",
+                         "kv_bitcount", "kv_hscan",
                          "kv_hkeys", "kv_hvals",
                          "kv_zrandmember", "kv_zscan", "kv_zrangebylex",
                          "kv_zlexcount", "kv_lindex")
@@ -249,7 +251,10 @@ PROMPTS = [
             "non-integer field or a container, HINCRBYFLOATs that "
             "would fail on a non-float field or a container, "
             "HSETNXes that would fail on a container, APPENDs that "
-            "would fail, GETEXes that would change or remove a TTL, "
+            "would fail, SETBITs that would fail on a container or "
+            "with a bad offset, BITOPs that would fail on a container "
+            "or overwrite a key that never expires, GETEXes that "
+            "would change or remove a TTL, "
             "ZPOPs that would drain a sorted set, LPUSHXes and "
             "RPUSHXes that would fail on a container, LTRIMs that "
             "would delete a list outright, LMOVEs that would fail "
@@ -1189,6 +1194,75 @@ def _setrange_audit_args(op):
     return offset, value
 
 
+def _setbit_audit_args(op):
+    """The (offset, bit) for a kv_setbit op in a write plan,
+    validated like the tool's own arguments: the offset must be
+    an integer and the bit an integer. An out-of-range offset or
+    a bit outside 0/1 is returned as-is — the caller reports it
+    as risky (it would fail in cinder) rather than not audited.
+    Anything else raises ValueError, so the caller reports the op
+    as not audited instead of guessing."""
+    offset = op.get("offset")
+    if offset is None:
+        raise ValueError("kv_setbit is missing offset: %r" % (op,))
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError(
+            "kv_setbit offset must be an integer: %r" % (offset,)
+        )
+    bit = op.get("bit")
+    if bit is None:
+        raise ValueError("kv_setbit is missing bit: %r" % (op,))
+    if isinstance(bit, bool) or not isinstance(bit, int):
+        raise ValueError(
+            "kv_setbit bit must be an integer: %r" % (bit,)
+        )
+    return offset, bit
+
+
+def _bitop_audit_args(op):
+    """The (operation, destination, sources) for a kv_bitop op in
+    a write plan, validated like the tool's own arguments: the
+    operation is "and", "or", "xor" or "not" in any case, the
+    destination a string, the sources a non-empty list of
+    strings, NOT with exactly one source and the rest with at
+    least two. Anything else raises ValueError, so the caller
+    reports the op as not audited instead of guessing."""
+    operation = op.get("operation")
+    if not isinstance(operation, str) \
+            or operation.lower() not in ("and", "or", "xor", "not"):
+        raise ValueError(
+            "kv_bitop operation must be \"and\", \"or\", \"xor\" or "
+            "\"not\": %r" % (op,)
+        )
+    destination = op.get("destination")
+    if not isinstance(destination, str):
+        raise ValueError(
+            "kv_bitop destination must be a string: %r" % (op,)
+        )
+    sources = op.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError(
+            "kv_bitop sources must be a non-empty list: %r" % (op,)
+        )
+    for source in sources:
+        if not isinstance(source, str):
+            raise ValueError(
+                "kv_bitop sources must be strings: %r" % (op,)
+            )
+    operation = operation.upper()
+    if operation == "NOT":
+        if len(sources) != 1:
+            raise ValueError(
+                "kv_bitop NOT takes exactly one source key: %r" % (op,)
+            )
+    elif len(sources) < 2:
+        raise ValueError(
+            "kv_bitop %s takes at least two source keys: %r"
+            % (operation, op)
+        )
+    return operation, destination, sources
+
+
 def _format_key_list(keys):
     """Key names quoted and comma-joined for one audit line, with
     the rest counted when there are more than a few: a kv_mset can
@@ -1358,6 +1432,123 @@ def _audit_lmove(client, op):
     )
 
 
+def _audit_bitop(client, op):
+    """Audit one kv_bitop op: the destination and every source are
+    probed live, because the op reads the sources, overwrites the
+    destination wholesale and clears its TTL — or deletes the
+    destination when every source is missing. Cinder fails with
+    WRONGTYPE on a container anywhere, destination or source, and
+    a missing source counts as empty. Returns (verdict, line)."""
+    operation, destination, sources = _bitop_audit_args(op)
+    # Sources first: a container source fails before the
+    # destination is touched.
+    live = 0
+    for source in sources:
+        if client.command("EXISTS", source) == 0:
+            continue
+        try:
+            kind, _sv, size, _sample = _inspect_key(client, source)
+        except ValueError:
+            # The source expired while auditing; it counts as
+            # missing now.
+            continue
+        if kind != "string":
+            return "risky", (
+                "kv_bitop %r — would fail with WRONGTYPE: source "
+                "%r is a %s of %s"
+                % (destination, source, kind, size)
+            )
+        live += 1
+    if live == 0:
+        # Every source is missing: the result is empty and the
+        # destination is deleted, as in Redis.
+        if client.command("EXISTS", destination) == 0:
+            return "safe", (
+                "kv_bitop %r — no-op, every source is missing and "
+                "there is no destination to delete" % destination
+            )
+        ttl = client.command("TTL", destination)
+        if ttl == -2:
+            return "safe", (
+                "kv_bitop %r — no-op, the destination expired while "
+                "auditing" % destination
+            )
+        try:
+            kind, size_value, size, _sample = _inspect_key(
+                client, destination)
+        except ValueError:
+            return "safe", (
+                "kv_bitop %r — no-op, the destination expired while "
+                "auditing" % destination
+            )
+        if kind != "string":
+            return "risky", (
+                "kv_bitop %r — would fail with WRONGTYPE: the "
+                "destination is a %s of %s"
+                % (destination, kind, size)
+            )
+        large = size_value >= HEALTH_BIG_STRING_BYTES
+        flags = []
+        if ttl == -1:
+            flags.append("deletes a key that never expires")
+        if large:
+            flags.append("deletes a large key (%s)" % size)
+        if flags:
+            return "risky", "kv_bitop %r — %s" % (
+                destination, "; ".join(flags))
+        return "caution", (
+            "kv_bitop %r — deletes a string of %s that %s, since "
+            "every source is missing"
+            % (destination, size,
+               "expires in %s" % _format_ttl(ttl))
+        )
+    # At least one source lives: the destination is overwritten
+    # wholesale and its TTL is cleared.
+    if client.command("EXISTS", destination) == 0:
+        return "caution", (
+            "kv_bitop %r — creates a new key with no expiry from "
+            "the %s of %d source(s)"
+            % (destination, operation, live)
+        )
+    ttl = client.command("TTL", destination)
+    if ttl == -2:
+        return "caution", (
+            "kv_bitop %r — creates a new key with no expiry from "
+            "the %s of %d source(s)"
+            % (destination, operation, live)
+        )
+    try:
+        kind, size_value, size, _sample = _inspect_key(
+            client, destination)
+    except ValueError:
+        return "caution", (
+            "kv_bitop %r — creates a new key with no expiry from "
+            "the %s of %d source(s)"
+            % (destination, operation, live)
+        )
+    if kind != "string":
+        return "risky", (
+            "kv_bitop %r — would fail with WRONGTYPE: the "
+            "destination is a %s of %s"
+            % (destination, kind, size)
+        )
+    large = size_value >= HEALTH_BIG_STRING_BYTES
+    flags = []
+    if ttl == -1:
+        flags.append("overwrites a key that never expires")
+    if large:
+        flags.append("overwrites a large key (%s)" % size)
+    if flags:
+        return "risky", "kv_bitop %r — %s; its TTL is cleared too" % (
+            destination, "; ".join(flags))
+    return "caution", (
+        "kv_bitop %r — overwrites a string of %s that %s with the "
+        "%s of %d source(s), clearing its TTL"
+        % (destination, size,
+           "expires in %s" % _format_ttl(ttl), operation, live)
+    )
+
+
 def _audit_write_op(client, op):
     """Audit one write op from a write plan against the live
     keyspace. Returns (verdict, line) where verdict is "safe",
@@ -1375,7 +1566,9 @@ def _audit_write_op(client, op):
     a non-integer or a container, a HINCRBY on a non-integer field
     or a container, a HINCRBYFLOAT on a non-float field or a
     container, a HSETNX on a container, an APPEND or SETRANGE on a
-    container, a SETRANGE with a negative offset, a GETEX or ZPOP
+    container, a SETRANGE with a negative offset, a SETBIT on a
+    container or with an offset out of range, a BITOP on a
+    container source or destination, a GETEX or ZPOP
     on a container, an LSET or LINSERT
     on a container, an LSET on a missing key or with an index out
     of range, an LPUSHX or RPUSHX on a container, an LTRIM that
@@ -1409,11 +1602,15 @@ def _audit_write_op(client, op):
     only reads a value, an LPUSHX, RPUSHX, or LTRIM on a missing
     key, an LMOVE out of a missing key or within one key, a
     SETRANGE that overwrites part of a string or writes an empty
-    value, or a no-op on a missing key.
+    value, a SETBIT that flips one bit of a string or finds the
+    bit already set, a BITOP over missing sources with no
+    destination to delete, or a no-op on a missing key.
     kv_mset has no single key — it writes several at once — so it
     is audited by _audit_mset instead of the single-key flow below.
     kv_lmove has two keys — a source and a destination — so it is
-    audited by _audit_lmove instead."""
+    audited by _audit_lmove instead. kv_bitop writes a destination
+    from several sources, so it is audited by _audit_bitop
+    instead."""
     name = op.get("op")
     if name not in WRITE_SAFETY_WRITE_OPS:
         raise ValueError("not a write op: %s" % name)
@@ -1424,6 +1621,10 @@ def _audit_write_op(client, op):
         # LMOVE writes two keys at once — a source and a
         # destination — so it is audited on its own.
         return _audit_lmove(client, op)
+    if name == "kv_bitop":
+        # BITOP writes a destination from several sources, so it
+        # is audited on its own.
+        return _audit_bitop(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))
@@ -1550,6 +1751,27 @@ def _audit_write_op(client, op):
             return "caution", (
                 "kv_setrange %r — creates a new string key with no "
                 "expiry" % key
+            )
+        if name == "kv_setbit":
+            # SETBIT on a missing key creates it zero-padded to
+            # the byte holding the offset, as in Redis — even
+            # when the bit being set is 0, the key comes into
+            # being.
+            offset, bit = _setbit_audit_args(op)
+            if offset < 0 or offset > 4294967295:
+                return "risky", (
+                    "kv_setbit %r — would fail: offset is out of "
+                    "range" % key
+                )
+            if bit not in (0, 1):
+                return "risky", (
+                    "kv_setbit %r — would fail: bit must be 0 or 1"
+                    % key
+                )
+            return "caution", (
+                "kv_setbit %r — creates a new string key with no "
+                "expiry, zero-padded to %d byte(s)"
+                % (key, offset // 8 + 1)
             )
         if name == "kv_getdel":
             return "safe", (
@@ -1763,6 +1985,41 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_setrange %r — overwrites part of a string of %s "
             "that %s" % (key, size, ttl_text)
+        )
+    if name == "kv_setbit":
+        # SETBIT flips one bit in place and keeps the key's TTL,
+        # like SETRANGE — it never replaces the key, so a
+        # never-expiring string is not on its own a risk. A bit
+        # that already holds the requested value changes nothing.
+        offset, bit = _setbit_audit_args(op)
+        if offset < 0 or offset > 4294967295:
+            return "risky", (
+                "kv_setbit %r — would fail: offset is out of range"
+                % key
+            )
+        if bit not in (0, 1):
+            return "risky", (
+                "kv_setbit %r — would fail: bit must be 0 or 1"
+                % key
+            )
+        if kind != "string":
+            return "risky", (
+                "kv_setbit %r — would fail with WRONGTYPE: the key "
+                "is a %s of %s" % (key, kind, size)
+            )
+        if client.command("GETBIT", key, offset) == bit:
+            return "safe", (
+                "kv_setbit %r — no-op, bit %d already holds %d"
+                % (key, offset, bit)
+            )
+        if large:
+            return "caution", (
+                "kv_setbit %r — flips one bit of a large string "
+                "of %s that %s" % (key, size, ttl_text)
+            )
+        return "safe", (
+            "kv_setbit %r — flips bit %d of a string of %s that %s"
+            % (key, offset, size, ttl_text)
         )
     if name in ("kv_decr", "kv_decrby"):
         if name == "kv_decrby" and "by" not in op:
