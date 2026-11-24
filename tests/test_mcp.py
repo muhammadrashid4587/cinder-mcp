@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1104,6 +1104,92 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     flat.append(repr(value.members[member]))
             return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
+        elif name == "ZRANGEBYLEX" and len(args) >= 3:
+            # Bounds are min first, or max first with REV, as in
+            # cinder: "-" is -inf (min only), "+" is +inf (max
+            # only), "[x" inclusive and "(x" exclusive. A bare
+            # member, the wrong infinity, or any other option
+            # (WITHSCORES included) is a syntax error. Members
+            # come back in lex order regardless of their scores;
+            # REV reverses that order before LIMIT applies.
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+
+            def parse_lex(text):
+                # Returns (kind, bound, exclusive), kind -1 = -inf,
+                # +1 = +inf, 0 = a finite bound, or None for bad
+                # syntax.
+                if text == "-":
+                    return (-1, None, False)
+                if text == "+":
+                    return (1, None, False)
+                if text.startswith(("[", "(")) and len(text) > 1:
+                    return (0, text[1:], text.startswith("("))
+                return None
+
+            rev = False
+            offset, count = 0, -1
+            i = 3
+            seen_limit = False
+            seen_rev = False
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "REV":
+                    if seen_rev:
+                        return "-ERR syntax error\r\n"
+                    rev = True
+                    seen_rev = True
+                    i += 1
+                elif opt == "LIMIT":
+                    if seen_limit or i + 2 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        offset, count = int(args[i + 1]), int(args[i + 2])
+                    except ValueError:
+                        return "-ERR syntax error\r\n"
+                    if offset < 0:
+                        return "-ERR syntax error\r\n"
+                    seen_limit = True
+                    i += 3
+                else:
+                    return "-ERR syntax error\r\n"
+            if rev:
+                parsed_hi = parse_lex(args[1])
+                parsed_lo = parse_lex(args[2])
+            else:
+                parsed_lo = parse_lex(args[1])
+                parsed_hi = parse_lex(args[2])
+            if parsed_lo is None or parsed_hi is None:
+                return "-ERR syntax error\r\n"
+            lo_kind, lo_bound, lo_excl = parsed_lo
+            hi_kind, hi_bound, hi_excl = parsed_hi
+            if lo_kind == 1 or hi_kind == -1:
+                return "-ERR syntax error\r\n"
+            matches = []
+            for member in sorted(value.members):
+                if lo_kind == 0:
+                    if member < lo_bound or (
+                            member == lo_bound and lo_excl):
+                        continue
+                if hi_kind == 0:
+                    if member > hi_bound or (
+                            member == hi_bound and hi_excl):
+                        continue
+                matches.append(member)
+            if rev:
+                matches.reverse()
+            if offset >= len(matches):
+                matches = []
+            else:
+                matches = matches[offset:]
+                if count >= 0:
+                    matches = matches[:count]
+            return "*%d\r\n" % len(matches) + "".join(
+                self._bulk(m) for m in matches)
         elif name == "DEL":
             n = sum(1 for k in args if self._get(k) is not None)
             for k in args:
@@ -1315,7 +1401,8 @@ class McpTests(unittest.TestCase):
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
                     "kv_hscan",
                     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
-                    "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
+                    "kv_zadd", "kv_zrange", "kv_zrangebyscore",
+                    "kv_zrangebylex", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
@@ -4607,6 +4694,218 @@ class McpTests(unittest.TestCase):
         self.assertIn("1000", summary["results"][1]["error"])
         self.assertEqual(summary["results"][2]["result"], 1001)
 
+    def test_tools_call_zrangebylex(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "words",
+                          "members": {"banana": 99, "apple": 1,
+                                      "cherry": 50, "apricot": 2,
+                                      "blueberry": 3}},
+        })
+        # No bounds: the whole set, in lex order regardless of
+        # score (banana scores 99 but sorts second).
+        whole = self._call("tools/call", 2, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words"},
+        })
+        self.assertEqual(
+            json.loads(whole["result"]["content"][0]["text"]),
+            ["apple", "apricot", "banana", "blueberry", "cherry"],
+        )
+        # Bounds are inclusive by default.
+        bounded = self._call("tools/call", 3, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "min": "[apricot",
+                          "max": "[blueberry"},
+        })
+        self.assertEqual(
+            json.loads(bounded["result"]["content"][0]["text"]),
+            ["apricot", "banana", "blueberry"],
+        )
+        # A leading '(' makes a bound exclusive.
+        exclusive = self._call("tools/call", 4, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "min": "(apricot",
+                          "max": "(blueberry"},
+        })
+        self.assertEqual(
+            json.loads(exclusive["result"]["content"][0]["text"]),
+            ["banana"],
+        )
+        # - / + as open ends mean no bound on that side.
+        open_ended = self._call("tools/call", 5, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "max": "[banana"},
+        })
+        self.assertEqual(
+            json.loads(open_ended["result"]["content"][0]["text"]),
+            ["apple", "apricot", "banana"],
+        )
+        # rev reads highest lex order first; bounds are still
+        # given min then max.
+        reversed_ = self._call("tools/call", 6, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "rev": True,
+                          "max": "[blueberry"},
+        })
+        self.assertEqual(
+            json.loads(reversed_["result"]["content"][0]["text"]),
+            ["blueberry", "banana", "apricot", "apple"],
+        )
+        # LIMIT pages through the matches, and applies to the
+        # reversed order when rev is set.
+        page = self._call("tools/call", 7, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "offset": 1, "count": 2},
+        })
+        self.assertEqual(
+            json.loads(page["result"]["content"][0]["text"]),
+            ["apricot", "banana"],
+        )
+        rev_page = self._call("tools/call", 8, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "rev": True,
+                          "offset": 1, "count": 2},
+        })
+        self.assertEqual(
+            json.loads(rev_page["result"]["content"][0]["text"]),
+            ["blueberry", "banana"],
+        )
+        # A range with no matches, and a missing key, both return [].
+        empty = self._call("tools/call", 9, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "words", "min": "[z"},
+        })
+        self.assertEqual(empty["result"]["content"][0]["text"], "[]")
+        missing = self._call("tools/call", 10, {
+            "name": "kv_zrangebylex", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_zrangebylex_rejects_bad_arguments(self):
+        cases = [
+            # Bad bounds: a bare member is a syntax error in
+            # cinder, as is the wrong infinity on a side, an empty
+            # bracket, and a non-string bound.
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "min": "apple"}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "min": "+"}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "max": "-"}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "min": "["}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "max": "("}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "min": 5}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "max": True}},
+            # Bad flags and paging: wrong types, negative offset,
+            # count below -1, count over the 1000-member cap.
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "rev": 1}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "offset": -1}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "offset": "1"}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "count": 1.5}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "count": -2}},
+            {"name": "kv_zrangebylex",
+             "arguments": {"key": "z", "count": 1001}},
+            {"name": "kv_zrangebylex", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zrangebylex_rejects_too_wide_a_range(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "big",
+                          "members": {"m%04d" % i: i
+                                      for i in range(1001)}},
+        })
+        # No limit over 1001 matches fails instead of truncating.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrangebylex", "arguments": {"key": "big"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # The same range with an explicit count inside the cap works.
+        page = self._call("tools/call", 3, {
+            "name": "kv_zrangebylex",
+            "arguments": {"key": "big", "count": 1000},
+        })
+        self.assertEqual(
+            len(json.loads(page["result"]["content"][0]["text"])), 1000,
+        )
+
+    def test_tools_call_zrangebylex_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrangebylex", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+
+    def test_tools_call_zrangebylex_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 3, "b": 1, "c": 2}},
+                {"op": "kv_zrangebylex", "key": "z",
+                 "min": "[b"},
+                {"op": "kv_zrangebylex", "key": "z",
+                 "min": "(a", "max": "(c", "rev": True},
+                {"op": "kv_zrangebylex", "key": "z",
+                 "offset": 1, "count": 1},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], ["b", "c"])
+        self.assertEqual(summary["results"][2]["result"], ["b"])
+        self.assertEqual(summary["results"][3]["result"], ["b"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zrangebylex", "key": "z2", "rev": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], ["y", "x"])
+        # A too-wide range inside an atomic batch is recorded as
+        # that op's error in place, while the rest still run.
+        wide = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "big",
+                 "members": {"m%04d" % i: i for i in range(1001)}},
+                {"op": "kv_zrangebylex", "key": "big"},
+                {"op": "kv_zcard", "key": "big"},
+            ]},
+        })
+        summary = json.loads(wide["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], 1001)
+        self.assertFalse(summary["results"][1]["ok"])
+        self.assertIn("1000", summary["results"][1]["error"])
+        self.assertEqual(summary["results"][2]["result"], 1001)
+
     def test_tools_call_zcount_zrevrank(self):
         self._call("tools/call", 1, {
             "name": "kv_zadd",
@@ -6204,15 +6503,17 @@ class McpTests(unittest.TestCase):
             {"op": "kv_set"},
             {"op": "kv_hscan", "key": "a"},
             {"op": "kv_zscan", "key": "a"},
+            {"op": "kv_zrangebylex", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 7 op(s), 1 audited, 6 not audited.", text)
+        self.assertIn("Plan: 8 op(s), 1 audited, 7 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
         self.assertIn("op 4: op is missing a key", text)
         self.assertIn("op 5: kv_hscan is a read, not a write", text)
         self.assertIn("op 6: kv_zscan is a read, not a write", text)
+        self.assertIn("op 7: kv_zrangebylex is a read, not a write", text)
 
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
@@ -8016,6 +8317,54 @@ class LiveCinderMigrationTests(unittest.TestCase):
                                      "start": 0, "stop": -1}),
             ["y", "z", "x"])
         self.assertEqual(self._tool("kv_llen", {"key": "rot"}), 3)
+
+    def test_live_zrangebylex(self):
+        """kv_zrangebylex against a real cinder 0.43.0: lex order
+        regardless of score, inclusive/exclusive bounds, REV with
+        max-first bounds, and LIMIT paging — plus the two syntax
+        errors cinder returns for a bare member and for WITHSCORES,
+        which the tool never sends."""
+        self.assertEqual(
+            self._tool("kv_zadd", {"key": "lex:words",
+                                   "members": {"banana": 99, "apple": 1,
+                                               "cherry": 50}}),
+            3)
+        # Lex order, not score order: banana scores 99 but sorts
+        # between apple and cherry.
+        self.assertEqual(
+            self._tool("kv_zrangebylex", {"key": "lex:words"}),
+            ["apple", "banana", "cherry"])
+        self.assertEqual(
+            self._tool("kv_zrangebylex", {"key": "lex:words",
+                                         "min": "(apple",
+                                         "max": "[cherry"}),
+            ["banana", "cherry"])
+        self.assertEqual(
+            self._tool("kv_zrangebylex", {"key": "lex:words",
+                                         "rev": True, "count": 2}),
+            ["cherry", "banana"])
+        self.assertEqual(
+            self._tool("kv_zrangebylex", {"key": "lex:words",
+                                         "offset": 1, "count": 1}),
+            ["banana"])
+        self.assertEqual(
+            self._tool("kv_zrangebylex", {"key": "lex:ghost"}), [])
+        # A bare member and the wrong infinity are syntax errors
+        # in cinder, surfaced as clean JSON-RPC errors here.
+        for arguments in ({"key": "lex:words", "min": "apple"},
+                          {"key": "lex:words", "min": "+"}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zrangebylex", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+        # Cinder has no WITHSCORES for ZRANGEBYLEX: ask it
+        # directly and confirm the syntax error, so the tool's
+        # choice not to offer the option stays grounded.
+        from cinder_mcp.resp import RespError
+        client = RespClient("127.0.0.1", self.PORT)
+        with self.assertRaises(RespError) as caught:
+            client.command("ZRANGEBYLEX", "lex:words", "-",
+                           "+", "WITHSCORES")
+        self.assertIn("syntax error", str(caught.exception))
 
 
 if __name__ == "__main__":

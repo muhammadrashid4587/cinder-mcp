@@ -465,6 +465,22 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zrangebylex",
+        "description": "Members of a sorted set whose names fall in a lex range, in lex order: ZRANGEBYLEX key min max [LIMIT offset count] [REV]. `min` and `max` default to \"-\" and \"+\"; pass \"[a\" for an inclusive bound, \"(a\" for an exclusive one, \"-\" for no lower bound and \"+\" for no upper bound — a bare member name is a syntax error in cinder, as is the wrong infinity on a side. Members come back in lex order regardless of their scores, and cinder has no WITHSCORES for this command. Pass rev=true to read highest lex order first (bounds still given min then max). Pass offset/count to page through the matches (count defaults to all); at most 1000 members per call, so narrow the range or pass a smaller count for a larger set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "min": {"type": "string"},
+                "max": {"type": "string"},
+                "rev": {"type": "boolean"},
+                "offset": {"type": "integer"},
+                "count": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_zcount",
         "description": "The number of members of a sorted set whose scores fall in a range: cinder has no ZCOUNT, so this counts by fetching the range with ZRANGEBYSCORE key min max and counting the members it returns. `min` and `max` default to -inf and +inf; pass a number or a string like \"5\", \"(5\" for an exclusive bound, \"-inf\" or \"+inf\". At most 1000 members per call, so a range holding more than that fails instead of returning a silently truncated count — narrow the range for a larger set.",
         "inputSchema": {
@@ -809,7 +825,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -929,7 +945,8 @@ BATCHABLE_TOOLS = {
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
-    "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
+    "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zrangebylex",
+    "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan",
@@ -1010,7 +1027,8 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
-    "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
+    "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zrangebylex",
+    "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan",
@@ -1174,6 +1192,21 @@ def _call_batch_atomic(client, ops):
                 results.append(
                     {"op": op_name, "ok": False,
                      "error": "kv_zrangebyscore returns at most %d "
+                              "members; narrow the range or pass a limit"
+                              % MAX_ZRANGE_MEMBERS})
+                continue
+            value = members
+        elif op_name == "kv_zrangebylex":
+            # ZRANGEBYLEX came back as a flat list inside the
+            # transaction; shape it like the standalone tool does.
+            # A range wider than the cap is recorded as this op's
+            # error, in place, like an EXEC-time failure — the rest
+            # still run.
+            members = _zrange_result(reply or [], False)
+            if len(members) > MAX_ZRANGE_MEMBERS:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_zrangebylex returns at most %d "
                               "members; narrow the range or pass a limit"
                               % MAX_ZRANGE_MEMBERS})
                 continue
@@ -1588,6 +1621,21 @@ def _op_argv(name, args):
         if withscores:
             cmd.append("WITHSCORES")
         cmd += ["LIMIT", offset, probe]
+        return cmd
+    if name == "kv_zrangebylex":
+        key, min_b, max_b, rev, offset, count = _zrangebylex_args(args)
+        # The reply is capped at MAX_ZRANGE_MEMBERS members: an
+        # explicit count is sent as given (already checked against
+        # the cap); without one, ask for one extra member so the
+        # caller can tell the range was too wide instead of getting
+        # a silently truncated list. With REV the bounds go
+        # max-first, as cinder reads them; without it, min first.
+        probe = count if count >= 0 else MAX_ZRANGE_MEMBERS + 1
+        cmd = ["ZRANGEBYLEX", key]
+        cmd += [max_b, min_b] if rev else [min_b, max_b]
+        cmd += ["LIMIT", offset, probe]
+        if rev:
+            cmd.append("REV")
         return cmd
     if name == "kv_zcount":
         key, min_b, max_b = _zcount_args(args)
@@ -2086,6 +2134,94 @@ def _call_zrangebyscore(client, args):
     )
 
 
+def _format_lex_bound(value, side, tool="kv_zrangebylex"):
+    """One ZRANGEBYLEX bound as a RESP argument: "-" is -inf (min
+    only), "+" is +inf (max only), "[x" is inclusive and "(x"
+    exclusive, exactly as cinder's lex-bound parser reads them. A
+    bare member name is a syntax error in cinder, so fail here as
+    invalid params instead; so is the wrong infinity on a side, an
+    empty bracket, and anything that is not a string."""
+    if not isinstance(value, str):
+        raise ValueError(
+            "%s %s bound must be a string, got %r" % (tool, side, value)
+        )
+    if value == "-":
+        if side != "min":
+            raise ValueError(
+                "%s max bound must not be \"-\"" % tool
+            )
+        return value
+    if value == "+":
+        if side != "max":
+            raise ValueError(
+                "%s min bound must not be \"+\"" % tool
+            )
+        return value
+    if value.startswith(("[", "(")) and len(value) > 1:
+        return value
+    raise ValueError(
+        "%s %s bound %r is not a valid lex bound: use \"-\", \"+\", "
+        "\"[member\" or \"(member\"" % (tool, side, value)
+    )
+
+
+def _zrangebylex_args(args):
+    """Validate a kv_zrangebylex call: (key, min, max, rev, offset,
+    count). min defaults to "-" and max to "+", as in Redis; offset
+    defaults to 0 and count to -1, meaning all matches from the
+    offset. count is at most MAX_ZRANGE_MEMBERS, and an offset below
+    0 or a count below -1 fails the call instead of sending a
+    half-formed ZRANGEBYLEX. There is no withscores: cinder reads
+    WITHSCORES as a syntax error, so the tool does not offer it."""
+    key = _require(args, "key")
+    min_b = _format_lex_bound(args.get("min", "-"), "min")
+    max_b = _format_lex_bound(args.get("max", "+"), "max")
+    rev = args.get("rev", False)
+    if not isinstance(rev, bool):
+        raise ValueError("kv_zrangebylex rev must be true or false")
+    offset = args.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError("kv_zrangebylex offset must be an integer")
+    if offset < 0:
+        raise ValueError("kv_zrangebylex offset must be 0 or more")
+    count = args.get("count", -1)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise ValueError("kv_zrangebylex count must be an integer")
+    if count < -1:
+        raise ValueError("kv_zrangebylex count must be -1 or more")
+    if count > MAX_ZRANGE_MEMBERS:
+        raise ValueError(
+            "kv_zrangebylex returns at most %d members; narrow the "
+            "range or pass a smaller count" % MAX_ZRANGE_MEMBERS
+        )
+    return key, min_b, max_b, rev, offset, count
+
+
+def _zrangebylex_result(flat):
+    """Shape a flat ZRANGEBYLEX reply into the tool's return value,
+    a list of member names in lex order, and fail when the probe
+    asked for one extra member and got it — the range holds more
+    than MAX_ZRANGE_MEMBERS members, so the caller must narrow it
+    or pass a limit instead of getting a silently truncated list."""
+    members = _zrange_result(flat, False)
+    if len(members) > MAX_ZRANGE_MEMBERS:
+        raise ValueError(
+            "kv_zrangebylex returns at most %d members; narrow the "
+            "range or pass a limit" % MAX_ZRANGE_MEMBERS
+        )
+    return members
+
+
+def _call_zrangebylex(client, args):
+    """kv_zrangebylex: run ZRANGEBYLEX and shape the reply. The
+    argv always carries a LIMIT (see _op_argv), so a range wider
+    than the cap is caught from the reply. The call is read-only:
+    the set is untouched, so the audit treats it as a read op."""
+    return _zrangebylex_result(
+        client.command(*_op_argv("kv_zrangebylex", args)) or []
+    )
+
+
 def _zcount_args(args):
     """Validate a kv_zcount call: (key, min, max). The bounds parse
     exactly like kv_zrangebyscore's: numbers or strings with an
@@ -2464,6 +2600,8 @@ def _call_single(client, name, args):
         return _call_zrange(client, args)
     if name == "kv_zrangebyscore":
         return _call_zrangebyscore(client, args)
+    if name == "kv_zrangebylex":
+        return _call_zrangebylex(client, args)
     if name == "kv_zcount":
         return _call_zcount(client, args)
     if name == "kv_zrevrank":
