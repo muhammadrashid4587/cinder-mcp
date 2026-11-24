@@ -14,8 +14,11 @@ value so the per-key resource's type probing can be exercised.
 import hashlib
 import io
 import json
+import os
 import random
+import shutil
 import socket
+import subprocess
 import threading
 import time
 import unittest
@@ -7170,9 +7173,12 @@ class McpTests(unittest.TestCase):
             "'old:big' after verifying the copy)",
             ready)
         self.assertIn(
-            "- old:todo → new:todo (list, 2 elements, no expiry; delete "
-            "the source with kv_del 'old:todo' after verifying the "
-            "copy)",
+            "- old:todo → new:todo (list, 2 elements, no expiry; move "
+            "it with 2 kv_lmove calls — source 'old:todo', "
+            "destination 'new:todo', from 'left' to 'right' — each "
+            "move is atomic and moves one element in order; the last "
+            "move deletes the source, so no kv_del is needed; then "
+            "re-apply the TTL with kv_expire)",
             ready)
         overwrite = self._section(text, "Overwrite (1)")
         self.assertEqual(overwrite, [
@@ -7191,6 +7197,91 @@ class McpTests(unittest.TestCase):
         self.assertEqual(len(listed), 5)
         self.assertIn("Do not run anything yourself", text)
         self.assertIn("re-check the source TTL with kv_ttl", text)
+
+    def test_prompts_get_key_migration_list_keys_use_lmove(self):
+        # A list key migrates with kv_lmove, one atomic move per
+        # element, in order — not by reading and re-writing it.
+        self._call("tools/call", 1, {
+            "name": "kv_rpush", "arguments": {
+                "key": "old:queue", "elements": ["a", "b", "c"]},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_expire", "arguments": {
+                "key": "old:queue", "seconds": 3600},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {
+                "key": "old:plain", "value": "v"},
+        })
+        text = self._migration_text(
+            {"pattern": "old:*", "target_prefix": "new:"})
+        ready = self._section(text, "Ready (2)")
+        self.assertEqual(len(ready), 2)
+        queue = next(line for line in ready
+                     if line.startswith("- old:queue → new:queue"))
+        self.assertIn("list, 3 elements", queue)
+        self.assertIn(
+            "move it with 3 kv_lmove calls — source 'old:queue', "
+            "destination 'new:queue', from 'left' to 'right'",
+            queue)
+        self.assertIn("each move is atomic", queue)
+        self.assertIn("the last move deletes the source", queue)
+        self.assertIn("no kv_del is needed", queue)
+        self.assertIn("re-apply the TTL with kv_expire", queue)
+        plain = next(line for line in ready
+                     if line.startswith("- old:plain → new:plain"))
+        self.assertIn(
+            "delete the source with kv_del 'old:plain' after "
+            "verifying the copy",
+            plain)
+        # The plan's steps say how the LMOVE path works and that
+        # non-list keys still migrate as a read plus a write.
+        self.assertIn("move it with kv_lmove, not by reading and "
+                      "re-writing it", text)
+        self.assertIn("verify instead with kv_llen on the target",
+                      text)
+        self.assertIn("A move interrupted halfway is safe to resume",
+                      text)
+        self.assertIn("LMOVE creates the target with no expiry", text)
+        self.assertIn("A list key is the exception: each kv_lmove "
+                      "is atomic", text)
+        self.assertIn("a migration of a non-list key is a read plus "
+                      "a write, not one atomic move", text)
+
+    def test_prompts_get_key_migration_self_mapped_list_key(self):
+        # A list key whose target is itself needs no move at all:
+        # kv_lmove with source and destination the same key would
+        # rotate the list instead of moving it.
+        self.fake.store["same:q"] = (["a", "b"], None)
+        text = self._migration_text(
+            {"pattern": "same:*", "target_prefix": "same:"})
+        self_mapped = self._section(text, "Maps onto itself (1)")
+        self.assertEqual(self_mapped, [
+            "- same:q → same:q (list, 2 elements, no expiry; the "
+            "target is the key itself — already in place, do not "
+            "call kv_lmove with source and destination the same "
+            "key, that would rotate the list)",
+        ])
+        self.assertIn("Plan covers 0 ready key(s)", text)
+
+    def test_prompts_get_key_migration_overwrite_list_key(self):
+        # LMOVE into an existing target list would append onto it,
+        # so an overwrite list key says to delete the target first.
+        self.fake.store["old:list"] = (["a", "b"], None)
+        self.fake.store["new:list"] = (["old"], None)
+        text = self._migration_text(
+            {"pattern": "old:*", "target_prefix": "new:"})
+        overwrite = self._section(text, "Overwrite (1)")
+        self.assertEqual(overwrite, [
+            "- old:list → new:list (source: list, 2 elements, no "
+            "expiry; target exists: list, 1 elements, no expiry)",
+        ])
+        self.assertIn(
+            "for an overwrite list key, kv_lmove would append the "
+            "source's elements onto the target's existing list, so "
+            "if the source wins delete the target with kv_del first "
+            "and only then move it with kv_lmove",
+            text)
 
     def test_prompts_get_key_migration_self_mapping(self):
         self._call("tools/call", 1, {
@@ -7796,6 +7887,136 @@ class BudgetTests(unittest.TestCase):
         }, clear=True):
             with self.assertRaises(ValueError):
                 _budgets_from_env()
+
+CINDER_BIN = os.path.join(
+    os.path.expanduser("~/workspace/projects/cinder"), "cinder")
+
+
+@unittest.skipUnless(os.path.exists(CINDER_BIN),
+                     "cinder binary not built")
+class LiveCinderMigrationTests(unittest.TestCase):
+    """The key-migration LMOVE path against a real cinder instance.
+
+    The fake server above proves the prompt text; this proves the
+    plan it lays out actually works on cinder: LMOVE moves the list
+    in order, the last move deletes the source, the target is
+    created with no expiry, and a same-key LMOVE rotates.
+    Runs on scratch port 7781 with a throwaway data dir."""
+
+    PORT = 7781
+    DATA_DIR = "/tmp/cinder-mcp-live-migration-data"
+
+    @classmethod
+    def setUpClass(cls):
+        shutil.rmtree(cls.DATA_DIR, ignore_errors=True)
+        cls.cinder = subprocess.Popen(
+            [CINDER_BIN, "--port", str(cls.PORT),
+             "--data-dir", cls.DATA_DIR],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(
+                        ("127.0.0.1", cls.PORT), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            cls.tearDownClass()
+            raise RuntimeError("cinder did not start on port %d"
+                               % cls.PORT)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            with socket.create_connection(
+                    ("127.0.0.1", cls.PORT), timeout=2) as sock:
+                sock.sendall(b"*1\r\n$8\r\nSHUTDOWN\r\n")
+        except OSError:
+            pass
+        try:
+            cls.cinder.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            cls.cinder.terminate()
+            cls.cinder.wait(timeout=5)
+        shutil.rmtree(cls.DATA_DIR, ignore_errors=True)
+
+    def setUp(self):
+        self.server = MCPServer(RespClient("127.0.0.1", self.PORT))
+
+    def _call(self, method, msg_id=1, params=None):
+        return self.server.handle_message(
+            {"jsonrpc": "2.0", "id": msg_id, "method": method,
+             "params": params or {}}
+        )
+
+    def _tool(self, name, arguments, msg_id=1):
+        reply = self._call("tools/call", msg_id, {
+            "name": name, "arguments": arguments})
+        self.assertNotIn("error", reply, (name, arguments))
+        text = reply["result"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except ValueError:
+            # Scalar results (a moved element, "OK") are raw text.
+            return text
+
+    def test_live_lmove_migration_path(self):
+        self.assertEqual(
+            self._tool("kv_rpush", {"key": "old:queue",
+                                    "elements": ["a", "b", "c"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "old:queue",
+                                     "seconds": 3600}),
+            1)
+        text = self._call("prompts/get", 10, {
+            "name": "key-migration",
+            "arguments": {"pattern": "old:*",
+                          "target_prefix": "new:"},
+        })["result"]["messages"][0]["content"]["text"]
+        self.assertIn("move it with 3 kv_lmove calls", text)
+        self.assertIn("from 'left' to 'right'", text)
+        # Follow the plan: one kv_lmove per element, LEFT to RIGHT.
+        for expected in ("a", "b", "c"):
+            self.assertEqual(
+                self._tool("kv_lmove", {
+                    "source": "old:queue", "destination": "new:queue",
+                    "from": "left", "to": "right"}),
+                expected)
+        # The last move emptied the source, so cinder deleted it.
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "old:queue"}), 0)
+        # The elements arrived in order, and the target carries no
+        # expiry: LMOVE does not copy the TTL.
+        self.assertEqual(
+            self._tool("kv_lrange", {"key": "new:queue",
+                                     "start": 0, "stop": -1}),
+            ["a", "b", "c"])
+        self.assertEqual(
+            self._tool("kv_ttl", {"key": "new:queue"}), -1)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "new:queue",
+                                     "seconds": 3600}),
+            1)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "new:queue"}), 0)
+
+    def test_live_lmove_same_key_rotates(self):
+        self.assertEqual(
+            self._tool("kv_rpush", {"key": "rot",
+                                    "elements": ["x", "y", "z"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_lmove", {"source": "rot", "destination": "rot",
+                                    "from": "left", "to": "right"}),
+            "x")
+        self.assertEqual(
+            self._tool("kv_lrange", {"key": "rot",
+                                     "start": 0, "stop": -1}),
+            ["y", "z", "x"])
+        self.assertEqual(self._tool("kv_llen", {"key": "rot"}), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

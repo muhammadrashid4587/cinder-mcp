@@ -37,11 +37,13 @@ and proposes one kv_expire renewal per key up to a safety cap,
 without ever printing a value. key-migration plans moving keys
 matching a pattern to a new prefix: it audits each key's type, size,
 and TTL, checks whether the target name already exists and with
-what type, and lays out the ordered copy steps — read the value,
-write it under the target name, re-apply the TTL with kv_expire,
-verify, then delete the source with kv_del — without ever printing
-a value. Cinder has no RENAME or COPY command, so a migration is a
-read plus a write, not one atomic move, and the prompt says so.
+what type, and lays out the ordered copy steps — list keys move
+atomically one element at a time with kv_lmove, other keys are read
+and written under the target name, the TTL re-applied with
+kv_expire, verified, then the source deleted with kv_del — without
+ever printing a value. Cinder has no RENAME or COPY command, so a
+migration of a non-list key is a read plus a write, not one atomic
+move, and the prompt says so.
 """
 
 import bisect
@@ -313,8 +315,10 @@ PROMPTS = [
             "Plan migrating keys matching a pattern to a new prefix: "
             "audit each key's type, size, and TTL, flag target "
             "names that already exist, and lay out the ordered "
-            "copy steps with the exact kv_del calls for the source "
-            "keys, up to a safety cap."
+            "copy steps — list keys move atomically one element "
+            "at a time with kv_lmove, other keys copy and then "
+            "delete the source with the exact kv_del calls — "
+            "up to a safety cap."
         ),
         "arguments": [
             {
@@ -2400,16 +2404,24 @@ def _key_migration(client, arguments):
     self-mapping, and missing keys are warnings, so each of those
     sections lists only its first 10 plus a count of the rest.
     Values are never read and never printed: only TTLs, types, and
-    sizes are probed. One honest limit: cinder has no RENAME or
-    COPY command, so a migration is a read plus a write, not one
-    atomic move — the plan's copy step is read the value, write it
-    under the target name, re-apply the TTL, verify, then delete
-    the source, and a key can change between the read and the
-    write, so the source is only deleted after the target is
-    verified. The TTL printed for a key is the one observed during
-    the audit and it ticks down, so the plan says to re-check it
-    with kv_ttl just before copying and use the fresh value in
-    kv_expire."""
+    sizes are probed. List keys move atomically one element at a
+    time: kv_lmove from 'left' to 'right', once per element, so the
+    elements arrive in order and each move is atomic; the last move
+    empties the source and cinder deletes an emptied list, so no
+    kv_del is needed for a list key, and the TTL is re-applied with
+    kv_expire afterwards because LMOVE creates the target with no
+    expiry. A list key whose target name is itself needs no move at
+    all — kv_lmove with source and destination the same key would
+    rotate the list instead of moving it. One honest limit: cinder
+    has no RENAME or COPY command, so migrating a non-list key is a
+    read plus a write, not one atomic move — the plan's copy step is
+    read the value, write it under the target name, re-apply the
+    TTL, verify, then delete the source, and a key can change
+    between the read and the write, so the source is only deleted
+    after the target is verified. The TTL printed for a key is the
+    one observed during the audit and it ticks down, so the plan
+    says to re-check it with kv_ttl just before copying and use the
+    fresh value in kv_expire."""
     pattern = arguments.get("pattern", "*")
     target_prefix = arguments.get("target_prefix")
     if not target_prefix or not isinstance(target_prefix, str):
@@ -2472,18 +2484,48 @@ def _key_migration(client, arguments):
                 source_text += ", large — copy one at a time"
             if target == key:
                 self_count += 1
+                self_note = ""
+                if kind == "list":
+                    # LMOVE with source and destination the same key
+                    # rotates the list instead of moving it, so a
+                    # self-mapped list key must never be moved.
+                    self_note = (
+                        " — already in place, do not call kv_lmove "
+                        "with source and destination the same key, "
+                        "that would rotate the list"
+                    )
                 _bounded_insert(
                     self_mapped,
-                    (key, "- %s → %s (%s; the target is the key itself)"
-                     % (key, target, source_text)),
+                    (key, "- %s → %s (%s; the target is the key "
+                     "itself%s)"
+                     % (key, target, source_text, self_note)),
                     MAX_MIGRATION_FLAGGED_LISTED,
                 )
                 continue
-            ready_line = (
-                "- %s → %s (%s; delete the source with kv_del %r "
-                "after verifying the copy)"
-                % (key, target, source_text, key)
-            )
+            if kind == "list":
+                # A list moves with LMOVE, one element per call,
+                # from 'left' to 'right' so the elements arrive in
+                # order; each move is atomic, the last move empties
+                # the source and cinder deletes an emptied list, so
+                # no kv_del is needed, and the TTL is re-applied
+                # afterwards because LMOVE creates the target with
+                # no expiry.
+                ready_line = (
+                    "- %s → %s (%s; move it with %d kv_lmove calls — "
+                    "source %r, destination %r, from 'left' to "
+                    "'right' — each move is atomic and moves one "
+                    "element in order; the last move deletes the "
+                    "source, so no kv_del is needed; then re-apply "
+                    "the TTL with kv_expire)"
+                    % (key, target, source_text, size_value, key,
+                       target)
+                )
+            else:
+                ready_line = (
+                    "- %s → %s (%s; delete the source with kv_del %r "
+                    "after verifying the copy)"
+                    % (key, target, source_text, key)
+                )
             if client.command("EXISTS", target) == 0:
                 ready.append((key, ready_line))
                 continue
@@ -2601,8 +2643,26 @@ def _key_migration(client, arguments):
     lines.extend([
         "",
         "Produce the migration steps for the ready keys, in the "
-        "order listed above, one key at a time: first read the "
-        "value — kv_get or cinder://key/<key> for a string, "
+        "order listed above, one key at a time. For a ready list "
+        "key, move it with kv_lmove, not by reading and re-writing "
+        "it: call kv_lmove once per element — source the key, "
+        "destination the target name, from 'left' to 'right' — so "
+        "the elements arrive in order, one at a time, each move "
+        "atomic; the audited element count above is how many calls "
+        "to make. The last move empties the source, and cinder "
+        "deletes an emptied list, so there is no kv_del step for a "
+        "list key — verify instead with kv_llen on the target (it "
+        "must equal the audited element count) and kv_exists on "
+        "the source (it must be 0). A move interrupted halfway is "
+        "safe to resume: the elements already moved are in the "
+        "target in order and the rest are still in the source, so "
+        "keep calling kv_lmove until the source is empty; never "
+        "read the elements out and re-write them. LMOVE creates "
+        "the target with no expiry, so re-check the source TTL "
+        "with kv_ttl just before moving and re-apply the fresh "
+        "value on the target with kv_expire after the last move. "
+        "For a ready key of any other type, first read the value "
+        "— kv_get or cinder://key/<key> for a string, "
         "cinder://key/<key> for a container — and write it under "
         "the target name; then re-check the source TTL with kv_ttl "
         "and re-apply the fresh value on the target with kv_expire, "
@@ -2613,17 +2673,27 @@ def _key_migration(client, arguments):
         "copies can run as one kv_batch call. For each overwrite "
         "key, say what to check before migrating it — read the "
         "target's value, decide which copy wins, and back the loser "
-        "up — and for each conflict key, say what has to change "
-        "before it can migrate at all. Copy large keys one at a "
-        "time, in a quiet window. Do not print any value anywhere. "
-        "Cinder has no RENAME or COPY command, so a migration is a "
-        "read plus a write, not one atomic move: a key can change "
-        "between the read and the write, so verify the target "
-        "before deleting the source, and do not migrate keys that "
-        "are being written concurrently. This plan renames keys "
-        "within this cinder instance; moving keys to another server "
-        "needs the same steps run against that server, and this "
-        "server cannot check whether the target names exist there. "
+        "up — and for an overwrite list key, kv_lmove would append "
+        "the source's elements onto the target's existing list, so "
+        "if the source wins delete the target with kv_del first "
+        "and only then move it with kv_lmove; for each conflict "
+        "key, say what has to change before it can migrate at all. "
+        "A self-mapped key is already at its target name and needs "
+        "no move at all — and for a self-mapped list key never "
+        "call kv_lmove with source and destination the same key, "
+        "that rotates the list instead of moving it. Copy large "
+        "keys one at a time, in a quiet window. Do not print any "
+        "value anywhere. Cinder has no RENAME or COPY command, so "
+        "a migration of a non-list key is a read plus a write, not "
+        "one atomic move: a key can change between the read and "
+        "the write, so verify the target before deleting the "
+        "source, and do not migrate keys that are being written "
+        "concurrently. A list key is the exception: each kv_lmove "
+        "is atomic, though the whole list still moves one element "
+        "at a time. This plan renames keys within this cinder "
+        "instance; moving keys to another server needs the same "
+        "steps run against that server, and this server cannot "
+        "check whether the target names exist there. "
         "Do not run anything yourself: nothing in this plan has "
         "changed the keyspace yet.",
     ])
