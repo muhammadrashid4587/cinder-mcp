@@ -242,6 +242,58 @@ class FakeCinder(threading.Thread):
             # GETSET clears the TTL, like a plain SET.
             self.store[args[0]] = (args[1], None)
             return self._bulk(value)
+        elif name == "APPEND" and len(args) == 2:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            # Appending preserves the TTL, as in real cinder.
+            expires = self.store[args[0]][1] if args[0] in self.store else None
+            new_value = (value or "") + args[1]
+            self.store[args[0]] = (new_value, expires)
+            return ":%d\r\n" % len(new_value)
+        elif name == "STRLEN" and len(args) == 1:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return ":%d\r\n" % (0 if value is None else len(value))
+        elif name == "GETEX" and len(args) >= 1:
+            # GETEX key [EX s | PX ms | PERSIST]: returns the value
+            # and sets, refreshes, or removes its TTL; no option
+            # leaves the TTL alone. A missing key is nil, and a bad
+            # option fails even on a missing key, as in real cinder.
+            if len(args) > 3:
+                return "-ERR wrong number of arguments for 'getex' command\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            expires = self.store[args[0]][1] if args[0] in self.store else None
+            if len(args) == 1:
+                pass
+            elif len(args) == 2:
+                if args[1].upper() != "PERSIST":
+                    return "-ERR syntax error\r\n"
+                expires = None
+            else:
+                try:
+                    t = int(args[2])
+                except ValueError:
+                    return "-ERR invalid expire time in 'getex' command\r\n"
+                if t <= 0:
+                    return "-ERR invalid expire time in 'getex' command\r\n"
+                opt = args[1].upper()
+                if opt == "EX":
+                    expires = time.time() + t
+                elif opt == "PX":
+                    expires = time.time() + t / 1000.0
+                else:
+                    return "-ERR syntax error\r\n"
+            if value is None:
+                return self._bulk(None)
+            self.store[args[0]] = (value, expires)
+            return self._bulk(value)
         elif name == "GET" and len(args) == 1:
             value = self._get(args[0])
             if value is not None and not isinstance(value, str):
@@ -519,6 +571,38 @@ class FakeCinder(threading.Thread):
                 self.store[args[0]] = (value, None)
             value.members[args[2]] = nxt
             return self._bulk(repr(nxt))
+        elif name in ("ZPOPMIN", "ZPOPMAX") and len(args) in (1, 2):
+            # ZPOPMIN/ZPOPMAX key [count]: remove and return the
+            # lowest- / highest-scoring member(s) with their scores,
+            # as a flat [member, score, ...] array; count defaults
+            # to 1 and must be positive. A missing key is an empty
+            # array, and popping the last member deletes the key,
+            # as in real cinder.
+            try:
+                count = int(args[1]) if len(args) == 2 else 1
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            if count < 1:
+                return "-ERR value is out of range, must be positive\r\n"
+            value = self._get(args[0])
+            if value is None:
+                return "*0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            ordered = value.ordered()
+            if name == "ZPOPMAX":
+                ordered.reverse()
+            popped = [(m, value.members[m]) for m in ordered[:count]]
+            for member, _score in popped:
+                del value.members[member]
+            if not value.members:
+                del self.store[args[0]]
+            flat = []
+            for member, score in popped:
+                flat.append(member)
+                flat.append(repr(score))
+            return "*%d\r\n" % len(flat) + "".join(self._bulk(v) for v in flat)
         elif name in ("ZRANGE", "ZREVRANGE") and len(args) in (3, 4):
             value = self._get(args[0])
             if value is None:
@@ -695,6 +779,16 @@ class FakeCinder(threading.Thread):
                 return ":%d\r\n" % self._incr(args[0], int(args[1]))
             except ValueError:
                 return "-ERR value is not an integer or out of range\r\n"
+        elif name == "DECR" and len(args) == 1:
+            try:
+                return ":%d\r\n" % self._incr(args[0], -1)
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+        elif name == "DECRBY" and len(args) == 2:
+            try:
+                return ":%d\r\n" % self._incr(args[0], -int(args[1]))
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
         elif name == "TTL" and len(args) == 1:
             entry = self.store.get(args[0])
             if entry is None or (entry[1] is not None and entry[1] <= time.time()):
@@ -794,6 +888,11 @@ class FakeCinder(threading.Thread):
 
     def _incr(self, key, by):
         current = self._get(key)
+        if current is not None and not isinstance(current, str):
+            # INCR on a container is an error, not a crash: the
+            # caller's except ValueError turns this into an -ERR
+            # reply, as real cinder answers.
+            raise ValueError("not an integer")
         value = (int(current) if current is not None else 0) + by
         expires = self.store[key][1] if key in self.store else None
         self.store[key] = (str(value), expires)
@@ -828,12 +927,15 @@ class McpTests(unittest.TestCase):
                     "kv_pexpire",
                     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx",
                     "kv_setex", "kv_getset",
+                    "kv_append", "kv_strlen", "kv_decr", "kv_decrby",
+                    "kv_getex",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+                    "kv_zpopmin", "kv_zpopmax",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_sadd", "kv_smembers", "kv_scard",
@@ -1965,6 +2067,232 @@ class McpTests(unittest.TestCase):
                 {"op": "kv_mset", "values": {"t": "1"}},
                 {"op": "kv_setex", "key": "t", "seconds": 0,
                  "value": "v"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "t"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_string_append_strlen_decr_getex(self):
+        # STRLEN on a missing key is 0, and APPEND creates the key.
+        missing_len = self._call("tools/call", 1, {
+            "name": "kv_strlen", "arguments": {"key": "greet"},
+        })
+        self.assertEqual(missing_len["result"]["content"][0]["text"], "0")
+        created = self._call("tools/call", 2, {
+            "name": "kv_append",
+            "arguments": {"key": "greet", "value": "hello"},
+        })
+        self.assertEqual(created["result"]["content"][0]["text"], "5")
+        # Appending again grows the string and returns the new length.
+        grown = self._call("tools/call", 3, {
+            "name": "kv_append",
+            "arguments": {"key": "greet", "value": " world"},
+        })
+        self.assertEqual(grown["result"]["content"][0]["text"], "11")
+        length = self._call("tools/call", 4, {
+            "name": "kv_strlen", "arguments": {"key": "greet"},
+        })
+        self.assertEqual(length["result"]["content"][0]["text"], "11")
+        read_back = self._call("tools/call", 5, {
+            "name": "kv_get", "arguments": {"key": "greet"},
+        })
+        self.assertEqual(read_back["result"]["content"][0]["text"],
+                         "hello world")
+        # APPEND preserves the TTL, as in Redis.
+        self._call("tools/call", 6, {
+            "name": "kv_set",
+            "arguments": {"key": "expiring", "value": "a", "ex": 100},
+        })
+        self._call("tools/call", 7, {
+            "name": "kv_append",
+            "arguments": {"key": "expiring", "value": "b"},
+        })
+        ttl = self._call("tools/call", 8, {
+            "name": "kv_ttl", "arguments": {"key": "expiring"},
+        })
+        self.assertTrue(0 < int(ttl["result"]["content"][0]["text"]) <= 100)
+        # DECR counts down from a missing key, DECRBY steps by more.
+        down = self._call("tools/call", 9, {
+            "name": "kv_decr", "arguments": {"key": "n"},
+        })
+        self.assertEqual(down["result"]["content"][0]["text"], "-1")
+        down_more = self._call("tools/call", 10, {
+            "name": "kv_decr", "arguments": {"key": "n", "by": 3},
+        })
+        self.assertEqual(down_more["result"]["content"][0]["text"], "-4")
+        stepped = self._call("tools/call", 11, {
+            "name": "kv_decrby", "arguments": {"key": "n", "by": 5},
+        })
+        self.assertEqual(stepped["result"]["content"][0]["text"], "-9")
+        fresh = self._call("tools/call", 12, {
+            "name": "kv_decrby", "arguments": {"key": "m", "by": 4},
+        })
+        self.assertEqual(fresh["result"]["content"][0]["text"], "-4")
+        # GETEX with no option returns the value and leaves the TTL alone.
+        self._call("tools/call", 13, {
+            "name": "kv_set",
+            "arguments": {"key": "s", "value": "v", "ex": 100},
+        })
+        plain = self._call("tools/call", 14, {
+            "name": "kv_getex", "arguments": {"key": "s"},
+        })
+        self.assertEqual(plain["result"]["content"][0]["text"], "v")
+        kept = self._call("tools/call", 15, {
+            "name": "kv_ttl", "arguments": {"key": "s"},
+        })
+        self.assertTrue(0 < int(kept["result"]["content"][0]["text"]) <= 100)
+        # GETEX EX refreshes the TTL in seconds, PX in milliseconds.
+        refreshed = self._call("tools/call", 16, {
+            "name": "kv_getex", "arguments": {"key": "s", "ex": 50},
+        })
+        self.assertEqual(refreshed["result"]["content"][0]["text"], "v")
+        shorter = self._call("tools/call", 17, {
+            "name": "kv_ttl", "arguments": {"key": "s"},
+        })
+        self.assertTrue(0 < int(shorter["result"]["content"][0]["text"]) <= 50)
+        millis = self._call("tools/call", 18, {
+            "name": "kv_getex", "arguments": {"key": "s", "px": 5000},
+        })
+        self.assertEqual(millis["result"]["content"][0]["text"], "v")
+        pttl = self._call("tools/call", 19, {
+            "name": "kv_pttl", "arguments": {"key": "s"},
+        })
+        self.assertTrue(0 < int(pttl["result"]["content"][0]["text"]) <= 5000)
+        # GETEX PERSIST removes the TTL; GETEX on a missing key is null.
+        kept_forever = self._call("tools/call", 20, {
+            "name": "kv_getex", "arguments": {"key": "s", "persist": True},
+        })
+        self.assertEqual(kept_forever["result"]["content"][0]["text"], "v")
+        no_ttl = self._call("tools/call", 21, {
+            "name": "kv_ttl", "arguments": {"key": "s"},
+        })
+        self.assertEqual(no_ttl["result"]["content"][0]["text"], "-1")
+        ghost = self._call("tools/call", 22, {
+            "name": "kv_getex", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost["result"]["content"][0]["text"], "null")
+
+    def test_tools_call_string_counter_tools_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_append", "arguments": {}},
+            {"name": "kv_append", "arguments": {"key": "a"}},
+            {"name": "kv_append", "arguments": {"value": "v"}},
+            {"name": "kv_strlen", "arguments": {}},
+            {"name": "kv_decr", "arguments": {}},
+            {"name": "kv_decrby", "arguments": {"key": "a"}},
+            {"name": "kv_decrby", "arguments": {"by": 3}},
+            {"name": "kv_decrby",
+             "arguments": {"key": "a", "by": "3"}},
+            {"name": "kv_decrby",
+             "arguments": {"key": "a", "by": True}},
+            {"name": "kv_getex", "arguments": {}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "ex": 0}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "ex": -5}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "ex": "100"}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "ex": True}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "px": 0}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "px": -1}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "persist": "yes"}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "ex": 10, "px": 1000}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "ex": 10, "persist": True}},
+            {"name": "kv_getex",
+             "arguments": {"key": "a", "px": 1000, "persist": True}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_string_counter_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        for i, call in enumerate([
+            {"name": "kv_append",
+             "arguments": {"key": "queue", "value": "v"}},
+            {"name": "kv_strlen", "arguments": {"key": "queue"}},
+            {"name": "kv_decr", "arguments": {"key": "queue"}},
+            {"name": "kv_decrby",
+             "arguments": {"key": "queue", "by": 2}},
+            {"name": "kv_getex", "arguments": {"key": "queue"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+        # DECR on a non-integer string fails too, as in Redis.
+        self._call("tools/call", 7, {
+            "name": "kv_set",
+            "arguments": {"key": "name", "value": "alice"},
+        })
+        not_a_number = self._call("tools/call", 8, {
+            "name": "kv_decr", "arguments": {"key": "name"},
+        })
+        self.assertIn("error", not_a_number)
+        self.assertEqual(not_a_number["error"]["code"], -32000)
+
+    def test_tools_call_string_counter_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_set", "key": "count", "value": "10"},
+                {"op": "kv_decr", "key": "count"},
+                {"op": "kv_decrby", "key": "count", "by": 4},
+                {"op": "kv_set", "key": "s", "value": "hi"},
+                {"op": "kv_append", "key": "s", "value": "!"},
+                {"op": "kv_strlen", "key": "s"},
+                {"op": "kv_getex", "key": "s", "ex": 100},
+                {"op": "kv_ttl", "key": "s"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 8)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertEqual(summary["results"][1]["result"], 9)
+        self.assertEqual(summary["results"][2]["result"], 5)
+        self.assertEqual(summary["results"][3]["result"], "OK")
+        self.assertEqual(summary["results"][4]["result"], 3)
+        self.assertEqual(summary["results"][5]["result"], 3)
+        self.assertEqual(summary["results"][6]["result"], "hi!")
+        self.assertTrue(0 < summary["results"][7]["result"] <= 100)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "n2", "value": "10"},
+                {"op": "kv_decrby", "key": "n2", "by": 3},
+                {"op": "kv_append", "key": "g2", "value": "x"},
+                {"op": "kv_getex", "key": "g2"},
+                {"op": "kv_strlen", "key": "g2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertEqual(summary["results"][1]["result"], 7)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], "x")
+        self.assertEqual(summary["results"][4]["result"], 1)
+        # Bad counter arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "t", "value": "1"},
+                {"op": "kv_getex", "key": "t", "ex": 0},
             ]},
         })
         self.assertIn("error", bad)
@@ -3291,6 +3619,123 @@ class McpTests(unittest.TestCase):
         })
         self.assertEqual(card["result"]["content"][0]["text"], "0")
 
+    def test_tools_call_zpopmin_zpopmax(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10, "bo": 20, "cy": 15}},
+        })
+        lowest = self._call("tools/call", 2, {
+            "name": "kv_zpopmin", "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(
+            json.loads(lowest["result"]["content"][0]["text"]),
+            [{"member": "amy", "score": 10.0}],
+        )
+        highest = self._call("tools/call", 3, {
+            "name": "kv_zpopmax",
+            "arguments": {"key": "leaderboard", "count": 2},
+        })
+        self.assertEqual(
+            json.loads(highest["result"]["content"][0]["text"]),
+            [{"member": "bo", "score": 20.0},
+             {"member": "cy", "score": 15.0}],
+        )
+        # Popping the last member deletes the key, as in Redis.
+        gone = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+        # A missing key pops to an empty list.
+        ghost = self._call("tools/call", 5, {
+            "name": "kv_zpopmin", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(
+            json.loads(ghost["result"]["content"][0]["text"]), [])
+        # A count past the end pops the whole set.
+        self._call("tools/call", 6, {
+            "name": "kv_zadd",
+            "arguments": {"key": "small", "members": {"a": 1, "b": 2}},
+        })
+        everything = self._call("tools/call", 7, {
+            "name": "kv_zpopmax",
+            "arguments": {"key": "small", "count": 5},
+        })
+        self.assertEqual(
+            json.loads(everything["result"]["content"][0]["text"]),
+            [{"member": "b", "score": 2.0},
+             {"member": "a", "score": 1.0}],
+        )
+
+    def test_tools_call_zpopmin_zpopmax_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_zpopmin", "arguments": {}},
+            {"name": "kv_zpopmax", "arguments": {}},
+            {"name": "kv_zpopmin",
+             "arguments": {"key": "z", "count": 0}},
+            {"name": "kv_zpopmin",
+             "arguments": {"key": "z", "count": -1}},
+            {"name": "kv_zpopmax",
+             "arguments": {"key": "z", "count": "2"}},
+            {"name": "kv_zpopmax",
+             "arguments": {"key": "z", "count": True}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zpopmin_zpopmax_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        for i, call in enumerate([
+            {"name": "kv_zpopmin", "arguments": {"key": "queue"}},
+            {"name": "kv_zpopmax", "arguments": {"key": "queue"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_zpopmin_zpopmax_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zpopmin", "key": "z"},
+                {"op": "kv_zpopmax", "key": "z", "count": 2},
+                {"op": "kv_exists", "key": "z"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"],
+                         [{"member": "a", "score": 1.0}])
+        self.assertEqual(summary["results"][2]["result"],
+                         [{"member": "c", "score": 3.0},
+                          {"member": "b", "score": 2.0}])
+        self.assertEqual(summary["results"][3]["result"], 0)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1, "b": 2}},
+                {"op": "kv_zpopmin", "key": "z2", "count": 2},
+                {"op": "kv_zcard", "key": "z2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"],
+                         [{"member": "a", "score": 1.0},
+                          {"member": "b", "score": 2.0}])
+        self.assertEqual(summary["results"][2]["result"], 0)
+
     def test_resources_list_returns_info_metrics_changes_and_key_template(self):
         listed = self._call("resources/list", 1)
         resources = listed["result"]["resources"]
@@ -3340,6 +3785,15 @@ class McpTests(unittest.TestCase):
         reply = self._call("resources/read", 2, {"uri": "cinder://key/user:1"})
         self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
             "key": "user:1", "type": "hash", "length": 1,
+        })
+
+    def test_resources_read_key_zset_returns_type_and_length(self):
+        board = ZSet()
+        board.members = {"amy": 10.0, "bo": 20.0}
+        self.fake.store["board"] = (board, None)
+        reply = self._call("resources/read", 1, {"uri": "cinder://key/board"})
+        self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
+            "key": "board", "type": "zset", "length": 2,
         })
 
     def test_resources_read_key_url_decodes_key(self):
@@ -4117,6 +4571,167 @@ class McpTests(unittest.TestCase):
         text = self._write_safety_text(plan)
         self.assertNotIn("hunter2-dont-print", text)
         self.assertIn("op 0: kv_set 'secret'", text)
+
+    def test_prompts_get_write_safety_covers_new_write_ops(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "forever", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_set", "arguments": {"key": "count", "value": "41"},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set",
+            "arguments": {"key": "soon", "value": "v", "ex": 3600},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_set", "arguments": {"key": "big", "value": "x" * 2000},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        board = ZSet()
+        board.members = {"amy": 10.0, "bo": 20.0}
+        self.fake.store["board"] = (board, None)
+        plan = [
+            {"op": "kv_append", "key": "forever", "value": "more"},
+            {"op": "kv_append", "key": "big", "value": "more"},
+            {"op": "kv_append", "key": "todo", "value": "more"},
+            {"op": "kv_append", "key": "brand-new", "value": "v"},
+            {"op": "kv_decr", "key": "name"},
+            {"op": "kv_decr", "key": "count"},
+            {"op": "kv_decr", "key": "todo"},
+            {"op": "kv_decr", "key": "fresh-counter"},
+            {"op": "kv_decrby", "key": "count", "by": 5},
+            {"op": "kv_decrby", "key": "ghost", "by": 5},
+            {"op": "kv_getex", "key": "forever", "ex": 60},
+            {"op": "kv_getex", "key": "soon", "ex": 60},
+            {"op": "kv_getex", "key": "forever", "persist": True},
+            {"op": "kv_getex", "key": "soon", "persist": True},
+            {"op": "kv_getex", "key": "todo"},
+            {"op": "kv_getex", "key": "forever"},
+            {"op": "kv_getex", "key": "ghost"},
+            {"op": "kv_getex", "key": "forever", "ex": 0},
+            {"op": "kv_zpopmin", "key": "board"},
+            {"op": "kv_zpopmax", "key": "board", "count": 2},
+            {"op": "kv_zpopmin", "key": "todo"},
+            {"op": "kv_zpopmin", "key": "ghost"},
+            {"op": "kv_strlen", "key": "forever"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 23 op(s), 22 audited, 1 not audited.", text)
+        self.assertIn(
+            "op 22: kv_strlen is a read, not a write", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_append 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 4: kv_decr 'name' — would fail: the current value is "
+            "not an integer",
+            risky,
+        )
+        self.assertIn(
+            "op 6: kv_decr 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_getex 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 17: kv_getex 'forever' — would fail: invalid expire "
+            "time 0",
+            risky,
+        )
+        self.assertIn(
+            "op 19: kv_zpopmax 'board' — pops every member, deleting "
+            "a sorted set that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 20: kv_zpopmin 'todo' — would fail with WRONGTYPE: "
+            "the key is a list of 2 elements",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_append 'big' — appends to a large string of "
+            "2000 bytes that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 3: kv_append 'brand-new' — creates a new string key "
+            "with no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 10: kv_getex 'forever' — returns the value and gives "
+            "a key that never expires an expiry of 1m",
+            caution,
+        )
+        self.assertIn(
+            "op 13: kv_getex 'soon' — returns the value and removes "
+            "its expiry (currently expires in ",
+            caution,
+        )
+        self.assertIn(
+            "op 18: kv_zpopmin 'board' — removes 1 of 2 members",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_append 'forever' — appends to a string of "
+            "1 bytes that no expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 5: kv_decr 'count' — decrements a counter currently "
+            "at 41",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_decr 'fresh-counter' — creates a counter "
+            "starting at -1",
+            safe,
+        )
+        self.assertIn(
+            "op 8: kv_decrby 'count' — decrements a counter "
+            "currently at 41",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_decrby 'ghost' — creates a counter starting "
+            "at -5",
+            safe,
+        )
+        self.assertIn(
+            "op 11: kv_getex 'soon' — returns the value and sets its "
+            "expiry to 1m",
+            safe,
+        )
+        self.assertIn(
+            "op 12: kv_getex 'forever' — returns the value; the key "
+            "has no expiry to remove",
+            safe,
+        )
+        self.assertIn(
+            "op 15: kv_getex 'forever' — returns the value and "
+            "leaves its TTL alone",
+            safe,
+        )
+        self.assertIn(
+            "op 16: kv_getex 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 21: kv_zpopmin 'ghost' — no-op, the key does not exist",
+            safe,
+        )
 
     def _renewal_text(self, arguments=None, batch_size=None):
         return self._prompt_text("ttl-renewal", arguments, batch_size)

@@ -202,6 +202,65 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_append",
+        "description": "Append a value to the string stored at a key: APPEND key value. Creates the key when it does not exist. Returns the length of the string after the append. Preserves the key's TTL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "kv_strlen",
+        "description": "The length of the string stored at a key: STRLEN key. Returns 0 when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_decr",
+        "description": "Decrement the integer stored at a key by a given amount (default 1).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "by": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_decrby",
+        "description": "Decrement the integer stored at a key by a given amount: DECRBY key n. Creates the key holding -n when it does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "by": {"type": "integer"},
+            },
+            "required": ["key", "by"],
+        },
+    },
+    {
+        "name": "kv_getex",
+        "description": "Get the string value of a key and set, refresh, or remove its TTL: GETEX key [EX seconds | PX milliseconds | PERSIST]. Returns the value, or null when the key does not exist. With no option the TTL is left alone; ex sets it in seconds, px in milliseconds, persist removes it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "ex": {"type": "integer"},
+                "px": {"type": "integer"},
+                "persist": {"type": "boolean"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_hset",
         "description": "Set fields on a hash: HSET key field value [field value ...]. Takes `fields` as an object mapping field names to values. Returns the number of fields that were newly added (updating an existing field returns 0 for it).",
         "inputSchema": {
@@ -401,6 +460,30 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zpopmin",
+        "description": "Remove and return the lowest-scoring member(s) of a sorted set: ZPOPMIN key [count]. Returns a list of {\"member\": ..., \"score\": ...} objects, lowest score first; count defaults to 1. A count past the end pops the whole set, and a missing key returns an empty list. Popping the last member deletes the key, as in Redis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_zpopmax",
+        "description": "Remove and return the highest-scoring member(s) of a sorted set: ZPOPMAX key [count]. Returns a list of {\"member\": ..., \"score\": ...} objects, highest score first; count defaults to 1. A count past the end pops the whole set, and a missing key returns an empty list. Popping the last member deletes the key, as in Redis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -520,7 +603,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -538,6 +621,7 @@ TOOLS = [
                             "by": {"type": "integer"},
                             "seconds": {"type": "integer"},
                             "milliseconds": {"type": "integer"},
+                            "persist": {"type": "boolean"},
                             "keys": {"type": "array", "items": {"type": "string"}},
                             "values": {"type": "object"},
                             "field": {"type": "string"},
@@ -627,9 +711,11 @@ BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
+    "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+    "kv_zpopmin", "kv_zpopmax",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
@@ -701,9 +787,11 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_get", "kv_set", "kv_del", "kv_keys",
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
+    "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
+    "kv_zpopmin", "kv_zpopmax",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
@@ -845,6 +933,11 @@ def _call_batch_atomic(client, ops):
                               "narrow the range" % MAX_ZRANGE_MEMBERS})
                 continue
             value = count
+        elif op_name in ("kv_zpopmin", "kv_zpopmax"):
+            # ZPOPMIN/ZPOPMAX came back as a flat list inside the
+            # transaction; shape it like the standalone tool does,
+            # into member/score objects.
+            value = _zpop_result(reply or [])
         elif op_name == "kv_zscore":
             # ZSCORE came back as a bulk score string (or nil) inside
             # the transaction; parse it like the standalone tool does.
@@ -1006,6 +1099,29 @@ def _op_argv(name, args):
         return ["SETEX", key, seconds, value]
     if name == "kv_getset":
         return ["GETSET", _require(args, "key"), _require(args, "value")]
+    if name == "kv_append":
+        return ["APPEND", _require(args, "key"), _require(args, "value")]
+    if name == "kv_strlen":
+        return ["STRLEN", _require(args, "key")]
+    if name == "kv_decr":
+        # Like kv_incr: DECR for the default step of 1, DECRBY
+        # otherwise, so a plain kv_decr sends the plain command.
+        by = args.get("by", 1)
+        if by == 1:
+            return ["DECR", _require(args, "key")]
+        return ["DECRBY", _require(args, "key"), by]
+    if name == "kv_decrby":
+        key, by = _decrby_args(args)
+        return ["DECRBY", key, by]
+    if name == "kv_getex":
+        key, ex, px, persist = _getex_args(args)
+        if ex is not None:
+            return ["GETEX", key, "EX", ex]
+        if px is not None:
+            return ["GETEX", key, "PX", px]
+        if persist:
+            return ["GETEX", key, "PERSIST"]
+        return ["GETEX", key]
     if name == "kv_hset":
         return ["HSET", _require(args, "key")] + _hset_field_args(args)
     if name == "kv_hget":
@@ -1032,6 +1148,12 @@ def _op_argv(name, args):
     if name == "kv_zincrby":
         key, increment, member = _zincrby_args(args)
         return ["ZINCRBY", key, increment, member]
+    if name == "kv_zpopmin":
+        key, count = _zpop_args(args, name)
+        return ["ZPOPMIN", key] if count == 1 else ["ZPOPMIN", key, count]
+    if name == "kv_zpopmax":
+        key, count = _zpop_args(args, name)
+        return ["ZPOPMAX", key] if count == 1 else ["ZPOPMAX", key, count]
     if name == "kv_lpush":
         return ["LPUSH", _require(args, "key")] + _list_elements_args(args, name)
     if name == "kv_rpush":
@@ -1170,6 +1292,57 @@ def _setex_args(args):
             "kv_setex seconds must be more than 0, got %d" % seconds
         )
     return key, seconds, value
+
+
+def _decrby_args(args):
+    """Validate a kv_decrby call: (key, by). The step must be an
+    integer — cinder rejects anything else as a server error, so
+    fail here as invalid params instead. Any integer goes through,
+    including a negative one (DECRBY with a negative step counts
+    up, as in Redis)."""
+    key = _require(args, "key")
+    by = _require(args, "by")
+    if isinstance(by, bool) or not isinstance(by, int):
+        raise ValueError("kv_decrby by must be an integer")
+    return key, by
+
+
+def _getex_args(args):
+    """Validate a kv_getex call: (key, ex, px, persist). At most
+    one of ex / px / persist may be given — cinder rejects a
+    second option as a syntax error, so fail here as invalid
+    params instead. ex and px are seconds and milliseconds and
+    must be integers greater than 0, like kv_setex's seconds;
+    persist must be a boolean. No option leaves the TTL alone."""
+    key = _require(args, "key")
+    ex = args.get("ex")
+    px = args.get("px")
+    persist = args.get("persist", False)
+    if not isinstance(persist, bool):
+        raise ValueError("kv_getex persist must be true or false")
+    given = [name for name, value in (("ex", ex), ("px", px))
+             if value is not None]
+    if persist:
+        given.append("persist")
+    if len(given) > 1:
+        raise ValueError(
+            "kv_getex takes at most one of ex, px, persist"
+        )
+    if ex is not None:
+        if isinstance(ex, bool) or not isinstance(ex, int):
+            raise ValueError("kv_getex ex must be an integer")
+        if ex <= 0:
+            raise ValueError(
+                "kv_getex ex must be more than 0, got %d" % ex
+            )
+    if px is not None:
+        if isinstance(px, bool) or not isinstance(px, int):
+            raise ValueError("kv_getex px must be an integer")
+        if px <= 0:
+            raise ValueError(
+                "kv_getex px must be more than 0, got %d" % px
+            )
+    return key, ex, px, persist
 
 
 def _hset_field_args(args):
@@ -1532,6 +1705,41 @@ def _zrevrank_args(args):
     return _require(args, "key"), _require(args, "member")
 
 
+def _zpop_args(args, name):
+    """Validate a kv_zpopmin / kv_zpopmax call: (key, count).
+    count defaults to 1 and must be a positive integer — cinder
+    rejects 0 or a negative count as out of range, so fail here
+    as invalid params instead."""
+    key = _require(args, "key")
+    count = args.get("count", 1)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise ValueError("%s count must be an integer" % name)
+    if count < 1:
+        raise ValueError(
+            "%s count must be 1 or more, got %d" % (name, count)
+        )
+    return key, count
+
+
+def _zpop_result(flat):
+    """Shape a flat ZPOPMIN/ZPOPMAX reply [member, score, ...] into
+    a list of {"member": ..., "score": ...} objects, the scores
+    parsed as numbers, lowest score first for ZPOPMIN and highest
+    first for ZPOPMAX. A missing key replies as an empty list,
+    which becomes []."""
+    flat = flat or []
+    return [
+        {"member": flat[i], "score": float(flat[i + 1])}
+        for i in range(0, len(flat), 2)
+    ]
+
+
+def _call_zpop(client, args, name):
+    """kv_zpopmin / kv_zpopmax: pop the lowest- / highest-scoring
+    member(s) and shape the reply into member/score objects."""
+    return _zpop_result(client.command(*_op_argv(name, args)) or [])
+
+
 def _call_zrevrank(client, args):
     """kv_zrevrank: the member's rank, highest score first. Cinder
     has no ZREVRANK, so this reads ZRANK and ZCARD and returns
@@ -1661,4 +1869,6 @@ def _call_single(client, name, args):
         return _call_zcount(client, args)
     if name == "kv_zrevrank":
         return _call_zrevrank(client, args)
+    if name in ("kv_zpopmin", "kv_zpopmax"):
+        return _call_zpop(client, args, name)
     return client.command(*_op_argv(name, args))

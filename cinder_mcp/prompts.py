@@ -113,8 +113,13 @@ MAX_MIGRATION_FLAGGED_LISTED = 10
 # plan are not audited: they change nothing, so there is nothing
 # to flag about them. kv_keys_scan is a read too, but it is not a
 # kv_batch op at all, so it lands in the unparseable list instead.
-WRITE_SAFETY_WRITE_OPS = ("kv_set", "kv_del", "kv_incr", "kv_expire")
-WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists")
+WRITE_SAFETY_WRITE_OPS = (
+    "kv_set", "kv_del", "kv_incr", "kv_expire",
+    "kv_append", "kv_decr", "kv_decrby", "kv_getex",
+    "kv_zpopmin", "kv_zpopmax",
+)
+WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
+                         "kv_strlen")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -222,7 +227,9 @@ PROMPTS = [
             "Audit a proposed write plan against the live keyspace "
             "before it runs: flag overwrites of keys that never "
             "expire, overwrites of large keys, SETs that would "
-            "destroy a container, INCRs that would fail, and "
+            "destroy a container, INCRs and DECRs that would fail, "
+            "APPENDs that would fail, GETEXes that would change or "
+            "remove a TTL, ZPOPs that would drain a sorted set, and "
             "EXPIREs with a bad timeout, and give a go/no-go per "
             "risky op."
         ),
@@ -392,13 +399,14 @@ def _inspect_key(client, key):
     the human rendering ("5 bytes", "2 elements"). Cinder has no
     TYPE command, so the type is probed the same way the per-key
     resource does: GET succeeds for strings, otherwise LLEN /
-    SCARD / HLEN are tried in turn and the first one that does not
-    answer WRONGTYPE names it."""
+    SCARD / HLEN / ZCARD are tried in turn and the first one that
+    does not answer WRONGTYPE names it."""
     try:
         value = client.command("GET", key)
     except RespError:
         # Not a string: probe the container types.
-        for probe, name in (("LLEN", "list"), ("SCARD", "set"), ("HLEN", "hash")):
+        for probe, name in (("LLEN", "list"), ("SCARD", "set"),
+                            ("HLEN", "hash"), ("ZCARD", "zset")):
             try:
                 length = client.command(probe, key)
             except RespError:
@@ -944,6 +952,29 @@ def _is_int(text):
     return True
 
 
+def _getex_option(op):
+    """The GETEX option from a write-plan op: (ex, px, persist).
+    At most one option may be given, and persist must be a
+    boolean; anything else raises ValueError, so the caller
+    reports the op as not audited instead of guessing."""
+    ex = op.get("ex")
+    px = op.get("px")
+    persist = op.get("persist", False)
+    if not isinstance(persist, bool):
+        raise ValueError(
+            "kv_getex persist must be true or false: %r" % (persist,)
+        )
+    given = [name for name, value in (("ex", ex), ("px", px))
+             if value is not None]
+    if persist:
+        given.append("persist")
+    if len(given) > 1:
+        raise ValueError(
+            "kv_getex takes at most one of ex, px, persist: %r" % (op,)
+        )
+    return ex, px, persist
+
+
 def _audit_write_op(client, op):
     """Audit one write op from a write plan against the live
     keyspace. Returns (verdict, line) where verdict is "safe",
@@ -956,13 +987,18 @@ def _audit_write_op(client, op):
     Verdicts: "risky" destroys data that is hard to get back or
     would fail outright — overwriting or deleting a key that never
     expires, overwriting or deleting a large key, a SET that would
-    replace a list, set, or hash with a string, an INCR on a
-    non-integer or a container, an EXPIRE with a bad timeout.
-    "caution" changes something but the damage is bounded — an
-    overwrite or delete of a key that expires soon anyway, or a
-    SET that creates a key with no expiry. Everything else is
-    "safe": creating an expiring key, INCR on a missing key, an
-    EXPIRE on an existing key, or a no-op on a missing key."""
+    replace a list, set, or hash with a string, an INCR or DECR on
+    a non-integer or a container, an APPEND on a container, a
+    GETEX or ZPOP on a container, a ZPOP that would drain a
+    never-expiring or large sorted set, or an EXPIRE or GETEX
+    with a bad timeout. "caution" changes something but the
+    damage is bounded — an overwrite or delete of a key that
+    expires soon anyway, a SET or APPEND that creates a key with
+    no expiry, a GETEX that gives a never-expiring key an expiry
+    or removes one, or a ZPOP that takes some but not all members.
+    Everything else is "safe": creating an expiring key, INCR or
+    DECR on a missing key, an EXPIRE on an existing key, a GETEX
+    that only reads a value, or a no-op on a missing key."""
     name = op.get("op")
     if name not in WRITE_SAFETY_WRITE_OPS:
         raise ValueError("not a write op: %s" % name)
@@ -996,6 +1032,50 @@ def _audit_write_op(client, op):
             return "safe", (
                 "kv_incr %r — creates a counter starting at %s"
                 % (key, by)
+            )
+        if name == "kv_append":
+            if not isinstance(op.get("value"), str):
+                raise ValueError(
+                    "kv_append value must be a string: %r"
+                    % (op.get("value"),)
+                )
+            return "caution", (
+                "kv_append %r — creates a new string key with no expiry"
+                % key
+            )
+        if name in ("kv_decr", "kv_decrby"):
+            if name == "kv_decrby" and "by" not in op:
+                raise ValueError("kv_decrby is missing by: %r" % (op,))
+            by = op.get("by", 1)
+            if not _is_int(by):
+                raise ValueError(
+                    "%s by is not an integer: %r" % (name, by)
+                )
+            return "safe", (
+                "%s %r — creates a counter starting at %d"
+                % (name, key, -int(by))
+            )
+        if name == "kv_getex":
+            ex, px, _persist = _getex_option(op)
+            ttl_arg = ex if ex is not None else px
+            if ttl_arg is not None and (
+                not _is_int(ttl_arg) or int(ttl_arg) <= 0
+            ):
+                return "risky", (
+                    "kv_getex %r — would fail: invalid expire time %r"
+                    % (key, ttl_arg)
+                )
+            return "safe", (
+                "kv_getex %r — no-op, the key does not exist" % key
+            )
+        if name in ("kv_zpopmin", "kv_zpopmax"):
+            count = op.get("count", 1)
+            if not _is_int(count) or int(count) < 1:
+                raise ValueError(
+                    "%s count is not a positive integer: %r" % (name, count)
+                )
+            return "safe", (
+                "%s %r — no-op, the key does not exist" % (name, key)
             )
         # kv_expire on a missing key.
         seconds = op.get("seconds")
@@ -1083,6 +1163,131 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_incr %r — increments a counter currently at %s"
             % (key, sample)
+        )
+    if name == "kv_append":
+        if not isinstance(op.get("value"), str):
+            raise ValueError(
+                "kv_append value must be a string: %r" % (op.get("value"),)
+            )
+        if kind != "string":
+            return "risky", (
+                "kv_append %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        if large:
+            return "caution", (
+                "kv_append %r — appends to a large string of %s that %s"
+                % (key, size, ttl_text)
+            )
+        return "safe", (
+            "kv_append %r — appends to a string of %s that %s"
+            % (key, size, ttl_text)
+        )
+    if name in ("kv_decr", "kv_decrby"):
+        if name == "kv_decrby" and "by" not in op:
+            raise ValueError("kv_decrby is missing by: %r" % (op,))
+        by = op.get("by", 1)
+        if not _is_int(by):
+            raise ValueError(
+                "%s by is not an integer: %r" % (name, by)
+            )
+        if kind != "string":
+            return "risky", (
+                "%s %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (name, key, kind, size)
+            )
+        if not _is_int(sample):
+            return "risky", (
+                "%s %r — would fail: the current value is not "
+                "an integer" % (name, key)
+            )
+        return "safe", (
+            "%s %r — decrements a counter currently at %s"
+            % (name, key, sample)
+        )
+    if name == "kv_getex":
+        ex, px, persist = _getex_option(op)
+        if kind != "string":
+            return "risky", (
+                "kv_getex %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        ttl_arg = ex if ex is not None else px
+        if ttl_arg is not None and (
+            not _is_int(ttl_arg) or int(ttl_arg) <= 0
+        ):
+            return "risky", (
+                "kv_getex %r — would fail: invalid expire time %r"
+                % (key, ttl_arg)
+            )
+        if persist:
+            if ttl == -1:
+                return "safe", (
+                    "kv_getex %r — returns the value; the key has "
+                    "no expiry to remove" % key
+                )
+            return "caution", (
+                "kv_getex %r — returns the value and removes its "
+                "expiry (currently %s)" % (key, ttl_text)
+            )
+        if ex is not None:
+            if ttl == -1:
+                return "caution", (
+                    "kv_getex %r — returns the value and gives a key "
+                    "that never expires an expiry of %s"
+                    % (key, _format_ttl(int(ex)))
+                )
+            return "safe", (
+                "kv_getex %r — returns the value and sets its expiry "
+                "to %s" % (key, _format_ttl(int(ex)))
+            )
+        if px is not None:
+            if ttl == -1:
+                return "caution", (
+                    "kv_getex %r — returns the value and gives a key "
+                    "that never expires an expiry of %dms" % (key, int(px))
+                )
+            return "safe", (
+                "kv_getex %r — returns the value and sets its expiry "
+                "to %dms" % (key, int(px))
+            )
+        return "safe", (
+            "kv_getex %r — returns the value and leaves its TTL alone"
+            % key
+        )
+    if name in ("kv_zpopmin", "kv_zpopmax"):
+        count = op.get("count", 1)
+        if not _is_int(count) or int(count) < 1:
+            raise ValueError(
+                "%s count is not a positive integer: %r" % (name, count)
+            )
+        if kind != "zset":
+            return "risky", (
+                "%s %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (name, key, kind, size)
+            )
+        count = int(count)
+        if count >= size_value:
+            # Popping every member deletes the key outright.
+            flags = []
+            if ttl == -1:
+                flags.append(
+                    "pops every member, deleting a sorted set that "
+                    "never expires"
+                )
+            if large:
+                flags.append(
+                    "pops every member of a large sorted set (%s)" % size
+                )
+            if flags:
+                return "risky", "%s %r — %s" % (name, key, "; ".join(flags))
+            return "caution", (
+                "%s %r — pops every member of a sorted set of %s "
+                "that %s" % (name, key, size, ttl_text)
+            )
+        return "caution", (
+            "%s %r — removes %d of %d members"
+            % (name, key, count, size_value)
         )
     # kv_expire on an existing key.
     seconds = op.get("seconds")
