@@ -262,6 +262,56 @@ class FakeCinder(threading.Thread):
                 return ("-WRONGTYPE Operation against a key holding the "
                         "wrong kind of value\r\n")
             return ":%d\r\n" % (0 if value is None else len(value))
+        elif name == "GETRANGE" and len(args) == 3:
+            try:
+                start, stop = int(args[1]), int(args[2])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                return self._bulk("")
+            # Negative indices count from the end, out-of-range
+            # ends are clamped, as in real cinder.
+            length = len(value)
+            if start < 0:
+                start += length
+            if stop < 0:
+                stop += length
+            if start < 0:
+                start = 0
+            if stop >= length:
+                stop = length - 1
+            if start > stop or start >= length:
+                return self._bulk("")
+            return self._bulk(value[start:stop + 1])
+        elif name == "SETRANGE" and len(args) == 3:
+            try:
+                offset = int(args[1])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            if offset < 0:
+                return "-ERR offset is out of range\r\n"
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, str):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            # An empty value changes nothing and creates nothing,
+            # as in real cinder: just report the current length.
+            if args[2] == "":
+                return ":%d\r\n" % (0 if value is None else len(value))
+            # Overwriting preserves the TTL, as in real cinder.
+            expires = self.store[args[0]][1] if args[0] in self.store else None
+            if value is None:
+                new_value = "\x00" * offset + args[2]
+            else:
+                if offset > len(value):
+                    value = value + "\x00" * (offset - len(value))
+                new_value = value[:offset] + args[2] + value[offset + len(args[2]):]
+            self.store[args[0]] = (new_value, expires)
+            return ":%d\r\n" % len(new_value)
         elif name == "GETEX" and len(args) >= 1:
             # GETEX key [EX s | PX ms | PERSIST]: returns the value
             # and sets, refreshes, or removes its TTL; no option
@@ -1437,6 +1487,7 @@ class McpTests(unittest.TestCase):
                     "kv_setex", "kv_getset",
                     "kv_append", "kv_strlen", "kv_decr", "kv_decrby",
                     "kv_getex",
+                    "kv_getrange", "kv_setrange",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
@@ -3471,6 +3522,214 @@ class McpTests(unittest.TestCase):
         })
         self.assertIn("error", not_a_number)
         self.assertEqual(not_a_number["error"]["code"], -32000)
+
+    def test_tools_call_getrange_setrange(self):
+        # GETRANGE on a missing key is "", and a range with no
+        # defaults reads the whole value.
+        missing = self._call("tools/call", 1, {
+            "name": "kv_getrange", "arguments": {"key": "greet"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "")
+        self._call("tools/call", 2, {
+            "name": "kv_set",
+            "arguments": {"key": "greet", "value": "Hello, world!"},
+        })
+        whole = self._call("tools/call", 3, {
+            "name": "kv_getrange", "arguments": {"key": "greet"},
+        })
+        self.assertEqual(whole["result"]["content"][0]["text"],
+                         "Hello, world!")
+        # Positive and negative indices, and clamping past the end.
+        first = self._call("tools/call", 4, {
+            "name": "kv_getrange",
+            "arguments": {"key": "greet", "start": 0, "stop": 4},
+        })
+        self.assertEqual(first["result"]["content"][0]["text"], "Hello")
+        last = self._call("tools/call", 5, {
+            "name": "kv_getrange",
+            "arguments": {"key": "greet", "start": -6, "stop": -1},
+        })
+        self.assertEqual(last["result"]["content"][0]["text"], "world!")
+        clamped = self._call("tools/call", 6, {
+            "name": "kv_getrange",
+            "arguments": {"key": "greet", "start": -100, "stop": 100},
+        })
+        self.assertEqual(clamped["result"]["content"][0]["text"],
+                         "Hello, world!")
+        # A reversed range is empty, not an error.
+        empty = self._call("tools/call", 7, {
+            "name": "kv_getrange",
+            "arguments": {"key": "greet", "start": 5, "stop": 2},
+        })
+        self.assertEqual(empty["result"]["content"][0]["text"], "")
+        # SETRANGE overwrites in place and returns the new length.
+        overwritten = self._call("tools/call", 8, {
+            "name": "kv_setrange",
+            "arguments": {"key": "greet", "offset": 7, "value": "Redis"},
+        })
+        self.assertEqual(overwritten["result"]["content"][0]["text"], "13")
+        read_back = self._call("tools/call", 9, {
+            "name": "kv_get", "arguments": {"key": "greet"},
+        })
+        self.assertEqual(read_back["result"]["content"][0]["text"],
+                         "Hello, Redis!")
+        # SETRANGE past the end extends the string.
+        extended = self._call("tools/call", 10, {
+            "name": "kv_setrange",
+            "arguments": {"key": "greet", "offset": 13, "value": "!"},
+        })
+        self.assertEqual(extended["result"]["content"][0]["text"], "14")
+        # SETRANGE creates a missing key zero-padded to the offset,
+        # and the pad bytes come back intact through GETRANGE.
+        created = self._call("tools/call", 11, {
+            "name": "kv_setrange",
+            "arguments": {"key": "padded", "offset": 5, "value": "hi"},
+        })
+        self.assertEqual(created["result"]["content"][0]["text"], "7")
+        padded = self._call("tools/call", 12, {
+            "name": "kv_getrange",
+            "arguments": {"key": "padded", "start": 0, "stop": -1},
+        })
+        self.assertEqual(padded["result"]["content"][0]["text"],
+                         "\x00\x00\x00\x00\x00hi")
+        # An empty value changes nothing and creates nothing.
+        unchanged = self._call("tools/call", 13, {
+            "name": "kv_setrange",
+            "arguments": {"key": "greet", "offset": 0, "value": ""},
+        })
+        self.assertEqual(unchanged["result"]["content"][0]["text"], "14")
+        nothing = self._call("tools/call", 14, {
+            "name": "kv_setrange",
+            "arguments": {"key": "ghost", "offset": 0, "value": ""},
+        })
+        self.assertEqual(nothing["result"]["content"][0]["text"], "0")
+        ghost_exists = self._call("tools/call", 15, {
+            "name": "kv_exists", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(ghost_exists["result"]["content"][0]["text"], "0")
+        # SETRANGE preserves the TTL, as in Redis.
+        self._call("tools/call", 16, {
+            "name": "kv_set",
+            "arguments": {"key": "expiring", "value": "abcdef", "ex": 100},
+        })
+        self._call("tools/call", 17, {
+            "name": "kv_setrange",
+            "arguments": {"key": "expiring", "offset": 0, "value": "X"},
+        })
+        ttl = self._call("tools/call", 18, {
+            "name": "kv_ttl", "arguments": {"key": "expiring"},
+        })
+        self.assertTrue(0 < int(ttl["result"]["content"][0]["text"]) <= 100)
+
+    def test_tools_call_getrange_setrange_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_getrange", "arguments": {}},
+            {"name": "kv_getrange",
+             "arguments": {"key": "a", "start": "0"}},
+            {"name": "kv_getrange",
+             "arguments": {"key": "a", "start": True}},
+            {"name": "kv_getrange",
+             "arguments": {"key": "a", "stop": "1"}},
+            {"name": "kv_getrange",
+             "arguments": {"key": "a", "stop": 1.5}},
+            {"name": "kv_setrange", "arguments": {}},
+            {"name": "kv_setrange", "arguments": {"key": "a"}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "a", "offset": 0}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "a", "value": "v"}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "a", "offset": -1, "value": "v"}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "a", "offset": "0", "value": "v"}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "a", "offset": True, "value": "v"}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "a", "offset": 0, "value": 5}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_getrange_setrange_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_lpush",
+            "arguments": {"key": "queue", "elements": ["x"]},
+        })
+        for i, call in enumerate([
+            {"name": "kv_getrange",
+             "arguments": {"key": "queue", "start": 0, "stop": -1}},
+            {"name": "kv_setrange",
+             "arguments": {"key": "queue", "offset": 0, "value": "v"}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_getrange_setrange_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_set", "key": "greet", "value": "Hello"},
+                {"op": "kv_getrange", "key": "greet",
+                 "start": 0, "stop": 3},
+                {"op": "kv_getrange", "key": "greet",
+                 "start": -2, "stop": -1},
+                {"op": "kv_getrange", "key": "ghost"},
+                {"op": "kv_setrange", "key": "greet",
+                 "offset": 5, "value": ", world!"},
+                {"op": "kv_get", "key": "greet"},
+                {"op": "kv_setrange", "key": "fresh",
+                 "offset": 3, "value": "ab"},
+                {"op": "kv_getrange", "key": "fresh"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 8)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertEqual(summary["results"][1]["result"], "Hell")
+        self.assertEqual(summary["results"][2]["result"], "lo")
+        self.assertEqual(summary["results"][3]["result"], "")
+        self.assertEqual(summary["results"][4]["result"], 13)
+        self.assertEqual(summary["results"][5]["result"], "Hello, world!")
+        self.assertEqual(summary["results"][6]["result"], 5)
+        self.assertEqual(summary["results"][7]["result"],
+                         "\x00\x00\x00ab")
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "g2", "value": "abcdef"},
+                {"op": "kv_getrange", "key": "g2",
+                 "start": 1, "stop": 3},
+                {"op": "kv_setrange", "key": "g2",
+                 "offset": 0, "value": "X"},
+                {"op": "kv_get", "key": "g2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertEqual(summary["results"][1]["result"], "bcd")
+        self.assertEqual(summary["results"][2]["result"], 6)
+        self.assertEqual(summary["results"][3]["result"], "Xbcdef")
+        # A bad setrange argument fails an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "t", "value": "v"},
+                {"op": "kv_setrange", "key": "t",
+                 "offset": -1, "value": "v"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "t"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
     def test_tools_call_string_counter_tools_in_plain_and_atomic_batch(self):
         plain = self._call("tools/call", 1, {
@@ -6684,9 +6943,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_zscan", "key": "a"},
             {"op": "kv_zrangebylex", "key": "a"},
             {"op": "kv_zlexcount", "key": "a"},
+            {"op": "kv_getrange", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 9 op(s), 1 audited, 8 not audited.", text)
+        self.assertIn("Plan: 10 op(s), 1 audited, 9 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -6695,6 +6955,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 6: kv_zscan is a read, not a write", text)
         self.assertIn("op 7: kv_zrangebylex is a read, not a write", text)
         self.assertIn("op 8: kv_zlexcount is a read, not a write", text)
+        self.assertIn("op 9: kv_getrange is a read, not a write", text)
 
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
@@ -7147,9 +7408,21 @@ class McpTests(unittest.TestCase):
             {"op": "kv_getdel", "key": "ghost"},
             {"op": "kv_mset", "values": {}},
             {"op": "kv_mset", "values": {"a": 1}},
+            {"op": "kv_setrange", "key": "forever",
+             "offset": 0, "value": "x"},
+            {"op": "kv_setrange", "key": "todo",
+             "offset": 0, "value": "x"},
+            {"op": "kv_setrange", "key": "big",
+             "offset": 0, "value": "x"},
+            {"op": "kv_setrange", "key": "ghost",
+             "offset": 5, "value": "x"},
+            {"op": "kv_setrange", "key": "ghost2",
+             "offset": 0, "value": ""},
+            {"op": "kv_setrange", "key": "ghost3",
+             "offset": -1, "value": "x"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 21 op(s), 19 audited, 2 not audited.", text)
+        self.assertIn("Plan: 27 op(s), 25 audited, 2 not audited.", text)
         self.assertIn(
             "op 19: kv_mset values must be a non-empty object", text)
         self.assertIn(
@@ -7201,6 +7474,16 @@ class McpTests(unittest.TestCase):
             "the key is a list of 2 elements",
             risky,
         )
+        self.assertIn(
+            "op 22: kv_setrange 'todo' — would fail with WRONGTYPE: "
+            "the key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 26: kv_setrange 'ghost3' — would fail: offset is out "
+            "of range",
+            risky,
+        )
         caution = text.split("Caution (")[1].split("\n\n")[0]
         self.assertIn(
             "op 0: kv_mset 'fresh-a', 'fresh-b' — creates 2 new "
@@ -7245,6 +7528,16 @@ class McpTests(unittest.TestCase):
             "that expires in ",
             caution,
         )
+        self.assertIn(
+            "op 23: kv_setrange 'big' — overwrites part of a large "
+            "string of 2000 bytes that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 24: kv_setrange 'ghost' — creates a new string key "
+            "with no expiry, zero-padded to offset 5",
+            caution,
+        )
         safe = text.split("Safe (")[1].split("\n\n")[0]
         self.assertIn(
             "op 5: kv_setnx 'forever' — no-op, the key already exists",
@@ -7257,6 +7550,16 @@ class McpTests(unittest.TestCase):
         )
         self.assertIn(
             "op 18: kv_getdel 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+        self.assertIn(
+            "op 21: kv_setrange 'forever' — overwrites part of a "
+            "string of 1 bytes that no expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 25: kv_setrange 'ghost2' — no-op, an empty value "
+            "creates nothing",
             safe,
         )
 
@@ -8618,6 +8921,99 @@ class LiveCinderMigrationTests(unittest.TestCase):
             reply = self._call("tools/call", 99, {
                 "name": "kv_zlexcount", "arguments": arguments})
             self.assertIn("error", reply, arguments)
+
+    def test_live_getrange_setrange(self):
+        """kv_getrange / kv_setrange against a real cinder 0.45.0:
+        negative indices, clamping, an empty range, a missing key
+        reading "", SETRANGE overwriting and extending, a missing
+        key created zero-padded with the pad bytes coming back
+        intact through GETRANGE, an empty value changing nothing,
+        TTL preservation, and WRONGTYPE on a list key."""
+        self.assertEqual(
+            self._tool("kv_set", {"key": "range:greet",
+                                  "value": "Hello, world!"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:greet"}),
+            "Hello, world!")
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:greet",
+                                      "start": 0, "stop": 4}),
+            "Hello")
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:greet",
+                                      "start": -6, "stop": -1}),
+            "world!")
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:greet",
+                                      "start": -100, "stop": 100}),
+            "Hello, world!")
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:greet",
+                                      "start": 5, "stop": 2}),
+            "")
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:ghost"}), "")
+        self.assertEqual(
+            self._tool("kv_setrange", {"key": "range:greet",
+                                      "offset": 7, "value": "Redis"}),
+            13)
+        self.assertEqual(
+            self._tool("kv_get", {"key": "range:greet"}),
+            "Hello, Redis!")
+        self.assertEqual(
+            self._tool("kv_setrange", {"key": "range:greet",
+                                      "offset": 13, "value": "!"}),
+            14)
+        self.assertEqual(
+            self._tool("kv_setrange", {"key": "range:padded",
+                                      "offset": 5, "value": "hi"}),
+            7)
+        self.assertEqual(
+            self._tool("kv_getrange", {"key": "range:padded"}),
+            "\x00\x00\x00\x00\x00hi")
+        self.assertEqual(
+            self._tool("kv_strlen", {"key": "range:padded"}), 7)
+        # An empty value changes nothing and creates nothing.
+        self.assertEqual(
+            self._tool("kv_setrange", {"key": "range:greet",
+                                      "offset": 0, "value": ""}),
+            14)
+        self.assertEqual(
+            self._tool("kv_setrange", {"key": "range:ghost",
+                                      "offset": 0, "value": ""}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "range:ghost"}), 0)
+        # SETRANGE preserves the TTL, as in Redis.
+        self.assertEqual(
+            self._tool("kv_setex", {"key": "range:ttl", "seconds": 100,
+                                   "value": "abcdef"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_setrange", {"key": "range:ttl",
+                                      "offset": 0, "value": "X"}),
+            6)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "range:ttl"}), 0)
+        # WRONGTYPE on a list key, and a negative offset fails.
+        self.assertEqual(
+            self._tool("kv_rpush", {"key": "range:list",
+                                   "elements": ["a"]}),
+            1)
+        for call in ({"name": "kv_getrange",
+                      "arguments": {"key": "range:list"}},
+                     {"name": "kv_setrange",
+                      "arguments": {"key": "range:list",
+                                    "offset": 0, "value": "x"}}):
+            reply = self._call("tools/call", 99, call)
+            self.assertIn("error", reply, call)
+        reply = self._call("tools/call", 99, {
+            "name": "kv_setrange",
+            "arguments": {"key": "range:greet",
+                          "offset": -1, "value": "x"}})
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
 
 
 if __name__ == "__main__":

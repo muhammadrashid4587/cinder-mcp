@@ -266,6 +266,32 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_getrange",
+        "description": "A substring of the string stored at a key: GETRANGE key start stop. Negative indices count from the end, as in Redis; out-of-range ends are clamped, so GETRANGE key 0 -1 returns the whole value. Returns \"\" when the key does not exist or the range is empty — including a range past the end of a SETRANGE zero-pad, whose zero bytes come back intact. start defaults to 0 and stop to -1.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "start": {"type": "integer"},
+                "stop": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_setrange",
+        "description": "Overwrite the string stored at a key starting at an offset: SETRANGE key offset value. Creates the key zero-padded to the offset when it does not exist, and extends it when the write runs past the end. Returns the length of the string after the write. Preserves the key's TTL. An empty value changes nothing and creates nothing: it returns the current length, or 0 when the key does not exist. The offset must be 0 or more.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "offset": {"type": "integer"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "offset", "value"],
+        },
+    },
+    {
         "name": "kv_hset",
         "description": "Set fields on a hash: HSET key field value [field value ...]. Takes `fields` as an object mapping field names to values. Returns the number of fields that were newly added (updating an existing field returns 0 for it).",
         "inputSchema": {
@@ -838,7 +864,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -955,6 +981,7 @@ BATCHABLE_TOOLS = {
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
+    "kv_getrange", "kv_setrange",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
@@ -1037,6 +1064,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire", "kv_pexpire",
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
+    "kv_getrange", "kv_setrange",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
@@ -1489,6 +1517,12 @@ def _op_argv(name, args):
         if persist:
             return ["GETEX", key, "PERSIST"]
         return ["GETEX", key]
+    if name == "kv_getrange":
+        key, start, stop = _getrange_args(args)
+        return ["GETRANGE", key, start, stop]
+    if name == "kv_setrange":
+        key, offset, value = _setrange_args(args)
+        return ["SETRANGE", key, offset, value]
     if name == "kv_hset":
         return ["HSET", _require(args, "key")] + _hset_field_args(args)
     if name == "kv_hget":
@@ -1781,6 +1815,43 @@ def _getex_args(args):
                 "kv_getex px must be more than 0, got %d" % px
             )
     return key, ex, px, persist
+
+
+def _getrange_args(args):
+    """Validate a kv_getrange call: (key, start, stop). start
+    defaults to 0 and stop to -1, as in Redis; negative indices
+    count from the end and out-of-range ends are clamped by
+    cinder. Bad types fail the call instead of sending a
+    half-formed GETRANGE."""
+    key = _require(args, "key")
+    start = args.get("start", 0)
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise ValueError("kv_getrange start must be an integer")
+    stop = args.get("stop", -1)
+    if isinstance(stop, bool) or not isinstance(stop, int):
+        raise ValueError("kv_getrange stop must be an integer")
+    return key, start, stop
+
+
+def _setrange_args(args):
+    """Validate a kv_setrange call: (key, offset, value). The
+    offset must be an integer 0 or more — cinder rejects a
+    negative offset as a server error, so fail here as invalid
+    params instead — and the value must be a string. An empty
+    value is allowed through: cinder answers with the current
+    length (or 0 for a missing key) and changes nothing."""
+    key = _require(args, "key")
+    offset = _require(args, "offset")
+    value = _require(args, "value")
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError("kv_setrange offset must be an integer")
+    if offset < 0:
+        raise ValueError(
+            "kv_setrange offset must be 0 or more, got %d" % offset
+        )
+    if not isinstance(value, str):
+        raise ValueError("kv_setrange value must be a string")
+    return key, offset, value
 
 
 def _hincrby_args(args):

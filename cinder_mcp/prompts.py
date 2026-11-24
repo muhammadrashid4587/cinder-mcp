@@ -125,14 +125,15 @@ MAX_MIGRATION_FLAGGED_LISTED = 10
 WRITE_SAFETY_WRITE_OPS = (
     "kv_set", "kv_del", "kv_incr", "kv_expire",
     "kv_mset", "kv_setnx", "kv_setex", "kv_getset", "kv_getdel",
-    "kv_append", "kv_decr", "kv_decrby", "kv_getex",
+    "kv_append", "kv_decr", "kv_decrby", "kv_getex", "kv_setrange",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
-                         "kv_strlen", "kv_hscan", "kv_hkeys", "kv_hvals",
+                         "kv_strlen", "kv_getrange", "kv_hscan",
+                         "kv_hkeys", "kv_hvals",
                          "kv_zrandmember", "kv_zscan", "kv_zrangebylex",
                          "kv_zlexcount", "kv_lindex")
 
@@ -1165,6 +1166,29 @@ def _getex_option(op):
     return ex, px, persist
 
 
+def _setrange_audit_args(op):
+    """The (offset, value) for a kv_setrange op in a write plan,
+    validated like the tool's own arguments: the offset must be an
+    integer and the value a string. A negative offset is returned
+    as-is — the caller reports it as risky (it would fail in
+    cinder) rather than not audited. Anything else raises
+    ValueError, so the caller reports the op as not audited
+    instead of guessing."""
+    offset = op.get("offset")
+    if offset is None:
+        raise ValueError("kv_setrange is missing offset: %r" % (op,))
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise ValueError(
+            "kv_setrange offset must be an integer: %r" % (offset,)
+        )
+    value = op.get("value")
+    if not isinstance(value, str):
+        raise ValueError(
+            "kv_setrange value must be a string: %r" % (value,)
+        )
+    return offset, value
+
+
 def _format_key_list(keys):
     """Key names quoted and comma-joined for one audit line, with
     the rest counted when there are more than a few: a kv_mset can
@@ -1350,8 +1374,9 @@ def _audit_write_op(client, op):
     string, a GETDEL on a container, an INCR or DECR on
     a non-integer or a container, a HINCRBY on a non-integer field
     or a container, a HINCRBYFLOAT on a non-float field or a
-    container, a HSETNX on a container, an APPEND on a
-    container, a GETEX or ZPOP on a container, an LSET or LINSERT
+    container, a HSETNX on a container, an APPEND or SETRANGE on a
+    container, a SETRANGE with a negative offset, a GETEX or ZPOP
+    on a container, an LSET or LINSERT
     on a container, an LSET on a missing key or with an index out
     of range, an LPUSHX or RPUSHX on a container, an LTRIM that
     would delete a never-expiring or large list outright, an
@@ -1361,18 +1386,19 @@ def _audit_write_op(client, op):
     sorted set, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
-    of a key that expires soon anyway, a SET, MSET, SETNX, APPEND
-    or GETSET that creates a key with no expiry, a HSETNX that
-    creates a hash with no expiry or adds a field to a hash that
-    never expires, a GETEX that gives a never-expiring key an
-    expiry or removes one, a ZPOP that takes some but not all
+    of a key that expires soon anyway, a SET, MSET, SETNX, APPEND,
+    SETRANGE or GETSET that creates a key with no expiry, a HSETNX
+    that creates a hash with no expiry or adds a field to a hash
+    that never expires, a GETEX that gives a never-expiring key
+    an expiry or removes one, a ZPOP that takes some but not all
     members, an LSET that replaces one element of a list, or an
     LINSERT that adds one element to a list, an LPUSHX or RPUSHX
     that adds elements to a list that never expires, an LTRIM
     that shortens a list that never expires or deletes a list
-    that expires soon, or an LMOVE that moves one element out of
-    a list with more to spare or empties a source that expires
-    soon. SETNX on a key that
+    that expires soon, a SETRANGE that overwrites part of a large
+    string, or an LMOVE that moves one element out of a list with
+    more to spare or empties a source that expires soon. SETNX on
+    a key that
     already exists writes nothing, so it is safe, and so is HSETNX
     on a field that already exists, an LSET that writes the value
     the element already holds, and an LINSERT whose pivot is not
@@ -1381,8 +1407,9 @@ def _audit_write_op(client, op):
     missing field, HINCRBYFLOAT on a missing key or a missing
     field, an EXPIRE on an existing key, a GETEX that
     only reads a value, an LPUSHX, RPUSHX, or LTRIM on a missing
-    key, an LMOVE out of a missing key or within one key, or a
-    no-op on a missing key.
+    key, an LMOVE out of a missing key or within one key, a
+    SETRANGE that overwrites part of a string or writes an empty
+    value, or a no-op on a missing key.
     kv_mset has no single key — it writes several at once — so it
     is audited by _audit_mset instead of the single-key flow below.
     kv_lmove has two keys — a source and a destination — so it is
@@ -1498,6 +1525,31 @@ def _audit_write_op(client, op):
                 )
             return "caution", (
                 "kv_getset %r — creates a new key with no expiry" % key
+            )
+        if name == "kv_setrange":
+            # SETRANGE on a missing key creates it zero-padded to
+            # the offset, as in Redis — unless the value is empty,
+            # which changes nothing and creates nothing.
+            offset, value = _setrange_audit_args(op)
+            if offset < 0:
+                return "risky", (
+                    "kv_setrange %r — would fail: offset is out of "
+                    "range" % key
+                )
+            if value == "":
+                return "safe", (
+                    "kv_setrange %r — no-op, an empty value creates "
+                    "nothing" % key
+                )
+            if offset > 0:
+                return "caution", (
+                    "kv_setrange %r — creates a new string key with "
+                    "no expiry, zero-padded to offset %d"
+                    % (key, offset)
+                )
+            return "caution", (
+                "kv_setrange %r — creates a new string key with no "
+                "expiry" % key
             )
         if name == "kv_getdel":
             return "safe", (
@@ -1681,6 +1733,36 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_append %r — appends to a string of %s that %s"
             % (key, size, ttl_text)
+        )
+    if name == "kv_setrange":
+        # SETRANGE rewrites part of the string in place and keeps
+        # its TTL, like APPEND — it never replaces the key, so a
+        # never-expiring string is not on its own a risk. An empty
+        # value changes nothing at all.
+        offset, value = _setrange_audit_args(op)
+        if offset < 0:
+            return "risky", (
+                "kv_setrange %r — would fail: offset is out of range"
+                % key
+            )
+        if value == "":
+            return "safe", (
+                "kv_setrange %r — no-op, an empty value changes "
+                "nothing" % key
+            )
+        if kind != "string":
+            return "risky", (
+                "kv_setrange %r — would fail with WRONGTYPE: the key "
+                "is a %s of %s" % (key, kind, size)
+            )
+        if large:
+            return "caution", (
+                "kv_setrange %r — overwrites part of a large string "
+                "of %s that %s" % (key, size, ttl_text)
+            )
+        return "safe", (
+            "kv_setrange %r — overwrites part of a string of %s "
+            "that %s" % (key, size, ttl_text)
         )
     if name in ("kv_decr", "kv_decrby"):
         if name == "kv_decrby" and "by" not in op:
