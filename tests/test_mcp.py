@@ -2,7 +2,7 @@
 
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SMEMBERS, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -252,6 +252,30 @@ class FakeCinder(threading.Thread):
                     added += 1
                 value.add(member)
             return ":%d\r\n" % added
+        elif name == "SREM" and len(args) >= 2:
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, set):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            removed = 0
+            for member in args[1:]:
+                if member in value:
+                    removed += 1
+                value.discard(member)
+            if not value:
+                # A set emptied by removing is gone, as in Redis.
+                del self.store[args[0]]
+            return ":%d\r\n" % removed
+        elif name == "SISMEMBER" and len(args) == 2:
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, set):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return ":1\r\n" if args[1] in value else ":0\r\n"
         elif name == "HSET" and len(args) >= 3 and len(args) % 2 == 1:
             value = self._get(args[0])
             if value is not None and not isinstance(value, dict):
@@ -736,6 +760,7 @@ class McpTests(unittest.TestCase):
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_sadd", "kv_smembers", "kv_scard",
+                    "kv_srem", "kv_sismember",
                     "kv_batch"]
         )
 
@@ -1727,6 +1752,17 @@ class McpTests(unittest.TestCase):
              "arguments": {"key": "s", "members": ["a", 7]}},
             {"name": "kv_smembers", "arguments": {}},
             {"name": "kv_scard", "arguments": {}},
+            {"name": "kv_srem", "arguments": {"key": "s"}},
+            {"name": "kv_srem", "arguments": {"members": ["a"]}},
+            {"name": "kv_srem",
+             "arguments": {"key": "s", "members": []}},
+            {"name": "kv_srem",
+             "arguments": {"key": "s", "members": "a"}},
+            {"name": "kv_srem",
+             "arguments": {"key": "s", "members": ["a", 7]}},
+            {"name": "kv_sismember", "arguments": {"key": "s"}},
+            {"name": "kv_sismember", "arguments": {"member": "a"}},
+            {"name": "kv_sismember", "arguments": {}},
         ]
         for i, call in enumerate(cases):
             reply = self._call("tools/call", i + 1, call)
@@ -1751,6 +1787,62 @@ class McpTests(unittest.TestCase):
         })
         self.assertEqual(card["result"]["content"][0]["text"], "1001")
 
+    def test_tools_call_set_remove_and_membership(self):
+        self._call("tools/call", 1, {
+            "name": "kv_sadd",
+            "arguments": {"key": "tags",
+                          "members": ["a", "b", "c"]},
+        })
+        # Removing a present member counts 1 for it; a member that
+        # is not present counts 0, and the rest still remove.
+        removed = self._call("tools/call", 2, {
+            "name": "kv_srem",
+            "arguments": {"key": "tags", "members": ["b", "ghost"]},
+        })
+        self.assertEqual(removed["result"]["content"][0]["text"], "1")
+        present = self._call("tools/call", 3, {
+            "name": "kv_sismember",
+            "arguments": {"key": "tags", "member": "a"},
+        })
+        self.assertEqual(present["result"]["content"][0]["text"], "1")
+        absent = self._call("tools/call", 4, {
+            "name": "kv_sismember",
+            "arguments": {"key": "tags", "member": "b"},
+        })
+        self.assertEqual(absent["result"]["content"][0]["text"], "0")
+        members = self._call("tools/call", 5, {
+            "name": "kv_smembers", "arguments": {"key": "tags"},
+        })
+        self.assertEqual(
+            sorted(json.loads(members["result"]["content"][0]["text"])),
+            ["a", "c"],
+        )
+        card = self._call("tools/call", 6, {
+            "name": "kv_scard", "arguments": {"key": "tags"},
+        })
+        self.assertEqual(card["result"]["content"][0]["text"], "2")
+        # Removing from a missing key removes 0 and membership is 0.
+        ghost_removed = self._call("tools/call", 7, {
+            "name": "kv_srem",
+            "arguments": {"key": "ghost", "members": ["a"]},
+        })
+        self.assertEqual(ghost_removed["result"]["content"][0]["text"], "0")
+        ghost_member = self._call("tools/call", 8, {
+            "name": "kv_sismember",
+            "arguments": {"key": "ghost", "member": "a"},
+        })
+        self.assertEqual(ghost_member["result"]["content"][0]["text"], "0")
+        # Removing the last member deletes the key, as in Redis.
+        last = self._call("tools/call", 9, {
+            "name": "kv_srem",
+            "arguments": {"key": "tags", "members": ["a", "c"]},
+        })
+        self.assertEqual(last["result"]["content"][0]["text"], "2")
+        gone = self._call("tools/call", 10, {
+            "name": "kv_exists", "arguments": {"key": "tags"},
+        })
+        self.assertEqual(gone["result"]["content"][0]["text"], "0")
+
     def test_tools_call_set_tools_wrong_type_errors(self):
         self._call("tools/call", 1, {
             "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
@@ -1760,6 +1852,10 @@ class McpTests(unittest.TestCase):
              "arguments": {"key": "plain", "members": ["m"]}},
             {"name": "kv_smembers", "arguments": {"key": "plain"}},
             {"name": "kv_scard", "arguments": {"key": "plain"}},
+            {"name": "kv_srem",
+             "arguments": {"key": "plain", "members": ["m"]}},
+            {"name": "kv_sismember",
+             "arguments": {"key": "plain", "member": "m"}},
         ]):
             reply = self._call("tools/call", i + 2, call)
             self.assertIn("error", reply, call)
@@ -1808,6 +1904,58 @@ class McpTests(unittest.TestCase):
             "arguments": {"atomic": True, "ops": [
                 {"op": "kv_sadd", "key": "s3", "members": ["a"]},
                 {"op": "kv_sadd", "key": "s3", "members": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "s3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_set_remove_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_sadd", "key": "s",
+                 "members": ["a", "b", "c"]},
+                {"op": "kv_sismember", "key": "s", "member": "b"},
+                {"op": "kv_srem", "key": "s", "members": ["b", "ghost"]},
+                {"op": "kv_sismember", "key": "s", "member": "b"},
+                {"op": "kv_scard", "key": "s"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        self.assertEqual(summary["results"][4]["result"], 2)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_sadd", "key": "s2",
+                 "members": ["x", "y"]},
+                {"op": "kv_sismember", "key": "s2", "member": "x"},
+                {"op": "kv_srem", "key": "s2", "members": ["x"]},
+                {"op": "kv_sismember", "key": "s2", "member": "x"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        # Bad remove arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_sadd", "key": "s3", "members": ["a"]},
+                {"op": "kv_srem", "key": "s3", "members": []},
             ]},
         })
         self.assertIn("error", bad)

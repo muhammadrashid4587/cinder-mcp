@@ -394,8 +394,32 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_srem",
+        "description": "Remove members from a set: SREM key member [member ...]. Takes `members` as a list of member names. Returns the number of members actually removed (removing a member that is not present counts 0). Removing the last member deletes the key, as in Redis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
+        "name": "kv_sismember",
+        "description": "Test whether a value is a member of a set: SISMEMBER key member. Returns 1 if the member is present, 0 if it is not or the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member": {"type": "string"},
+            },
+            "required": ["key", "member"],
+        },
+    },
+    {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers or kv_scard plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_hset, kv_hget, kv_hgetall, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -500,7 +524,7 @@ BATCHABLE_TOOLS = {
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
-    "kv_sadd", "kv_smembers", "kv_scard",
+    "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
 
 MAX_BATCH_OPS = 100
@@ -573,7 +597,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
-    "kv_sadd", "kv_smembers", "kv_scard",
+    "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
 }
 
 
@@ -909,6 +933,10 @@ def _op_argv(name, args):
         return ["SMEMBERS", _require(args, "key")]
     if name == "kv_scard":
         return ["SCARD", _require(args, "key")]
+    if name == "kv_srem":
+        return ["SREM", _require(args, "key")] + _set_members_args(args, name)
+    if name == "kv_sismember":
+        return ["SISMEMBER", _require(args, "key"), _require(args, "member")]
     if name == "kv_zrange":
         key, start, stop, withscores, rev = _zrange_args(args)
         # A range both ends of which are non-negative has a known
@@ -1380,9 +1408,9 @@ MAX_SMEMBERS = 1000
 
 
 def _set_members_args(args, name):
-    """The member names for an SADD, as an argv list. `members` must
-    be a non-empty list of strings; anything else fails the call
-    instead of sending a half-formed SADD."""
+    """The member names for an SADD or SREM, as an argv list.
+    `members` must be a non-empty list of strings; anything else
+    fails the call instead of sending a half-formed command."""
     members = args.get("members")
     if not isinstance(members, list) or not members:
         raise ValueError("%s members must be a non-empty list" % name)
