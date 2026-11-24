@@ -120,6 +120,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_set", "kv_del", "kv_incr", "kv_expire",
     "kv_mset", "kv_setnx", "kv_setex", "kv_getset", "kv_getdel",
     "kv_append", "kv_decr", "kv_decrby", "kv_getex",
+    "kv_hsetnx", "kv_hincrby",
     "kv_zpopmin", "kv_zpopmax",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
@@ -233,7 +234,9 @@ PROMPTS = [
             "expire, overwrites of large keys, SETs, MSETs, SETEXes "
             "and GETSETs that would destroy a container, GETDELs "
             "that would delete a key that never expires, INCRs and "
-            "DECRs that would fail, APPENDs that would fail, GETEXes "
+            "DECRs that would fail, HINCRBYs that would fail on a "
+            "non-integer field or a container, HSETNXes that would "
+            "fail on a container, APPENDs that would fail, GETEXes "
             "that would change or remove a TTL, ZPOPs that would "
             "drain a sorted set, and EXPIREs with a bad timeout, "
             "and give a go/no-go per risky op."
@@ -957,6 +960,21 @@ def _is_int(text):
     return True
 
 
+def _hincrby_audit_increment(op):
+    """The increment for a kv_hincrby op in a write plan, validated
+    like the tool's own argument: it must be an integer, and a
+    negative one counts down. Anything else raises ValueError, so
+    the caller reports the op as not audited instead of guessing."""
+    increment = op.get("increment")
+    if increment is None:
+        raise ValueError("kv_hincrby is missing increment: %r" % (op,))
+    if not _is_int(increment):
+        raise ValueError(
+            "kv_hincrby increment is not an integer: %r" % (increment,)
+        )
+    return increment
+
+
 def _getex_option(op):
     """The GETEX option from a write-plan op: (ex, px, persist).
     At most one option may be given, and persist must be a
@@ -1082,19 +1100,23 @@ def _audit_write_op(client, op):
     expires, overwriting or deleting a large key, a SET, MSET,
     SETEX or GETSET that would replace a list, set, or hash with a
     string, a GETDEL on a container, an INCR or DECR on
-    a non-integer or a container, an APPEND on a container, a
-    GETEX or ZPOP on a container, a ZPOP that would drain a
-    never-expiring or large sorted set, or an EXPIRE, SETEX or
-    GETEX with a bad timeout. "caution" changes something but the
-    damage is bounded — an overwrite or delete of a key that
-    expires soon anyway, a SET, MSET, SETNX, APPEND or GETSET
-    that creates a key with no expiry, a GETEX that gives a
-    never-expiring key an expiry or removes one, or a ZPOP that
-    takes some but not all members. SETNX on a key that already
-    exists writes nothing, so it is safe. Everything else is
-    "safe": creating an expiring key, INCR or DECR on a missing
-    key, an EXPIRE on an existing key, a GETEX that only reads a
-    value, or a no-op on a missing key.
+    a non-integer or a container, a HINCRBY on a non-integer field
+    or a container, a HSETNX on a container, an APPEND on a
+    container, a GETEX or ZPOP on a container, a ZPOP that would
+    drain a never-expiring or large sorted set, or an EXPIRE,
+    SETEX or GETEX with a bad timeout. "caution" changes
+    something but the damage is bounded — an overwrite or delete
+    of a key that expires soon anyway, a SET, MSET, SETNX, APPEND
+    or GETSET that creates a key with no expiry, a HSETNX that
+    creates a hash with no expiry or adds a field to a hash that
+    never expires, a GETEX that gives a never-expiring key an
+    expiry or removes one, or a ZPOP that takes some but not all
+    members. SETNX on a key that already exists writes nothing,
+    so it is safe, and so is HSETNX on a field that already
+    exists. Everything else is "safe": creating an expiring key,
+    INCR or DECR on a missing key, HINCRBY on a missing key or a
+    missing field, an EXPIRE on an existing key, a GETEX that
+    only reads a value, or a no-op on a missing key.
     kv_mset has no single key — it writes several at once — so it
     is audited by _audit_mset instead of the single-key flow below."""
     name = op.get("op")
@@ -1208,6 +1230,32 @@ def _audit_write_op(client, op):
         if name == "kv_getdel":
             return "safe", (
                 "kv_getdel %r — no-op, the key does not exist" % key
+            )
+        if name == "kv_hsetnx":
+            if not isinstance(op.get("field"), str):
+                raise ValueError(
+                    "kv_hsetnx field must be a string: %r"
+                    % (op.get("field"),)
+                )
+            if not isinstance(op.get("value"), str):
+                raise ValueError(
+                    "kv_hsetnx value must be a string: %r"
+                    % (op.get("value"),)
+                )
+            return "caution", (
+                "kv_hsetnx %r — creates a new hash with no expiry"
+                % key
+            )
+        if name == "kv_hincrby":
+            increment = _hincrby_audit_increment(op)
+            if not isinstance(op.get("field"), str):
+                raise ValueError(
+                    "kv_hincrby field must be a string: %r"
+                    % (op.get("field"),)
+                )
+            return "safe", (
+                "kv_hincrby %r — creates a counter field starting at %d"
+                % (key, int(increment))
             )
         if name in ("kv_zpopmin", "kv_zpopmax"):
             count = op.get("count", 1)
@@ -1473,6 +1521,63 @@ def _audit_write_op(client, op):
         return "caution", (
             "kv_getdel %r — deletes a %s of %s that %s"
             % (key, kind, size, ttl_text)
+        )
+    if name == "kv_hsetnx":
+        field = op.get("field")
+        if not isinstance(field, str):
+            raise ValueError(
+                "kv_hsetnx field must be a string: %r" % (field,)
+            )
+        if not isinstance(op.get("value"), str):
+            raise ValueError(
+                "kv_hsetnx value must be a string: %r"
+                % (op.get("value"),)
+            )
+        if kind != "hash":
+            return "risky", (
+                "kv_hsetnx %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        if client.command("HEXISTS", key, field) == 1:
+            # The field is already there: nothing is written.
+            return "safe", (
+                "kv_hsetnx %r — no-op, the field already exists" % key
+            )
+        if ttl == -1:
+            return "caution", (
+                "kv_hsetnx %r — adds a field to a hash that never "
+                "expires" % key
+            )
+        return "safe", (
+            "kv_hsetnx %r — adds a new field to a hash of %s that %s"
+            % (key, size, ttl_text)
+        )
+    if name == "kv_hincrby":
+        increment = _hincrby_audit_increment(op)
+        field = op.get("field")
+        if not isinstance(field, str):
+            raise ValueError(
+                "kv_hincrby field must be a string: %r" % (field,)
+            )
+        if kind != "hash":
+            return "risky", (
+                "kv_hincrby %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        current = client.command("HGET", key, field)
+        if current is None:
+            return "safe", (
+                "kv_hincrby %r — creates a counter field starting at %d"
+                % (key, int(increment))
+            )
+        if not _is_int(current):
+            return "risky", (
+                "kv_hincrby %r — would fail: the field value is not "
+                "an integer" % key
+            )
+        return "safe", (
+            "kv_hincrby %r — increments a counter field currently at %s"
+            % (key, current)
         )
     if name in ("kv_zpopmin", "kv_zpopmax"):
         count = op.get("count", 1)

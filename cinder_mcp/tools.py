@@ -327,6 +327,44 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_hmget",
+        "description": "Get several fields of a hash at once: HMGET key field [field ...]. Takes `fields` as a list of field names. Returns the values in the same order, with null for a field that does not exist — and null for every field when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "fields"],
+        },
+    },
+    {
+        "name": "kv_hsetnx",
+        "description": "Set one field of a hash only when the field does not already exist: HSETNX key field value. Returns 1 if the field was set, 0 if it already existed (the old value is left alone).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "field": {"type": "string"},
+                "value": {"type": "string"},
+            },
+            "required": ["key", "field", "value"],
+        },
+    },
+    {
+        "name": "kv_hincrby",
+        "description": "Increment the integer stored in one field of a hash: HINCRBY key field increment. Creates the field holding the increment when it does not exist, and the key when it does not exist. Returns the new value as a number. A negative increment counts down, as in Redis.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "field": {"type": "string"},
+                "increment": {"type": "integer"},
+            },
+            "required": ["key", "field", "increment"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -616,7 +654,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -726,6 +764,7 @@ BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
+    "kv_hmget", "kv_hsetnx", "kv_hincrby",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
@@ -803,6 +842,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx", "kv_setex", "kv_getset",
     "kv_append", "kv_strlen", "kv_decr", "kv_decrby", "kv_getex",
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
+    "kv_hmget", "kv_hsetnx", "kv_hincrby",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
@@ -1156,6 +1196,14 @@ def _op_argv(name, args):
         return ["HEXISTS", _require(args, "key"), _require(args, "field")]
     if name == "kv_hlen":
         return ["HLEN", _require(args, "key")]
+    if name == "kv_hmget":
+        return ["HMGET", _require(args, "key")] + _hash_fields_args(args, name)
+    if name == "kv_hsetnx":
+        return ["HSETNX", _require(args, "key"), _require(args, "field"),
+                _require(args, "value")]
+    if name == "kv_hincrby":
+        key, field, increment = _hincrby_args(args)
+        return ["HINCRBY", key, field, increment]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -1373,6 +1421,20 @@ def _getex_args(args):
                 "kv_getex px must be more than 0, got %d" % px
             )
     return key, ex, px, persist
+
+
+def _hincrby_args(args):
+    """Validate a kv_hincrby call: (key, field, increment). The
+    increment must be an integer — cinder rejects anything else as
+    a server error, so fail here as invalid params instead. Any
+    integer goes through, including a negative one (HINCRBY with a
+    negative increment counts down, as in Redis)."""
+    key = _require(args, "key")
+    field = _require(args, "field")
+    increment = _require(args, "increment")
+    if isinstance(increment, bool) or not isinstance(increment, int):
+        raise ValueError("kv_hincrby increment must be an integer")
+    return key, field, increment
 
 
 def _hset_field_args(args):

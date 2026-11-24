@@ -3,7 +3,7 @@
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -434,6 +434,58 @@ class FakeCinder(threading.Thread):
                 return ("-WRONGTYPE Operation against a key holding the "
                         "wrong kind of value\r\n")
             return ":1\r\n" if args[1] in value else ":0\r\n"
+        elif name == "HMGET" and len(args) >= 2:
+            value = self._get(args[0])
+            if value is None:
+                return "*%d\r\n" % (len(args) - 1) + "".join(
+                    self._bulk(None) for _ in args[1:]
+                )
+            if not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            return "*%d\r\n" % (len(args) - 1) + "".join(
+                self._bulk(value.get(field)) for field in args[1:]
+            )
+        elif name == "HSETNX" and len(args) == 3:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if value is None:
+                value = {}
+                self.store[args[0]] = (value, None)
+            if args[1] in value:
+                return ":0\r\n"
+            value[args[1]] = args[2]
+            return ":1\r\n"
+        elif name == "HINCRBY" and len(args) == 3:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            try:
+                delta = int(args[2])
+            except ValueError:
+                return "-ERR value is not an integer or out of range\r\n"
+            if delta > 2 ** 63 - 1 or delta < -(2 ** 63):
+                return "-ERR value is not an integer or out of range\r\n"
+            if value is None:
+                value = {}
+                self.store[args[0]] = (value, None)
+            current = value.get(args[1])
+            if current is None:
+                nxt = delta
+            else:
+                try:
+                    cur = int(current)
+                except ValueError:
+                    return "-ERR hash value is not an integer\r\n"
+                nxt = cur + delta
+                if nxt > 2 ** 63 - 1 or nxt < -(2 ** 63):
+                    return ("-ERR increment or decrement would "
+                            "overflow\r\n")
+            value[args[1]] = str(nxt)
+            return ":%d\r\n" % nxt
         elif name == "ZADD" and len(args) >= 3:
             # Options come after the key and before the first score,
             # as in cinder 0.25.0: NX | XX | GT | LT | CH | INCR.
@@ -979,6 +1031,7 @@ class McpTests(unittest.TestCase):
                     "kv_getex",
                     "kv_hset", "kv_hget", "kv_hgetall",
                     "kv_hdel", "kv_hexists", "kv_hlen",
+                    "kv_hmget", "kv_hsetnx", "kv_hincrby",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
@@ -1907,6 +1960,209 @@ class McpTests(unittest.TestCase):
                 {"op": "kv_hset", "key": "h3",
                  "fields": {"a": "1"}},
                 {"op": "kv_hdel", "key": "h3", "fields": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "h3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_hash_multi_get_setnx_and_incrby(self):
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "user:1",
+                          "fields": {"name": "mo", "age": "24"}},
+        })
+        # Several fields at once, in order, with null for a field
+        # that is not there.
+        multi = self._call("tools/call", 2, {
+            "name": "kv_hmget",
+            "arguments": {"key": "user:1",
+                          "fields": ["name", "ghost", "age"]},
+        })
+        self.assertEqual(
+            json.loads(multi["result"]["content"][0]["text"]),
+            ["mo", None, "24"],
+        )
+        # Every field reads null on a missing key.
+        ghost = self._call("tools/call", 3, {
+            "name": "kv_hmget",
+            "arguments": {"key": "ghost", "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(ghost["result"]["content"][0]["text"]),
+            [None, None],
+        )
+        # HSETNX sets a new field and leaves an existing one alone.
+        fresh = self._call("tools/call", 4, {
+            "name": "kv_hsetnx",
+            "arguments": {"key": "user:1", "field": "city",
+                          "value": "philly"},
+        })
+        self.assertEqual(fresh["result"]["content"][0]["text"], "1")
+        taken = self._call("tools/call", 5, {
+            "name": "kv_hsetnx",
+            "arguments": {"key": "user:1", "field": "name",
+                          "value": "someone-else"},
+        })
+        self.assertEqual(taken["result"]["content"][0]["text"], "0")
+        kept = self._call("tools/call", 6, {
+            "name": "kv_hget",
+            "arguments": {"key": "user:1", "field": "name"},
+        })
+        self.assertEqual(kept["result"]["content"][0]["text"], "mo")
+        # HSETNX creates the key when it does not exist.
+        created = self._call("tools/call", 7, {
+            "name": "kv_hsetnx",
+            "arguments": {"key": "fresh", "field": "a", "value": "1"},
+        })
+        self.assertEqual(created["result"]["content"][0]["text"], "1")
+        # HINCRBY bumps an integer field, creates a missing field
+        # holding the increment, and counts down on a negative one.
+        bumped = self._call("tools/call", 8, {
+            "name": "kv_hincrby",
+            "arguments": {"key": "user:1", "field": "age",
+                          "increment": 1},
+        })
+        self.assertEqual(bumped["result"]["content"][0]["text"], "25")
+        new_field = self._call("tools/call", 9, {
+            "name": "kv_hincrby",
+            "arguments": {"key": "user:1", "field": "visits",
+                          "increment": 3},
+        })
+        self.assertEqual(new_field["result"]["content"][0]["text"], "3")
+        down = self._call("tools/call", 10, {
+            "name": "kv_hincrby",
+            "arguments": {"key": "user:1", "field": "visits",
+                          "increment": -1},
+        })
+        self.assertEqual(down["result"]["content"][0]["text"], "2")
+        # A zero increment on an existing field changes nothing and
+        # returns the current value.
+        zero = self._call("tools/call", 11, {
+            "name": "kv_hincrby",
+            "arguments": {"key": "user:1", "field": "age",
+                          "increment": 0},
+        })
+        self.assertEqual(zero["result"]["content"][0]["text"], "25")
+        # HINCRBY on a non-integer field fails.
+        bad = self._call("tools/call", 12, {
+            "name": "kv_hincrby",
+            "arguments": {"key": "user:1", "field": "name",
+                          "increment": 1},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32000)
+
+    def test_tools_call_hash_new_tools_reject_bad_arguments(self):
+        cases = [
+            {"name": "kv_hmget", "arguments": {"key": "h"}},
+            {"name": "kv_hmget", "arguments": {"fields": ["a"]}},
+            {"name": "kv_hmget",
+             "arguments": {"key": "h", "fields": []}},
+            {"name": "kv_hmget",
+             "arguments": {"key": "h", "fields": "a"}},
+            {"name": "kv_hmget",
+             "arguments": {"key": "h", "fields": ["a", 7]}},
+            {"name": "kv_hsetnx",
+             "arguments": {"key": "h", "field": "a"}},
+            {"name": "kv_hsetnx",
+             "arguments": {"key": "h", "value": "v"}},
+            {"name": "kv_hsetnx",
+             "arguments": {"field": "a", "value": "v"}},
+            {"name": "kv_hsetnx", "arguments": {}},
+            {"name": "kv_hincrby",
+             "arguments": {"key": "h", "field": "a"}},
+            {"name": "kv_hincrby",
+             "arguments": {"key": "h", "increment": 1}},
+            {"name": "kv_hincrby",
+             "arguments": {"field": "a", "increment": 1}},
+            {"name": "kv_hincrby",
+             "arguments": {"key": "h", "field": "a",
+                           "increment": "1"}},
+            {"name": "kv_hincrby",
+             "arguments": {"key": "h", "field": "a",
+                           "increment": True}},
+            {"name": "kv_hincrby", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_hash_new_tools_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for i, call in enumerate([
+            {"name": "kv_hmget",
+             "arguments": {"key": "plain", "fields": ["f"]}},
+            {"name": "kv_hsetnx",
+             "arguments": {"key": "plain", "field": "f", "value": "v"}},
+            {"name": "kv_hincrby",
+             "arguments": {"key": "plain", "field": "f", "increment": 1}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32000, call)
+
+    def test_tools_call_hash_new_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_hset", "key": "h",
+                 "fields": {"a": "10", "b": "x"}},
+                {"op": "kv_hmget", "key": "h",
+                 "fields": ["a", "ghost", "b"]},
+                {"op": "kv_hsetnx", "key": "h", "field": "c",
+                 "value": "new"},
+                {"op": "kv_hsetnx", "key": "h", "field": "a",
+                 "value": "nope"},
+                {"op": "kv_hincrby", "key": "h", "field": "a",
+                 "increment": 5},
+                {"op": "kv_hincrby", "key": "h", "field": "fresh",
+                 "increment": 7},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 6)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"],
+                         ["10", None, "x"])
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        self.assertEqual(summary["results"][4]["result"], 15)
+        self.assertEqual(summary["results"][5]["result"], 7)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h2",
+                 "fields": {"x": "1"}},
+                {"op": "kv_hmget", "key": "h2",
+                 "fields": ["x", "y"]},
+                {"op": "kv_hsetnx", "key": "h2", "field": "y",
+                 "value": "2"},
+                {"op": "kv_hincrby", "key": "h2", "field": "x",
+                 "increment": 4},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertEqual(summary["results"][1]["result"], ["1", None])
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 5)
+        # Bad hash arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h3",
+                 "fields": {"a": "1"}},
+                {"op": "kv_hmget", "key": "h3", "fields": []},
             ]},
         })
         self.assertIn("error", bad)
@@ -5091,6 +5347,112 @@ class McpTests(unittest.TestCase):
         )
         self.assertIn(
             "op 18: kv_getdel 'ghost' — no-op, the key does not exist",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_hash_write_ops(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "forever",
+                          "fields": {"count": "41", "name": "alice"}},
+        })
+        self.fake.store["soon"] = ({"count": "5"}, time.time() + 3600)
+        plan = [
+            {"op": "kv_hsetnx", "key": "forever", "field": "count",
+             "value": "9"},
+            {"op": "kv_hsetnx", "key": "forever", "field": "new",
+             "value": "v"},
+            {"op": "kv_hsetnx", "key": "soon", "field": "new",
+             "value": "v"},
+            {"op": "kv_hsetnx", "key": "ghost", "field": "a",
+             "value": "v"},
+            {"op": "kv_hsetnx", "key": "plain", "field": "a",
+             "value": "v"},
+            {"op": "kv_hsetnx", "key": "forever", "field": 7,
+             "value": "v"},
+            {"op": "kv_hincrby", "key": "forever", "field": "count",
+             "increment": 1},
+            {"op": "kv_hincrby", "key": "forever", "field": "name",
+             "increment": 1},
+            {"op": "kv_hincrby", "key": "forever", "field": "fresh",
+             "increment": 5},
+            {"op": "kv_hincrby", "key": "soon", "field": "count",
+             "increment": 2},
+            {"op": "kv_hincrby", "key": "ghost", "field": "a",
+             "increment": 3},
+            {"op": "kv_hincrby", "key": "plain", "field": "a",
+             "increment": 1},
+            {"op": "kv_hincrby", "key": "forever", "field": "count",
+             "increment": "x"},
+            {"op": "kv_hincrby", "key": "forever", "field": "count"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 14 op(s), 11 audited, 3 not audited.", text)
+        self.assertIn(
+            "op 5: kv_hsetnx field must be a string: 7", text)
+        self.assertIn(
+            "op 12: kv_hincrby increment is not an integer: 'x'", text)
+        self.assertIn(
+            "op 13: kv_hincrby is missing increment", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 4: kv_hsetnx 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 7: kv_hincrby 'forever' — would fail: the field "
+            "value is not an integer",
+            risky,
+        )
+        self.assertIn(
+            "op 11: kv_hincrby 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_hsetnx 'forever' — adds a field to a hash "
+            "that never expires",
+            caution,
+        )
+        self.assertIn(
+            "op 3: kv_hsetnx 'ghost' — creates a new hash with no "
+            "expiry",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_hsetnx 'forever' — no-op, the field already "
+            "exists",
+            safe,
+        )
+        self.assertIn(
+            "op 2: kv_hsetnx 'soon' — adds a new field to a hash of "
+            "1 elements that expires in ",
+            safe,
+        )
+        self.assertIn(
+            "op 6: kv_hincrby 'forever' — increments a counter "
+            "field currently at 41",
+            safe,
+        )
+        self.assertIn(
+            "op 8: kv_hincrby 'forever' — creates a counter field "
+            "starting at 5",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_hincrby 'soon' — increments a counter field "
+            "currently at 5",
+            safe,
+        )
+        self.assertIn(
+            "op 10: kv_hincrby 'ghost' — creates a counter field "
+            "starting at 3",
             safe,
         )
 
