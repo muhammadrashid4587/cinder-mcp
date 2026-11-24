@@ -481,6 +481,19 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zlexcount",
+        "description": "The number of members of a sorted set whose names fall in a lex range: ZLEXCOUNT key min max. `min` and `max` default to \"-\" and \"+\"; pass \"[a\" for an inclusive bound, \"(a\" for an exclusive one, \"-\" for no lower bound and \"+\" for no upper bound — a bare member name is a syntax error in cinder, as is the wrong infinity on a side. There is no REV and no LIMIT: the count does not depend on order, and cinder counts server-side, so unlike kv_zcount there is no 1000-member cap and a range holding any number of members counts honestly. Returns 0 when the key does not exist or the range is empty, including a finite min above the max.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "min": {"type": "string"},
+                "max": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_zcount",
         "description": "The number of members of a sorted set whose scores fall in a range: cinder has no ZCOUNT, so this counts by fetching the range with ZRANGEBYSCORE key min max and counting the members it returns. `min` and `max` default to -inf and +inf; pass a number or a string like \"5\", \"(5\" for an exclusive bound, \"-inf\" or \"+inf\". At most 1000 members per call, so a range holding more than that fails instead of returning a silently truncated count — narrow the range for a larger set.",
         "inputSchema": {
@@ -825,7 +838,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -946,7 +959,7 @@ BATCHABLE_TOOLS = {
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zrangebylex",
-    "kv_zcount", "kv_zcard",
+    "kv_zlexcount", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan",
@@ -1028,7 +1041,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_zadd", "kv_zrange", "kv_zrangebyscore", "kv_zrangebylex",
-    "kv_zcount", "kv_zcard",
+    "kv_zlexcount", "kv_zcount", "kv_zcard",
     "kv_zscore", "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan",
@@ -1637,6 +1650,9 @@ def _op_argv(name, args):
         if rev:
             cmd.append("REV")
         return cmd
+    if name == "kv_zlexcount":
+        key, min_b, max_b = _zlexcount_args(args)
+        return ["ZLEXCOUNT", key, min_b, max_b]
     if name == "kv_zcount":
         key, min_b, max_b = _zcount_args(args)
         # Ask for one extra member so the caller can tell the range
@@ -2245,6 +2261,18 @@ def _call_zcount(client, args):
             % MAX_ZRANGE_MEMBERS
         )
     return len(members)
+
+
+def _zlexcount_args(args):
+    """Validate a kv_zlexcount call: (key, min, max). The bounds parse
+    exactly like kv_zrangebylex's: "-" / "+" or "[x" / "(x",
+    defaulting to "-" / "+". There is no REV and no LIMIT: the count
+    does not depend on order, and cinder counts server-side, so no
+    cap applies and no probe member is needed."""
+    key = _require(args, "key")
+    min_b = _format_lex_bound(args.get("min", "-"), "min", "kv_zlexcount")
+    max_b = _format_lex_bound(args.get("max", "+"), "max", "kv_zlexcount")
+    return key, min_b, max_b
 
 
 def _zrevrank_args(args):

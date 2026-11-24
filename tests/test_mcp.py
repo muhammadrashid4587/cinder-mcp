@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZRANK, ZREM, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1190,6 +1190,47 @@ class FakeCinder(threading.Thread):
                     matches = matches[:count]
             return "*%d\r\n" % len(matches) + "".join(
                 self._bulk(m) for m in matches)
+        elif name == "ZLEXCOUNT" and len(args) == 3:
+            # Same bounds as ZRANGEBYLEX, but no REV and no LIMIT:
+            # the count does not depend on order. A missing key
+            # counts 0, as does an empty range, and a non-sorted-set
+            # key is WRONGTYPE.
+            value = self._get(args[0])
+            if value is None:
+                return ":0\r\n"
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+
+            def parse_lex(text):
+                if text == "-":
+                    return (-1, None, False)
+                if text == "+":
+                    return (1, None, False)
+                if text.startswith(("[", "(")) and len(text) > 1:
+                    return (0, text[1:], text.startswith("("))
+                return None
+
+            parsed_lo = parse_lex(args[1])
+            parsed_hi = parse_lex(args[2])
+            if parsed_lo is None or parsed_hi is None:
+                return "-ERR syntax error\r\n"
+            lo_kind, lo_bound, lo_excl = parsed_lo
+            hi_kind, hi_bound, hi_excl = parsed_hi
+            if lo_kind == 1 or hi_kind == -1:
+                return "-ERR syntax error\r\n"
+            count = 0
+            for member in sorted(value.members):
+                if lo_kind == 0:
+                    if member < lo_bound or (
+                            member == lo_bound and lo_excl):
+                        continue
+                if hi_kind == 0:
+                    if member > hi_bound or (
+                            member == hi_bound and hi_excl):
+                        continue
+                count += 1
+            return ":%d\r\n" % count
         elif name == "DEL":
             n = sum(1 for k in args if self._get(k) is not None)
             for k in args:
@@ -1402,7 +1443,7 @@ class McpTests(unittest.TestCase):
                     "kv_hscan",
                     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
                     "kv_zadd", "kv_zrange", "kv_zrangebyscore",
-                    "kv_zrangebylex", "kv_zcount",
+                    "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore",
                     "kv_zrank", "kv_zrevrank", "kv_zrem", "kv_zincrby",
@@ -4997,6 +5038,144 @@ class McpTests(unittest.TestCase):
             self.assertIn("error", reply, call)
             self.assertEqual(reply["error"]["code"], -32602, call)
 
+    def test_tools_call_zlexcount(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "words",
+                          "members": {"banana": 99, "apple": 1,
+                                      "cherry": 50, "apricot": 2,
+                                      "blueberry": 3}},
+        })
+        # No bounds: the whole set. Lex order is irrelevant to a
+        # count, but the bounds are the same as kv_zrangebylex's.
+        whole = self._call("tools/call", 2, {
+            "name": "kv_zlexcount", "arguments": {"key": "words"},
+        })
+        self.assertEqual(whole["result"]["content"][0]["text"], "5")
+        # Bounds are inclusive by default.
+        bounded = self._call("tools/call", 3, {
+            "name": "kv_zlexcount",
+            "arguments": {"key": "words", "min": "[apricot",
+                          "max": "[blueberry"},
+        })
+        self.assertEqual(bounded["result"]["content"][0]["text"], "3")
+        # A leading '(' makes a bound exclusive.
+        exclusive = self._call("tools/call", 4, {
+            "name": "kv_zlexcount",
+            "arguments": {"key": "words", "min": "(apricot",
+                          "max": "(blueberry"},
+        })
+        self.assertEqual(exclusive["result"]["content"][0]["text"], "1")
+        # - / + as open ends mean no bound on that side.
+        open_ended = self._call("tools/call", 5, {
+            "name": "kv_zlexcount",
+            "arguments": {"key": "words", "max": "[banana"},
+        })
+        self.assertEqual(open_ended["result"]["content"][0]["text"], "3")
+        # A range with no matches, a finite min above the max, and
+        # a missing key all count 0.
+        empty = self._call("tools/call", 6, {
+            "name": "kv_zlexcount",
+            "arguments": {"key": "words", "min": "[z"},
+        })
+        self.assertEqual(empty["result"]["content"][0]["text"], "0")
+        reversed_bounds = self._call("tools/call", 7, {
+            "name": "kv_zlexcount",
+            "arguments": {"key": "words", "min": "[cherry",
+                          "max": "[apple"},
+        })
+        self.assertEqual(
+            reversed_bounds["result"]["content"][0]["text"], "0")
+        missing = self._call("tools/call", 8, {
+            "name": "kv_zlexcount", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "0")
+        # Unlike kv_zcount, the count is server-side, so a range
+        # holding more than 1000 members still counts honestly.
+        self._call("tools/call", 9, {
+            "name": "kv_zadd",
+            "arguments": {"key": "big",
+                          "members": {"m%04d" % i: i
+                                      for i in range(1001)}},
+        })
+        wide = self._call("tools/call", 10, {
+            "name": "kv_zlexcount", "arguments": {"key": "big"},
+        })
+        self.assertEqual(wide["result"]["content"][0]["text"], "1001")
+
+    def test_tools_call_zlexcount_rejects_bad_arguments(self):
+        cases = [
+            # Bad bounds: a bare member is a syntax error in
+            # cinder, as is the wrong infinity on a side, an empty
+            # bracket, and a non-string bound.
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "min": "apple"}},
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "min": "+"}},
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "max": "-"}},
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "min": "["}},
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "max": "("}},
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "min": 5}},
+            {"name": "kv_zlexcount",
+             "arguments": {"key": "z", "max": True}},
+            {"name": "kv_zlexcount", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zlexcount_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        counted = self._call("tools/call", 2, {
+            "name": "kv_zlexcount", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", counted)
+
+    def test_tools_call_zlexcount_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zlexcount", "key": "z"},
+                {"op": "kv_zlexcount", "key": "z",
+                 "min": "[b", "max": "[c"},
+                {"op": "kv_zlexcount", "key": "z",
+                 "min": "(a", "max": "(c"},
+                {"op": "kv_zlexcount", "key": "ghost"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], 3)
+        self.assertEqual(summary["results"][2]["result"], 2)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        self.assertEqual(summary["results"][4]["result"], 0)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zlexcount", "key": "z2"},
+                {"op": "kv_zlexcount", "key": "z2",
+                 "min": "[y"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 1)
+
     def test_tools_call_zcount_rejects_too_wide_a_range(self):
         self._call("tools/call", 1, {
             "name": "kv_zadd",
@@ -6504,9 +6683,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_hscan", "key": "a"},
             {"op": "kv_zscan", "key": "a"},
             {"op": "kv_zrangebylex", "key": "a"},
+            {"op": "kv_zlexcount", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 8 op(s), 1 audited, 7 not audited.", text)
+        self.assertIn("Plan: 9 op(s), 1 audited, 8 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -6514,6 +6694,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 5: kv_hscan is a read, not a write", text)
         self.assertIn("op 6: kv_zscan is a read, not a write", text)
         self.assertIn("op 7: kv_zrangebylex is a read, not a write", text)
+        self.assertIn("op 8: kv_zlexcount is a read, not a write", text)
 
     def test_prompts_get_write_safety_caps_at_fifty_ops(self):
         plan = [
@@ -8365,6 +8546,78 @@ class LiveCinderMigrationTests(unittest.TestCase):
             client.command("ZRANGEBYLEX", "lex:words", "-",
                            "+", "WITHSCORES")
         self.assertIn("syntax error", str(caught.exception))
+
+    def test_live_zlexcount(self):
+        """kv_zlexcount against a real cinder: the native ZLEXCOUNT
+        command counts a lex range server-side — inclusive and
+        exclusive bounds, open ends, a missing key and an empty
+        range count 0, a finite min above the max counts 0, and a
+        non-sorted-set key is WRONGTYPE. The count is honest past
+        1000 members, unlike kv_zcount's fetch-and-count."""
+        self.assertEqual(
+            self._tool("kv_zadd", {"key": "lex:count",
+                                   "members": {"banana": 99, "apple": 1,
+                                               "cherry": 50,
+                                               "apricot": 2,
+                                               "blueberry": 3}}),
+            5)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:count"}), 5)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:count",
+                                        "min": "[apricot",
+                                        "max": "[blueberry"}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:count",
+                                        "min": "(apricot",
+                                        "max": "(blueberry"}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:count",
+                                        "max": "[banana"}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:count",
+                                        "min": "[z"}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:count",
+                                        "min": "[cherry",
+                                        "max": "[apple"}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:ghost"}), 0)
+        # A range past the 1000-member cap still counts honestly:
+        # cinder counts server-side, it never fetches the members.
+        # Members go in in chunks: one ZADD carrying 1001 members
+        # (2003 args) makes cinder close the connection, so no
+        # single call adds the whole set.
+        for start in range(0, 1001, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "lex:big",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       min(start + 200,
+                                                           1001))}}),
+                min(start + 200, 1001) - start)
+        self.assertEqual(
+            self._tool("kv_zlexcount", {"key": "lex:big"}), 1001)
+        # WRONGTYPE on a string key, and the same syntax errors
+        # cinder returns for a bare member and the wrong infinity.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "lex:plain", "value": "v"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zlexcount",
+            "arguments": {"key": "lex:plain"}})
+        self.assertIn("error", reply)
+        for arguments in ({"key": "lex:count", "min": "apple"},
+                          {"key": "lex:count", "min": "+"}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zlexcount", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
 
 
 if __name__ == "__main__":
