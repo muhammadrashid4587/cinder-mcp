@@ -3,7 +3,7 @@
 The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
+LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
@@ -1461,6 +1461,55 @@ class FakeCinder(threading.Thread):
             return ("*2\r\n" + self._bulk(str(nxt))
                     + "*%d\r\n" % len(flat)
                     + "".join(self._bulk(v) for v in flat))
+        elif name == "SSCAN" and len(args) >= 2:
+            # Cinder's cursor is an index into the set's members;
+            # "0" starts (and ends) the walk. MATCH filters member
+            # names, COUNT caps the matching members in the page —
+            # exact here, as in HSCAN and ZSCAN: only matches count
+            # toward it. A missing key is done at once, with no
+            # members. The fake holds sets as Python sets, so it
+            # walks them in sorted order; real cinder walks them in
+            # insertion order.
+            value = self._get(args[0])
+            if value is None:
+                return "*2\r\n$1\r\n0\r\n*0\r\n"
+            if not isinstance(value, set):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if not args[1].isdigit():
+                return "-ERR invalid cursor\r\n"
+            cursor = int(args[1])
+            pattern = "*"
+            count = 10
+            i = 2
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "MATCH" and i + 1 < len(args):
+                    pattern = args[i + 1]
+                    i += 2
+                elif opt == "COUNT" and i + 1 < len(args):
+                    try:
+                        count = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR value is not an integer or out "
+                                "of range\r\n")
+                    i += 2
+                else:
+                    return "-ERR syntax error\r\n"
+            ordered = sorted(value)
+            if count == 0 or cursor >= len(ordered):
+                return "*2\r\n$1\r\n0\r\n*0\r\n"
+            page = []
+            idx = cursor
+            while idx < len(ordered) and len(page) < count:
+                member = ordered[idx]
+                if _glob_match(pattern, member):
+                    page.append(member)
+                idx += 1
+            nxt = 0 if idx >= len(ordered) else idx
+            return ("*2\r\n" + self._bulk(str(nxt))
+                    + "*%d\r\n" % len(page)
+                    + "".join(self._bulk(v) for v in page))
         elif name in ("ZRANGE", "ZREVRANGE") and len(args) in (3, 4):
             value = self._get(args[0])
             if value is None:
@@ -1935,7 +1984,7 @@ class McpTests(unittest.TestCase):
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
                     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
-                    "kv_sadd", "kv_smembers", "kv_scard",
+                    "kv_sadd", "kv_smembers", "kv_sscan", "kv_scard",
                     "kv_srem", "kv_sismember",
                     "kv_batch"]
         )
@@ -3431,6 +3480,22 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, key)
         self.assertEqual(reply["result"]["content"][0]["text"], str(count))
 
+    def _seed_set(self, key, count):
+        members = ["m:%03d" % i for i in range(count)]
+        reply = self._call("tools/call", 1, {
+            "name": "kv_sadd",
+            "arguments": {"key": key, "members": members},
+        })
+        self.assertNotIn("error", reply, key)
+        self.assertEqual(reply["result"]["content"][0]["text"], str(count))
+
+    def _sscan_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_sscan", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def _zscan_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_zscan", "arguments": arguments,
@@ -3574,6 +3639,139 @@ class McpTests(unittest.TestCase):
         self.assertEqual(bad["error"]["code"], -32602)
         untouched = self._call("tools/call", 4, {
             "name": "kv_exists", "arguments": {"key": "z3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_kv_sscan_pages_through_a_set(self):
+        self._seed_set("big", 250)
+        seen = []
+        cursor = ""
+        pages = 0
+        while True:
+            data = self._sscan_result({"key": "big", "batch_size": 100,
+                                       "cursor": cursor})
+            self.assertEqual(data["batch_size"], 100)
+            # COUNT is exact for SSCAN: never more than batch_size.
+            self.assertLessEqual(len(data["members"]), 100)
+            seen.extend(data["members"])
+            pages += 1
+            self.assertLessEqual(pages, 10)
+            if data["done"]:
+                self.assertEqual(data["cursor"], "")
+                break
+            # The cursor is cinder's opaque decimal cursor: pass it
+            # back verbatim, never read a member out of it.
+            self.assertNotEqual(data["cursor"], "")
+            self.assertTrue(data["cursor"].isdigit(), data["cursor"])
+            cursor = data["cursor"]
+        self.assertEqual(pages, 3)
+        # The fake walks sets in sorted order; real cinder walks
+        # them in insertion order — either way the walk covers
+        # every member exactly once.
+        self.assertEqual(sorted(seen),
+                         ["m:%03d" % i for i in range(250)])
+        # A cursor returned by one page resumes the walk: the first
+        # five members come back, then the next five after it.
+        first = self._sscan_result({"key": "big", "batch_size": 5})
+        self.assertEqual(
+            sorted(first["members"]), ["m:%03d" % i for i in range(5)])
+        self.assertFalse(first["done"])
+        second = self._sscan_result(
+            {"key": "big", "batch_size": 5, "cursor": first["cursor"]})
+        self.assertEqual(
+            sorted(second["members"]),
+            ["m:%03d" % i for i in range(5, 10)])
+        self.assertFalse(second["done"])
+        # The pattern filters on member names, and a small set
+        # finishes in one page.
+        data = self._sscan_result({"key": "big", "pattern": "m:00*"})
+        self.assertEqual(
+            sorted(data["members"]), ["m:%03d" % i for i in range(10)])
+        self.assertTrue(data["done"])
+        self.assertEqual(data["cursor"], "")
+        # A missing key is done at once, with no members.
+        empty = self._sscan_result({"key": "ghost"})
+        self.assertEqual(
+            empty, {"members": [], "cursor": "", "done": True,
+                    "batch_size": 100})
+
+    def test_kv_sscan_rejects_bad_arguments(self):
+        self._seed_set("s", 2)
+        for bad in ({"batch_size": 0}, {"batch_size": -1},
+                    {"batch_size": 1001}, {"batch_size": "ten"},
+                    {"batch_size": True}, {"cursor": 7},
+                    {"cursor": "m:001"}, {"cursor": "abc"},
+                    {"pattern": 7}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_sscan",
+                "arguments": dict({"key": "s"}, **bad),
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        missing_key = self._call("tools/call", 2, {
+            "name": "kv_sscan", "arguments": {"members": ["a"]},
+        })
+        self.assertIn("error", missing_key)
+        self.assertEqual(missing_key["error"]["code"], -32602)
+
+    def test_kv_sscan_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_sscan", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_sscan_in_plain_and_atomic_batch(self):
+        self._seed_set("s", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_sscan", "key": "s", "batch_size": 2},
+                {"op": "kv_sscan", "key": "s", "batch_size": 2,
+                 "cursor": "2"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], {
+            "members": ["m:000", "m:001"],
+            "cursor": "2", "done": False, "batch_size": 2,
+        })
+        self.assertEqual(summary["results"][1]["result"], {
+            "members": ["m:002", "m:003"],
+            "cursor": "4", "done": False, "batch_size": 2,
+        })
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_sadd", "key": "s2",
+                 "members": ["a", "b", "c"]},
+                {"op": "kv_sscan", "key": "s2", "batch_size": 2},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], {
+            "members": ["a", "b"],
+            "cursor": "2", "done": False, "batch_size": 2,
+        })
+        # Bad sscan arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_sadd", "key": "s3", "members": ["a"]},
+                {"op": "kv_sscan", "key": "s3", "batch_size": 0},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "s3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
@@ -8193,9 +8391,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_getrange", "key": "a"},
             {"op": "kv_getbit", "key": "a", "offset": 0},
             {"op": "kv_bitcount", "key": "a"},
+            {"op": "kv_sscan", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 12 op(s), 1 audited, 11 not audited.", text)
+        self.assertIn("Plan: 13 op(s), 1 audited, 12 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -8207,6 +8406,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 9: kv_getrange is a read, not a write", text)
         self.assertIn("op 10: kv_getbit is a read, not a write", text)
         self.assertIn("op 11: kv_bitcount is a read, not a write", text)
+        self.assertIn("op 12: kv_sscan is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {

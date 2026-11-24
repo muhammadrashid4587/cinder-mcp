@@ -39,6 +39,16 @@ The cursor is a rank into that order, so members added or deleted
 between pages can shift the window: a member can be missed or
 come back twice if the set changes mid-walk, the same caveats
 real ZSCAN has.
+
+And two more cover cinder's SSCAN (cinder 0.40.0) the same way,
+one set at a time: `sscan_batch` returns one bounded page of a
+set's members from one real SSCAN call, and `sscan_result` shapes
+a raw SSCAN reply into the same page shape. COUNT is exact for
+SSCAN too — cinder stops the page at exactly that many matching
+members. Members come back in the set's storage order, which is
+insertion order. The cursor is an index into that order, so
+members added or deleted between pages can shift the window, the
+same caveats real SSCAN has.
 """
 
 # Keys per batch when the caller does not say otherwise.
@@ -269,6 +279,59 @@ def zscan_batch(client, key, pattern="*", cursor="",
         cmd.append("WITHSCORES")
     reply = client.command(*cmd)
     return zscan_result(reply, batch_size, withscores)
+
+
+def sscan_result(reply, batch_size):
+    """Shape one SSCAN reply [cursor, [member, ...]] into
+    {"members": [...], "cursor": str, "done": bool, "batch_size": n}.
+    A missing key replies as ["0", []], which becomes done with no
+    members. The cursor is cinder's opaque decimal cursor — pass it
+    back verbatim; when done is true the cursor is ""."""
+    batch_size = validate_batch_size(batch_size)
+    if not isinstance(reply, list) or len(reply) != 2:
+        raise ValueError("SSCAN returned an unexpected reply: %r" % (reply,))
+    next_cursor, members = reply
+    if not isinstance(next_cursor, str) or not next_cursor.isdigit():
+        raise ValueError(
+            "SSCAN returned an invalid cursor: %r" % (next_cursor,))
+    if not isinstance(members, list):
+        raise ValueError(
+            "SSCAN returned an unexpected member list: %r" % (members,))
+    done = next_cursor == SCAN_DONE_CURSOR
+    return {
+        "members": list(members),
+        "cursor": "" if done else next_cursor,
+        "done": done,
+        "batch_size": batch_size,
+    }
+
+
+def sscan_batch(client, key, pattern="*", cursor="",
+                batch_size=DEFAULT_SCAN_BATCH_SIZE):
+    """One page of a set, SSCAN-style: at most `batch_size`
+    members from one real SSCAN call, plus the cursor to resume
+    from and whether the scan is done. Pass "" to start. The cursor
+    is cinder's opaque decimal cursor — pass it back verbatim; do
+    not read meaning into it. When done is true the cursor is ""
+    and there is nothing left to fetch. COUNT is exact here: cinder
+    stops the page at exactly `batch_size` matching members.
+    `pattern` matches member names only, with the same glob
+    (* and ?). A missing key is done at once, with no members.
+    Members come back in the set's storage order, which is
+    insertion order; members added or deleted between pages can
+    shift the window, the same caveats real SSCAN has. Returns
+    {"members": [...], "cursor": str, "done": bool,
+    "batch_size": n}."""
+    batch_size = validate_batch_size(batch_size)
+    if not isinstance(cursor, str):
+        raise ValueError("cursor must be a string")
+    if cursor and not cursor.isdigit():
+        raise ValueError("cursor must be a decimal SSCAN cursor string")
+    reply = client.command(
+        "SSCAN", key, cursor or SCAN_DONE_CURSOR, "MATCH", pattern,
+        "COUNT", str(batch_size)
+    )
+    return sscan_result(reply, batch_size)
 
 
 def scan_batch(client, pattern="*", cursor="", batch_size=DEFAULT_SCAN_BATCH_SIZE):

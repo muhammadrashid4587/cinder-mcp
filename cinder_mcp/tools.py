@@ -12,6 +12,8 @@ from .scan import (
     hscan_batch,
     hscan_result,
     scan_batch,
+    sscan_batch,
+    sscan_result,
     validate_batch_size,
     zscan_batch,
     zscan_result,
@@ -919,6 +921,20 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_sscan",
+        "description": "Walk the members of a set one bounded page at a time with cinder's real SSCAN. Returns {\"members\": [...], \"cursor\": str, \"done\": bool, \"batch_size\": n}: at most `batch_size` members per page (default 100) — COUNT is exact here, cinder stops the page at that many matching members. Pass the returned `cursor` back to fetch the next page; pass \"\" (or omit it) to start. When `done` is true the cursor is \"\" and the walk is finished. The cursor is opaque: pass it back verbatim, do not read meaning into it. Pass `pattern` to match member names only, with the same glob (* and ?). A missing key is done at once, with no members. Members come back in the set's storage order, which is insertion order; members added or deleted between pages can shift the window, the same caveats real SSCAN has.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "pattern": {"type": "string"},
+                "batch_size": {"type": "integer"},
+                "cursor": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_scard",
         "description": "The number of members in a set: SCARD key. Returns 0 when the key does not exist.",
         "inputSchema": {
@@ -953,7 +969,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1087,7 +1103,7 @@ BATCHABLE_TOOLS = {
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
-    "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
+    "kv_sadd", "kv_smembers", "kv_sscan", "kv_scard", "kv_srem", "kv_sismember",
 }
 
 MAX_BATCH_OPS = 100
@@ -1172,7 +1188,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
-    "kv_sadd", "kv_smembers", "kv_scard", "kv_srem", "kv_sismember",
+    "kv_sadd", "kv_smembers", "kv_sscan", "kv_scard", "kv_srem", "kv_sismember",
 }
 
 
@@ -1268,6 +1284,13 @@ def _call_batch_atomic(client, ops):
             value = zscan_result(
                 reply, op.get("batch_size", DEFAULT_SCAN_BATCH_SIZE),
                 op.get("withscores", False),
+            )
+        elif op_name == "kv_sscan":
+            # SSCAN came back as [cursor, [member, ...]] inside the
+            # transaction; shape it like the standalone tool does,
+            # into one page with its resume cursor.
+            value = sscan_result(
+                reply, op.get("batch_size", DEFAULT_SCAN_BATCH_SIZE)
             )
         elif op_name in ("kv_hkeys", "kv_hvals"):
             # HKEYS/HVALS came back as a flat list inside the
@@ -1467,8 +1490,9 @@ def _hscan_args(args, tool="kv_hscan"):
     """The validated (key, pattern, batch_size, cursor) for a
     kv_hscan call. Bad values fail up front instead of sending a
     half-formed HSCAN, in the standalone tool and in a batch.
-    kv_zscan shares the same shape, so it passes tool="kv_zscan"
-    and gets its own name in the errors."""
+    kv_zscan and kv_sscan share the same shape, so they pass
+    tool="kv_zscan" / "kv_sscan" and get their own name in the
+    errors."""
     key = _require(args, "key")
     pattern = args.get("pattern", "*")
     if not isinstance(pattern, str):
@@ -1482,7 +1506,8 @@ def _hscan_args(args, tool="kv_hscan"):
     if cursor and not cursor.isdigit():
         raise ValueError(
             "%s cursor must be a decimal %s cursor string"
-            % (tool, "ZSCAN" if tool == "kv_zscan" else "HSCAN")
+            % (tool, {"kv_hscan": "HSCAN", "kv_zscan": "ZSCAN",
+                      "kv_sscan": "SSCAN"}[tool])
         )
     return key, pattern, batch_size, cursor
 
@@ -1530,6 +1555,15 @@ def _call_zscan(client, args):
     key, pattern, batch_size, cursor, withscores = _zscan_args(args)
     return zscan_batch(client, key, pattern, cursor, batch_size,
                        withscores)
+
+
+def _call_sscan(client, args):
+    """kv_sscan: one bounded page of a set from one real SSCAN
+    call. Returns {"members": [...], "cursor": str, "done": bool,
+    "batch_size": n}. Bad key/batch_size/cursor values fail the
+    call instead of silently ignoring the caller."""
+    key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
+    return sscan_batch(client, key, pattern, cursor, batch_size)
 
 
 def _op_argv(name, args):
@@ -1707,6 +1741,10 @@ def _op_argv(name, args):
         if withscores:
             cmd.append("WITHSCORES")
         return cmd
+    if name == "kv_sscan":
+        key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
+        return ["SSCAN", key, cursor or "0", "MATCH", pattern,
+                "COUNT", batch_size]
     if name == "kv_lpush":
         return ["LPUSH", _require(args, "key")] + _list_elements_args(args, name)
     if name == "kv_rpush":
@@ -3056,6 +3094,8 @@ def _call_single(client, name, args):
         return _call_hscan(client, args)
     if name == "kv_zscan":
         return _call_zscan(client, args)
+    if name == "kv_sscan":
+        return _call_sscan(client, args)
     if name == "kv_hkeys":
         return _call_hkeys(client, args)
     if name == "kv_hvals":
