@@ -133,7 +133,8 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
-WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_ttl", "kv_exists",
+WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
+                         "kv_exists",
                          "kv_strlen", "kv_getrange", "kv_getbit",
                          "kv_bitcount", "kv_hscan",
                          "kv_hkeys", "kv_hvals",

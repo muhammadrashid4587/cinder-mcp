@@ -1,7 +1,7 @@
 """Tests for cinder-mcp, against a fake RESP server on a socket.
 
 The fake server implements just enough of cinder's surface (PING, SET,
-GET, DEL, KEYS, SCAN, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
+GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
 ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
@@ -1771,6 +1771,11 @@ class FakeCinder(threading.Thread):
                         continue
                 count += 1
             return ":%d\r\n" % count
+        elif name == "DBSIZE":
+            # Cinder ignores extra arguments; count the live keys,
+            # expiring any whose TTL has passed first.
+            return ":%d\r\n" % sum(
+                1 for k in list(self.store) if self._get(k) is not None)
         elif name == "DEL":
             n = sum(1 for k in args if self._get(k) is not None)
             for k in args:
@@ -1971,6 +1976,7 @@ class McpTests(unittest.TestCase):
         names = [t["name"] for t in listed["result"]["tools"]]
         self.assertEqual(
             names, ["kv_get", "kv_set", "kv_del", "kv_keys", "kv_keys_scan",
+                    "kv_dbsize",
                     "kv_incr", "kv_ttl", "kv_pttl", "kv_exists", "kv_expire",
                     "kv_pexpire",
                     "kv_mget", "kv_mset", "kv_getdel", "kv_setnx",
@@ -3524,6 +3530,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _dbsize_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_dbsize", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def test_kv_zscan_pages_through_a_sorted_set(self):
         self._seed_zset("big", 250)
         seen = []
@@ -3662,6 +3675,48 @@ class McpTests(unittest.TestCase):
             "name": "kv_exists", "arguments": {"key": "z3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_kv_dbsize_counts_live_keys(self):
+        # An empty database reports 0; adding keys grows the count
+        # and deleting one shrinks it again. A key whose TTL has
+        # already passed does not count.
+        self.assertEqual(self._dbsize_result({}), 0)
+        self._call("tools/call", 1, {
+            "name": "kv_mset",
+            "arguments": {"values": {"db:a": "1", "db:b": "2",
+                                     "db:c": "3"}},
+        })
+        self.assertEqual(self._dbsize_result({}), 3)
+        self._call("tools/call", 2, {
+            "name": "kv_del", "arguments": {"key": "db:b"},
+        })
+        self.assertEqual(self._dbsize_result({}), 2)
+        self.fake.store["db:gone"] = ("v", time.time() - 1)
+        self.assertEqual(self._dbsize_result({}), 2)
+
+    def test_kv_dbsize_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_set", "key": "a", "value": "1"},
+                {"op": "kv_dbsize"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_set", "key": "b", "value": "2"},
+                {"op": "kv_dbsize"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        # The DBSIZE queued after the SET sees it: a and b.
+        self.assertEqual(summary["results"][1]["result"], 2)
 
     def test_kv_sscan_pages_through_a_set(self):
         self._seed_set("big", 250)
@@ -8508,9 +8563,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_bitcount", "key": "a"},
             {"op": "kv_sscan", "key": "a"},
             {"op": "kv_zmscore", "key": "a", "members": ["m"]},
+            {"op": "kv_dbsize"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 14 op(s), 1 audited, 13 not audited.", text)
+        self.assertIn("Plan: 15 op(s), 1 audited, 14 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -8524,6 +8580,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 11: kv_bitcount is a read, not a write", text)
         self.assertIn("op 12: kv_sscan is a read, not a write", text)
         self.assertIn("op 13: kv_zmscore is a read, not a write", text)
+        self.assertIn("op 14: kv_dbsize is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
@@ -11433,6 +11490,36 @@ class LiveCinderMigrationTests(unittest.TestCase):
             reply = self._call("tools/call", 99, call)
             self.assertIn("error", reply, call)
             self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_live_dbsize(self):
+        """kv_dbsize against a real cinder 0.49.0: the key count of
+        the whole database, checked relatively, since this class
+        shares one cinder with the other live tests and keys from
+        earlier tests are still there. Adding keys grows the count,
+        deleting one shrinks it, and a key whose TTL passes stops
+        counting once it is reaped by a read — cinder's DBSIZE is a
+        maintained counter, so an expired key still counts until
+        something touches it."""
+        before = self._tool("kv_dbsize", {})
+        self.assertEqual(
+            self._tool("kv_set", {"key": "db:one", "value": "1"}), "OK")
+        self.assertEqual(
+            self._tool("kv_set", {"key": "db:two", "value": "2"}), "OK")
+        self.assertEqual(self._tool("kv_dbsize", {}), before + 2)
+        self.assertEqual(self._tool("kv_del", {"key": "db:one"}), 1)
+        self.assertEqual(self._tool("kv_dbsize", {}), before + 1)
+        self.assertEqual(
+            self._tool("kv_setex", {"key": "db:soon", "seconds": 1,
+                                    "value": "x"}),
+            "OK")
+        self.assertEqual(self._tool("kv_dbsize", {}), before + 2)
+        time.sleep(1.2)
+        # The key has expired, but cinder's DBSIZE is a maintained
+        # counter: an expired key still counts until something
+        # reaps it, so read it first (null, and the read reaps it)
+        # before expecting the count to drop.
+        self.assertIsNone(self._tool("kv_get", {"key": "db:soon"}))
+        self.assertEqual(self._tool("kv_dbsize", {}), before + 1)
 
 
 if __name__ == "__main__":

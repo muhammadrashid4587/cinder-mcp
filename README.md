@@ -74,6 +74,7 @@ threshold it crossed, so the client sees it without polling
 | `kv_del` | `DEL key` | 1 if the key existed, 0 otherwise |
 | `kv_keys` | `KEYS pattern` | Glob `*` and `?`, defaults to `*`. Returns `{"keys": [...], "total": n, "returned": m, "sampled": bool}`: at most `limit` keys (default 100); a larger keyspace returns a deterministic sample seeded by `seed`, and `full: true` returns the whole list |
 | `kv_keys_scan` | `SCAN cursor [MATCH pattern] [COUNT n]` | Walk the matching keys one bounded page at a time with cinder's real `SCAN`. Returns `{"keys": [...], "cursor": str, "done": bool, "batch_size": n}`: about `batch_size` keys per page (default 100, max 1000) — `COUNT` is a hint, so a page can run a few keys over when several matches share one hash bucket. Pass the returned `cursor` back for the next page; `""` starts over. When `done` is true the cursor is `""` and the walk is finished. The cursor is opaque: pass it back verbatim. Pages are in `SCAN` order, not sorted; keys added after the cursor are picked up later, keys deleted or renamed between pages can shift the window, and a key can come back twice if the table resizes mid-walk — the same caveats real `SCAN` has |
+| `kv_dbsize` | `DBSIZE` | The number of keys in the database; 0 on an empty one. Takes no arguments. One honest detail: cinder's DBSIZE is a maintained counter, so a key whose TTL has passed still counts until a read (or the background expiry scan) reaps it |
 | `kv_incr` | `INCR key` / `INCRBY key n` | `by` defaults to 1 |
 | `kv_ttl` | `TTL key` | -1 = no expiry, -2 = missing key |
 | `kv_pttl` | `PTTL key` | Milliseconds until a key expires; -1 = no expiry, -2 = missing key |
@@ -306,6 +307,8 @@ sorted key order.
 
 - ~~Multi-score lookup (`kv_zmscore`): expose cinder 0.48.0's `ZMSCORE` — `kv_zmscore` takes a `members` list and returns the scores in order as numbers, with null for a member that is not in the set (and null for every member when the key does not exist), capped at 1000 members like `kv_mget`. Batchable, plain and atomic, and a read, so the `write-safety` audit reports it as one instead of as an unaudited op. Live-verified vs real cinder 0.48.0 on port 7782, including scores in request order, missing members, a missing key, WRONGTYPE on a string key, and inf / -inf scores~~ (done, v0.50.0)
 
+- ~~Key count (`kv_dbsize`): expose cinder's `DBSIZE` — `kv_dbsize` takes no arguments and returns the number of keys in the database, 0 on an empty one. Batchable, plain and atomic, and a read, so the `write-safety` audit reports it as one instead of as an unaudited op. One honest detail, verified live: cinder's DBSIZE is a maintained counter, so a key whose TTL has passed still counts until a read (or the background expiry scan) reaps it. Live-verified vs real cinder 0.49.0 on port 7781, including an empty database, adding and deleting keys, and an expired key dropping out of the count once read~~ (done, v0.51.0)
+
 ## Next
 
-- Cinder also ships `ZREMRANGEBYLEX` and `DBSIZE`, which have no tools yet — `kv_zremrangebylex` completes the sorted-set range-removal trio, `kv_dbsize` is a plain key-count read.
+- Cinder also ships `ZREMRANGEBYLEX`, which has no tool yet — `kv_zremrangebylex` completes the sorted-set range-removal trio.
