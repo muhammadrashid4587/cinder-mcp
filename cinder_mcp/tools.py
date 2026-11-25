@@ -791,6 +791,20 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_zinter",
+        "description": "The intersection of several sorted sets: ZINTER numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. A member must be in every set to appear, once, lowest score first, member name breaking ties. Pass `weights` as a list of numbers, one per key, to multiply each set's scores before aggregating (defaults to 1 per key); pass `aggregate` as \"sum\", \"min\" or \"max\" to combine a member's weighted scores (defaults to \"sum\"). A missing key counts as an empty set, so an intersection with one is empty. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The intersection holds at most 1000 members; a wider intersection fails instead of returning a truncated list. Cinder's `ZINTERSTORE` stores the intersection instead of returning it; like `kv_zunion` with `ZUNIONSTORE`, this tool does not offer it — it returns the intersection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keys": {"type": "array", "items": {"type": "string"}},
+                "weights": {"type": "array", "items": {"type": "number"}},
+                "aggregate": {"type": "string"},
+                "withscores": {"type": "boolean"},
+            },
+            "required": ["keys"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1014,7 +1028,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1058,6 +1072,9 @@ TOOLS = [
                             "sources": {"type": "array", "items": {"type": "string"}},
                             "count": {"type": "integer"},
                             "withscores": {"type": "boolean"},
+                            "weights": {"type": "array",
+                                        "items": {"type": "number"}},
+                            "aggregate": {"type": "string"},
                             "rev": {"type": "boolean"},
                             "pattern": {"type": "string"},
                             "limit": {"type": "integer"},
@@ -1146,7 +1163,7 @@ BATCHABLE_TOOLS = {
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
-    "kv_zrandmember", "kv_zscan", "kv_zunion",
+    "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1233,7 +1250,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
-    "kv_zrandmember", "kv_zscan", "kv_zunion",
+    "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1467,6 +1484,23 @@ def _call_batch_atomic(client, ops):
                     {"op": op_name, "ok": False,
                      "error": "kv_zunion returns at most %d members; "
                               "the union is larger"
+                              % MAX_ZRANGE_MEMBERS})
+                continue
+            value = members
+        elif op_name == "kv_zinter":
+            # ZINTER came back as a flat list inside the
+            # transaction; shape it like the standalone tool does,
+            # including the withscores member/score objects. An
+            # intersection wider than the cap is recorded as this
+            # op's error, in place, like an EXEC-time failure —
+            # the rest still run.
+            members = _zrange_result(reply or [],
+                                     _zinter_args(op)[1])
+            if len(members) > MAX_ZRANGE_MEMBERS:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_zinter returns at most %d members; "
+                              "the intersection is larger"
                               % MAX_ZRANGE_MEMBERS})
                 continue
             value = members
@@ -1823,6 +1857,17 @@ def _op_argv(name, args):
     if name == "kv_zunion":
         keys, withscores = _zunion_args(args)
         cmd = ["ZUNION", len(keys)] + list(keys)
+        if withscores:
+            cmd.append("WITHSCORES")
+        return cmd
+    if name == "kv_zinter":
+        keys, weights, aggregate, withscores = _zinter_args(args)
+        cmd = ["ZINTER", len(keys)] + list(keys)
+        if weights is not None:
+            cmd.append("WEIGHTS")
+            cmd += [repr(weight) for weight in weights]
+        if aggregate is not None:
+            cmd += ["AGGREGATE", aggregate.upper()]
         if withscores:
             cmd.append("WITHSCORES")
         return cmd
@@ -2686,6 +2731,97 @@ def _call_zunion(client, args):
     )
 
 
+# The most keys one kv_zinter call reads; a wider call fails
+# instead of sending a half-formed ZINTER with a huge argv.
+MAX_ZINTER_KEYS = 1000
+
+# How a member's scores combine across the sets: the default,
+# "sum", adds the weighted scores; "min" and "max" take the
+# smallest and largest. Cinder spells them uppercase on the wire.
+ZINTER_AGGREGATES = ("sum", "min", "max")
+
+
+def _zinter_args(args):
+    """Validate a kv_zinter call: (keys, weights, aggregate,
+    withscores). `keys` must be a non-empty list of string key
+    names, at most MAX_ZINTER_KEYS; `weights`, when given, must be
+    a list of numbers, one per key (NaN is rejected — cinder
+    rejects it too); `aggregate`, when given, must be "sum", "min"
+    or "max" (any case); `withscores` must be a boolean. Anything
+    else fails the call instead of sending a half-formed ZINTER.
+    Weights and aggregate default to None, meaning the tool sends
+    neither option and cinder weights every set by 1 and sums."""
+    keys = args.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError("kv_zinter keys must be a non-empty list")
+    if len(keys) > MAX_ZINTER_KEYS:
+        raise ValueError(
+            "kv_zinter reads at most %d keys; narrow the list"
+            % MAX_ZINTER_KEYS
+        )
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError("kv_zinter keys must be strings")
+    weights = args.get("weights")
+    if weights is not None:
+        if not isinstance(weights, list):
+            raise ValueError("kv_zinter weights must be a list")
+        if len(weights) != len(keys):
+            raise ValueError(
+                "kv_zinter weights must have one weight per key"
+            )
+        for weight in weights:
+            if isinstance(weight, bool) or not isinstance(
+                    weight, (int, float)):
+                raise ValueError(
+                    "kv_zinter weights must be numbers")
+            if isinstance(weight, float) and weight != weight:
+                raise ValueError(
+                    "kv_zinter weights must not be NaN")
+    aggregate = args.get("aggregate")
+    if aggregate is not None:
+        if not isinstance(aggregate, str):
+            raise ValueError("kv_zinter aggregate must be a string")
+        if aggregate.lower() not in ZINTER_AGGREGATES:
+            raise ValueError(
+                "kv_zinter aggregate must be sum, min or max")
+    withscores = args.get("withscores", False)
+    if not isinstance(withscores, bool):
+        raise ValueError("kv_zinter withscores must be true or false")
+    return list(keys), weights, aggregate, withscores
+
+
+def _zinter_result(flat, withscores):
+    """Shape a flat ZINTER reply into the tool's return value, a
+    list of member names in score order, or with withscores a list
+    of {"member": ..., "score": ...} objects, and fail when the
+    intersection holds more than MAX_ZRANGE_MEMBERS members —
+    cinder has no LIMIT for ZINTER, so the reply is checked after
+    the fact instead of asking for one member too many, as
+    kv_zrangebyscore does. The caller must intersect fewer or
+    smaller sets instead of getting a silently truncated list."""
+    members = _zrange_result(flat, withscores)
+    if len(members) > MAX_ZRANGE_MEMBERS:
+        raise ValueError(
+            "kv_zinter returns at most %d members; the intersection "
+            "is larger" % MAX_ZRANGE_MEMBERS
+        )
+    return members
+
+
+def _call_zinter(client, args):
+    """kv_zinter: the intersection of several sorted sets, a
+    member appearing once only when it is in every set, with its
+    weighted scores combined by the aggregate, lowest score first.
+    A missing key counts as an empty set, so an intersection with
+    one is empty, as in cinder. The call is read-only: the sets
+    are untouched, so the audit treats it as a read op."""
+    return _zinter_result(
+        client.command(*_op_argv("kv_zinter", args)) or [],
+        _zinter_args(args)[3],
+    )
+
+
 def _call_zincrby(client, args):
     """kv_zincrby: the member's new score as a number. Cinder
     replies with the score as a bulk string."""
@@ -3315,6 +3451,8 @@ def _call_single(client, name, args):
         return _call_zmscore(client, args)
     if name == "kv_zunion":
         return _call_zunion(client, args)
+    if name == "kv_zinter":
+        return _call_zinter(client, args)
     if name == "kv_zincrby":
         return _call_zincrby(client, args)
     if name == "kv_zrange":

@@ -1258,6 +1258,87 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     out += self._bulk(repr(totals[member]))
             return out
+        elif name == "ZINTER" and len(args) >= 2:
+            # ZINTER numkeys key [key ...] [WEIGHTS w ...]
+            # [AGGREGATE SUM|MIN|MAX] [WITHSCORES]: the
+            # intersection of several sorted sets, a member
+            # appearing once only when it is in every set, with
+            # its weighted scores combined by the aggregate,
+            # lowest score first, member name breaking ties, as
+            # in real cinder. A missing key counts as an empty
+            # set, so an intersection with one is empty; the
+            # type of every input key is checked before any set
+            # is read, so a non-sorted-set key is WRONGTYPE.
+            # There is no STORE variant. Options may come in any
+            # order, as cinder accepts them that way.
+            try:
+                numkeys = int(args[0])
+            except ValueError:
+                return ("-ERR at least 1 input key is needed for "
+                        "'zinter' command\r\n")
+            if numkeys < 1 or len(args) < 1 + numkeys:
+                return ("-ERR wrong number of arguments for 'zinter' "
+                        "command\r\n")
+            keys = args[1:1 + numkeys]
+            weights = [1.0] * numkeys
+            aggregate = "SUM"
+            withscores = False
+            i = 1 + numkeys
+            while i < len(args):
+                keyword = args[i].upper()
+                if keyword == "WEIGHTS":
+                    if i + numkeys >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        weights = [float(w) for w in
+                                   args[i + 1:i + 1 + numkeys]]
+                    except ValueError:
+                        return ("-ERR value is not a valid float"
+                                "\r\n")
+                    i += 1 + numkeys
+                elif keyword == "AGGREGATE":
+                    if i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    if args[i + 1].upper() not in ("SUM", "MIN", "MAX"):
+                        return "-ERR syntax error\r\n"
+                    aggregate = args[i + 1].upper()
+                    i += 2
+                elif keyword == "WITHSCORES":
+                    withscores = True
+                    i += 1
+                else:
+                    return "-ERR syntax error\r\n"
+            sets = []
+            for key in keys:
+                value = self._get(key)
+                if value is None:
+                    sets.append({})
+                elif not isinstance(value, ZSet):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                else:
+                    sets.append(value.members)
+            common = set(sets[0])
+            for members in sets[1:]:
+                common &= set(members)
+            scored = {}
+            for member in common:
+                weighted = [sets[j][member] * weights[j]
+                            for j in range(numkeys)]
+                if aggregate == "MIN":
+                    scored[member] = min(weighted)
+                elif aggregate == "MAX":
+                    scored[member] = max(weighted)
+                else:
+                    scored[member] = sum(weighted)
+            ordered = sorted(scored, key=lambda m: (scored[m], m))
+            out = "*%d\r\n" % (len(ordered) * 2 if withscores
+                               else len(ordered))
+            for member in ordered:
+                out += self._bulk(member)
+                if withscores:
+                    out += self._bulk(repr(scored[member]))
+            return out
         elif name == "ZRANK" and len(args) == 2:
             value = self._get(args[0])
             if value is None:
@@ -2094,7 +2175,7 @@ class McpTests(unittest.TestCase):
                     "kv_zremrangebylex",
                     "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
-                    "kv_zrandmember", "kv_zscan", "kv_zunion",
+                    "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -4203,6 +4284,199 @@ class McpTests(unittest.TestCase):
             "name": "kv_batch",
             "arguments": {"atomic": True, "ops": [
                 {"op": "kv_zunion", "keys": ["big"]},
+                {"op": "kv_zcard", "key": "big"},
+            ]},
+        })
+        summary = json.loads(wide["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("at most 1000 members",
+                      summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 1001)
+
+    def _zinter_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zinter", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_zinter_returns_intersection_with_aggregated_scores(self):
+        self._seed_zset("ia", 5)
+        self._seed_zset("ib", 5)
+        # A member in both sets appears once, with the sum of its
+        # scores; the intersection is ordered lowest score first.
+        # ia holds m:000..m:004 at 0..4 and ib the same members at
+        # 0..4, so every member scores double.
+        self.assertEqual(
+            self._zinter_result({"keys": ["ia", "ib"]}),
+            ["m:%03d" % i for i in range(5)])
+        self.assertEqual(
+            self._zinter_result({"keys": ["ia", "ib"],
+                                 "withscores": True}),
+            [{"member": "m:%03d" % i, "score": float(2 * i)}
+             for i in range(5)])
+        # Scores that only overlap on some members: seed two sets
+        # with different members and check the sums and the order.
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "i1",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_zadd",
+            "arguments": {"key": "i2",
+                          "members": {"b": 10, "d": 20}},
+        })
+        self.assertEqual(
+            self._zinter_result({"keys": ["i1", "i2"],
+                                 "withscores": True}),
+            [{"member": "b", "score": 12.0}])
+        # WEIGHTS multiply each set's scores before aggregating,
+        # and AGGREGATE picks how they combine: MIN takes the
+        # smallest weighted score, MAX the largest.
+        self.assertEqual(
+            self._zinter_result({"keys": ["i1", "i2"],
+                                 "weights": [2, 3],
+                                 "withscores": True}),
+            [{"member": "b", "score": 34.0}])
+        self.assertEqual(
+            self._zinter_result({"keys": ["i1", "i2"],
+                                 "weights": [2, 3],
+                                 "aggregate": "min",
+                                 "withscores": True}),
+            [{"member": "b", "score": 4.0}])
+        self.assertEqual(
+            self._zinter_result({"keys": ["i1", "i2"],
+                                 "weights": [2, 3],
+                                 "aggregate": "MAX",
+                                 "withscores": True}),
+            [{"member": "b", "score": 30.0}])
+        # A missing key counts as an empty set, so an intersection
+        # with one is empty, and an intersection of only missing
+        # keys is empty too.
+        self.assertEqual(
+            self._zinter_result({"keys": ["i1", "ghost"],
+                                 "withscores": True}),
+            [])
+        self.assertEqual(
+            self._zinter_result({"keys": ["ghost", "alsogone"]}), [])
+        self.assertEqual(
+            self._zinter_result({"keys": ["ghost"],
+                                 "withscores": True}), [])
+        # One key intersects with itself: the same members, in
+        # score order.
+        self.assertEqual(
+            self._zinter_result({"keys": ["i1"]}),
+            ["a", "b", "c"])
+
+    def test_kv_zinter_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"keys": []}, {"keys": "z"}, {"keys": [1]},
+                    {"keys": ["z", 2]},
+                    {"keys": ["z"] * 1001},
+                    {"keys": ["z"], "withscores": "yes"},
+                    {"keys": ["z", "z"], "weights": [1]},
+                    {"keys": ["z", "z"], "weights": [1, 2, 3]},
+                    {"keys": ["z"], "weights": "x"},
+                    {"keys": ["z", "z"], "weights": [1, "x"]},
+                    {"keys": ["z", "z"], "weights": [1, True]},
+                    {"keys": ["z"], "weights": [float("nan")]},
+                    {"keys": ["z"], "aggregate": "avg"},
+                    {"keys": ["z"], "aggregate": 3}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zinter",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zinter", "arguments": {},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_kv_zinter_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zinter",
+            "arguments": {"keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_zinter_intersection_wider_than_cap_fails(self):
+        self._seed_zset("big", 1001)
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zinter", "arguments": {"keys": ["big", "big"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # Exactly 1000 members still comes back whole.
+        self._seed_zset("edge", 1000)
+        self.assertEqual(
+            len(self._zinter_result({"keys": ["edge", "edge"]})), 1000)
+
+    def test_kv_zinter_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zinter", "keys": ["z", "z"],
+                 "weights": [1, 2], "aggregate": "min",
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        # MIN of score and twice the score is the score itself.
+        self.assertEqual(summary["results"][0]["result"],
+                         [{"member": "m:%03d" % i, "score": float(i)}
+                          for i in range(5)])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zinter", "keys": ["z2", "z"],
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        # z2 holds a, b, c and z holds m:000..m:004: nothing is in
+        # both, so the intersection is empty.
+        self.assertEqual(summary["results"][1]["result"], [])
+        # Bad zinter arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zinter", "keys": ["z3"],
+                 "weights": [1, 2]},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "z3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # An intersection wider than the cap inside an atomic batch
+        # is recorded as that op's error, in place, and the rest
+        # still run.
+        self._seed_zset("big", 1001)
+        wide = self._call("tools/call", 5, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zinter", "keys": ["big", "big"]},
                 {"op": "kv_zcard", "key": "big"},
             ]},
         })
@@ -8953,9 +9227,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_zmscore", "key": "a", "members": ["m"]},
             {"op": "kv_dbsize"},
             {"op": "kv_zunion", "keys": ["a", "b"]},
+            {"op": "kv_zinter", "keys": ["a", "b"]},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 16 op(s), 1 audited, 15 not audited.", text)
+        self.assertIn("Plan: 17 op(s), 1 audited, 16 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -8971,6 +9246,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 13: kv_zmscore is a read, not a write", text)
         self.assertIn("op 14: kv_dbsize is a read, not a write", text)
         self.assertIn("op 15: kv_zunion is a read, not a write", text)
+        self.assertIn("op 16: kv_zinter is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
@@ -12065,6 +12341,169 @@ class LiveCinderMigrationTests(unittest.TestCase):
             with self.assertRaises(RespError) as caught:
                 client.command("ZUNION", 1, "zu:a", *extra)
             self.assertIn("syntax error", str(caught.exception))
+
+    def test_live_zinter(self):
+        """kv_zinter against a real cinder 0.53.0: the intersection
+        of several sorted sets, a member appearing once only when
+        it is in every set, with WEIGHTS multiplying each set's
+        scores and AGGREGATE SUM|MIN|MAX combining them, lowest
+        score first with the member name breaking ties,
+        WITHSCORES member/score objects, a missing key counting
+        as an empty set, an empty intersection for only-missing
+        keys, inf scores round-tripping, WRONGTYPE on a string
+        key, the 1000-member cap, and cinder's ZINTERSTORE, which
+        stores the intersection instead of returning it and which
+        the tool does not offer, while the STORE keyword is still
+        a syntax error on ZINTER itself."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zi:a",
+                "members": {"a": 1, "b": 2, "c": 3}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zi:b",
+                "members": {"b": 10, "d": 20}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:b"]}),
+            ["b"])
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:b"],
+                                     "withscores": True}),
+            [{"member": "b", "score": 12.0}])
+        # WEIGHTS multiply each set's scores before aggregating;
+        # AGGREGATE picks how they combine.
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:b"],
+                                     "weights": [2, 3],
+                                     "withscores": True}),
+            [{"member": "b", "score": 34.0}])
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:b"],
+                                     "weights": [2, 3],
+                                     "aggregate": "min",
+                                     "withscores": True}),
+            [{"member": "b", "score": 4.0}])
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:b"],
+                                     "weights": [2, 3],
+                                     "aggregate": "MAX",
+                                     "withscores": True}),
+            [{"member": "b", "score": 30.0}])
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:b"],
+                                     "aggregate": "sum",
+                                     "withscores": True}),
+            [{"member": "b", "score": 12.0}])
+        # A missing key counts as an empty set, so an intersection
+        # with one is empty; only-missing keys intersect to
+        # nothing; one key intersects with itself.
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:ghost"]}),
+            [])
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:ghost", "zi:gone"]}),
+            [])
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        # Ties break by member name, and inf scores round-trip.
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zi:tie",
+                "members": {"x": 5, "y": 5, "a": 5,
+                            "top": float("inf")}}),
+            4)
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:tie", "zi:tie"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 10.0},
+             {"member": "x", "score": 10.0},
+             {"member": "y", "score": 10.0},
+             {"member": "top", "score": float("inf")}])
+        # The same key twice doubles every score, as in Redis.
+        self.assertEqual(
+            self._tool("kv_zinter", {"keys": ["zi:a", "zi:a"],
+                                     "withscores": True}),
+            [{"member": "a", "score": 2.0},
+             {"member": "b", "score": 4.0},
+             {"member": "c", "score": 6.0}])
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zi:str", "value": "hello"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zinter",
+            "arguments": {"keys": ["zi:a", "zi:str"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        for arguments in ({"keys": []}, {"keys": "zi:a"},
+                          {"keys": ["zi:a"], "withscores": "yes"},
+                          {"keys": ["zi:a", "zi:b"],
+                           "weights": [1]},
+                          {"keys": ["zi:a", "zi:b"],
+                           "weights": [1, "x"]},
+                          {"keys": ["zi:a"],
+                           "aggregate": "avg"}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zinter", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+        # An intersection wider than the 1000-member cap fails
+        # instead of returning a truncated list; exactly 1000
+        # comes back whole. Members go in in chunks: one ZADD
+        # carrying 1001 members (2003 args) makes cinder close
+        # the connection, so no single call adds the whole set.
+        for start in range(0, 1001, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "zi:big",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       min(start + 200,
+                                                           1001))}}),
+                min(start + 200, 1001) - start)
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zinter",
+            "arguments": {"keys": ["zi:big", "zi:big"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        for start in range(0, 1000, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "zi:edge",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       start + 200)}}),
+                200)
+        self.assertEqual(
+            len(self._tool("kv_zinter", {"keys": ["zi:edge",
+                                                  "zi:edge"]})), 1000)
+        # Cinder does ship ZINTERSTORE (0.53.0): ask it directly
+        # and confirm what it does, so the tool's choice not to
+        # offer it stays grounded — it stores the intersection
+        # instead of returning it, and the STORE keyword is still
+        # a syntax error on ZINTER itself.
+        from cinder_mcp.resp import RespError
+        client = RespClient("127.0.0.1", self.PORT)
+        self.assertEqual(
+            client.command("ZINTERSTORE", "zi:dst", 2, "zi:a", "zi:b"),
+            1)
+        self.assertEqual(
+            self._tool("kv_zrange", {"key": "zi:dst", "start": 0,
+                                     "stop": -1, "withscores": True}),
+            [{"member": "b", "score": 12.0}])
+        with self.assertRaises(RespError) as caught:
+            client.command("ZINTER", 2, "zi:a", "zi:b",
+                           "STORE", "zi:dest")
+        self.assertIn("syntax error", str(caught.exception))
 
     def test_live_dbsize(self):
         """kv_dbsize against a real cinder 0.49.0: the key count of
