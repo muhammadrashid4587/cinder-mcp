@@ -1339,6 +1339,57 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     out += self._bulk(repr(scored[member]))
             return out
+        elif name == "ZDIFF" and len(args) >= 2:
+            # ZDIFF numkeys key [key ...] [WITHSCORES]: the
+            # members of the first sorted set that are in none of
+            # the other sets, once each, in the first set's score
+            # order with the first set's scores, as in real
+            # cinder. A missing key counts as an empty set; the
+            # type of every input key is checked before any set
+            # is read, so a non-sorted-set key is WRONGTYPE.
+            # There is no STORE variant, and no WEIGHTS or
+            # AGGREGATE.
+            try:
+                numkeys = int(args[0])
+            except ValueError:
+                return ("-ERR at least 1 input key is needed for "
+                        "'zdiff' command\r\n")
+            if numkeys < 1 or len(args) < 1 + numkeys:
+                return ("-ERR wrong number of arguments for 'zdiff' "
+                        "command\r\n")
+            if len(args) == 2 + numkeys:
+                if args[1 + numkeys].upper() != "WITHSCORES":
+                    return "-ERR syntax error\r\n"
+                withscores = True
+            elif len(args) > 2 + numkeys:
+                return "-ERR syntax error\r\n"
+            else:
+                withscores = False
+            keys = args[1:1 + numkeys]
+            sets = []
+            for key in keys:
+                value = self._get(key)
+                if value is None:
+                    sets.append({})
+                elif not isinstance(value, ZSet):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                else:
+                    sets.append(value.members)
+            others = set()
+            for members in sets[1:]:
+                others |= set(members)
+            first = sets[0]
+            kept = [m for m in
+                    sorted(first, key=lambda m: (first[m], m))
+                    if m not in others]
+            out = "*%d\r\n" % (len(kept) * 2 if withscores
+                               else len(kept))
+            for member in kept:
+                out += self._bulk(member)
+                if withscores:
+                    out += self._bulk(repr(first[member]))
+            return out
         elif name == "ZRANK" and len(args) == 2:
             value = self._get(args[0])
             if value is None:
@@ -2176,6 +2227,7 @@ class McpTests(unittest.TestCase):
                     "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
                     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
+                    "kv_zdiff",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -4477,6 +4529,184 @@ class McpTests(unittest.TestCase):
             "name": "kv_batch",
             "arguments": {"atomic": True, "ops": [
                 {"op": "kv_zinter", "keys": ["big", "big"]},
+                {"op": "kv_zcard", "key": "big"},
+            ]},
+        })
+        summary = json.loads(wide["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("at most 1000 members",
+                      summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 1001)
+
+    def _zdiff_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zdiff", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_zdiff_returns_difference_with_first_set_scores(self):
+        self._seed_zset("da", 5)
+        self._seed_zset("db", 5)
+        # Every member is in both sets, so the difference is
+        # empty; one key diffs against itself to nothing too.
+        self.assertEqual(
+            self._zdiff_result({"keys": ["da", "db"]}), [])
+        self.assertEqual(
+            self._zdiff_result({"keys": ["da", "da"]}), [])
+        # Members only in the first set survive, once each, in
+        # the first set's score order with the first set's scores.
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "d1",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_zadd",
+            "arguments": {"key": "d2",
+                          "members": {"b": 10, "d": 20}},
+        })
+        self.assertEqual(
+            self._zdiff_result({"keys": ["d1", "d2"]}),
+            ["a", "c"])
+        self.assertEqual(
+            self._zdiff_result({"keys": ["d1", "d2"],
+                                "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        # A member must be absent from every other set: a third
+        # set removes c as well.
+        self._call("tools/call", 4, {
+            "name": "kv_zadd",
+            "arguments": {"key": "d3",
+                          "members": {"c": 30}},
+        })
+        self.assertEqual(
+            self._zdiff_result({"keys": ["d1", "d2", "d3"]}),
+            ["a"])
+        # A missing key counts as an empty set: diffing against
+        # only missing keys is the whole first set, a missing
+        # first key diffs to nothing, and only-missing keys diff
+        # to nothing.
+        self.assertEqual(
+            self._zdiff_result({"keys": ["d1", "ghost"],
+                                "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        self.assertEqual(
+            self._zdiff_result({"keys": ["ghost", "d1"]}), [])
+        self.assertEqual(
+            self._zdiff_result({"keys": ["ghost", "alsogone"]}), [])
+        self.assertEqual(
+            self._zdiff_result({"keys": ["ghost"],
+                                "withscores": True}), [])
+        # One key diffs with itself to its own members, in score
+        # order.
+        self.assertEqual(
+            self._zdiff_result({"keys": ["d1"]}),
+            ["a", "b", "c"])
+
+    def test_kv_zdiff_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"keys": []}, {"keys": "z"}, {"keys": [1]},
+                    {"keys": ["z", 2]},
+                    {"keys": ["z"] * 1001},
+                    {"keys": ["z"], "withscores": "yes"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zdiff",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zdiff", "arguments": {},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_kv_zdiff_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zdiff",
+            "arguments": {"keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+
+    def test_kv_zdiff_difference_wider_than_cap_fails(self):
+        self._seed_zset("big", 1001)
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zdiff", "arguments": {"keys": ["big", "ghost"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # Exactly 1000 members still comes back whole.
+        self._seed_zset("edge", 1000)
+        self.assertEqual(
+            len(self._zdiff_result({"keys": ["edge", "ghost"]})), 1000)
+
+    def test_kv_zdiff_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zdiff", "keys": ["z", "ghost"],
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"],
+                         [{"member": "m:%03d" % i, "score": float(i)}
+                          for i in range(5)])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zdiff", "keys": ["z2", "z"],
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        # a, b, c score 1, 2, 3 in z2 and are not in z, so the
+        # difference is the whole of z2.
+        self.assertEqual(summary["results"][1]["result"],
+                         [{"member": "a", "score": 1.0},
+                          {"member": "b", "score": 2.0},
+                          {"member": "c", "score": 3.0}])
+        # Bad zdiff arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zdiff", "keys": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "z3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # A difference wider than the cap inside an atomic batch is
+        # recorded as that op's error, in place, and the rest
+        # still run.
+        self._seed_zset("big", 1001)
+        wide = self._call("tools/call", 5, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zdiff", "keys": ["big", "ghost"]},
                 {"op": "kv_zcard", "key": "big"},
             ]},
         })
@@ -12503,6 +12733,158 @@ class LiveCinderMigrationTests(unittest.TestCase):
         with self.assertRaises(RespError) as caught:
             client.command("ZINTER", 2, "zi:a", "zi:b",
                            "STORE", "zi:dest")
+        self.assertIn("syntax error", str(caught.exception))
+
+    def test_live_zdiff(self):
+        """kv_zdiff against a real cinder 0.54.0: the members of
+        the first sorted set that are in none of the other sets,
+        once each, in the first set's score order with the first
+        set's scores, WITHSCORES member/score objects, a missing
+        key counting as an empty set, a missing first key diffing
+        to nothing, an empty difference for a set against itself,
+        tie order by member name, inf scores round-tripping,
+        WRONGTYPE on a string key, the 1000-member cap, and
+        cinder's ZDIFFSTORE, which stores the difference instead
+        of returning it and which the tool does not offer, while
+        the STORE keyword is still a syntax error on ZDIFF
+        itself."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zd:a",
+                "members": {"a": 1, "b": 2, "c": 3}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zd:b",
+                "members": {"b": 10, "d": 20}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:a", "zd:b"]}),
+            ["a", "c"])
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:a", "zd:b"],
+                                    "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        # A member must be absent from every other set.
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zd:c",
+                "members": {"c": 30}}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zdiff",
+                       {"keys": ["zd:a", "zd:b", "zd:c"]}),
+            ["a"])
+        # A missing key counts as an empty set, so a difference
+        # against only missing keys is the whole first set; a
+        # missing first key diffs to nothing; only-missing keys
+        # diff to nothing; one key diffs with itself to its own
+        # members, and a set against itself is empty.
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:a", "zd:ghost"],
+                                    "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:ghost", "zd:a"]}),
+            [])
+        self.assertEqual(
+            self._tool("kv_zdiff",
+                       {"keys": ["zd:ghost", "zd:gone"]}),
+            [])
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:a"]}),
+            ["a", "b", "c"])
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:a", "zd:a"]}),
+            [])
+        # Ties break by member name, and inf scores round-trip.
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zd:tie",
+                "members": {"x": 5, "y": 5, "a": 5,
+                            "top": float("inf")}}),
+            4)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zd:tie2",
+                "members": {"y": 1}}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zdiff", {"keys": ["zd:tie", "zd:tie2"],
+                                    "withscores": True}),
+            [{"member": "a", "score": 5.0},
+             {"member": "x", "score": 5.0},
+             {"member": "top", "score": float("inf")}])
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zd:str", "value": "hello"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zdiff",
+            "arguments": {"keys": ["zd:a", "zd:str"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        for arguments in ({"keys": []}, {"keys": "zd:a"},
+                          {"keys": ["zd:a"], "withscores": "yes"},
+                          {"keys": ["zd:a"] * 1001}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zdiff", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+        # A difference wider than the 1000-member cap fails
+        # instead of returning a truncated list; exactly 1000
+        # comes back whole. Members go in in chunks: one ZADD
+        # carrying 1001 members (2003 args) makes cinder close
+        # the connection, so no single call adds the whole set.
+        for start in range(0, 1001, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "zd:big",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       min(start + 200,
+                                                           1001))}}),
+                min(start + 200, 1001) - start)
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zdiff",
+            "arguments": {"keys": ["zd:big", "zd:ghost"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        for start in range(0, 1000, 200):
+            self.assertEqual(
+                self._tool("kv_zadd", {"key": "zd:edge",
+                                       "members": {"m%04d" % i: i
+                                                   for i in range(
+                                                       start,
+                                                       start + 200)}}),
+                200)
+        self.assertEqual(
+            len(self._tool("kv_zdiff", {"keys": ["zd:edge",
+                                                 "zd:ghost"]})), 1000)
+        # Cinder does ship ZDIFFSTORE (0.54.0): ask it directly
+        # and confirm what it does, so the tool's choice not to
+        # offer it stays grounded — it stores the difference
+        # instead of returning it, and the STORE keyword is still
+        # a syntax error on ZDIFF itself.
+        from cinder_mcp.resp import RespError
+        client = RespClient("127.0.0.1", self.PORT)
+        self.assertEqual(
+            client.command("ZDIFFSTORE", "zd:dst", 2, "zd:a", "zd:b"),
+            2)
+        self.assertEqual(
+            self._tool("kv_zrange", {"key": "zd:dst", "start": 0,
+                                     "stop": -1, "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        with self.assertRaises(RespError) as caught:
+            client.command("ZDIFF", 2, "zd:a", "zd:b",
+                           "STORE", "zd:dest")
         self.assertIn("syntax error", str(caught.exception))
 
     def test_live_dbsize(self):
