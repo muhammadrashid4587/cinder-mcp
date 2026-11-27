@@ -1446,6 +1446,43 @@ class FakeCinder(threading.Thread):
                             "holding the wrong kind of value\r\n")
                 merged |= value.elements
             return ":%d\r\n" % len(merged)
+        elif name == "PFMERGE" and len(args) >= 2:
+            # PFMERGE destination source [source ...]: merge the
+            # sources register-wise into the destination and
+            # answer OK. A missing source counts as empty; a
+            # plain string is not a valid HyperLogLog, and a
+            # container is the wrong type, as in real cinder, at
+            # either end, the destination first, then the sources
+            # in order. The destination is overwritten wholesale
+            # — its old registers are discarded unless it is
+            # itself a source — and its expiry is cleared, so the
+            # stored tuple is replaced. Every key is validated
+            # before anything is written: a failed merge leaves
+            # the destination and its TTL untouched, as in real
+            # cinder.
+            merged = set()
+            current = self._get(args[0])
+            if isinstance(current, str):
+                return ("-WRONGTYPE Key is not a valid HyperLogLog "
+                        "string value.\r\n")
+            if current is not None and not isinstance(current, HLL):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            for key in args[1:]:
+                value = self._get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    return ("-WRONGTYPE Key is not a valid "
+                            "HyperLogLog string value.\r\n")
+                if not isinstance(value, HLL):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                merged |= value.elements
+            value = HLL()
+            value.elements = merged
+            self.store[args[0]] = (value, None)
+            return "+OK\r\n"
         elif name == "ZRANK" and len(args) == 2:
             value = self._get(args[0])
             if value is None:
@@ -2284,7 +2321,7 @@ class McpTests(unittest.TestCase):
                     "kv_zpopmin", "kv_zpopmax",
                     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
                     "kv_zdiff",
-                    "kv_pfadd", "kv_pfcount",
+                    "kv_pfadd", "kv_pfcount", "kv_pfmerge",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -4841,6 +4878,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _pfmerge_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_pfmerge", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return reply["result"]["content"][0]["text"]
+
     def test_kv_pfadd_returns_changed_flag_and_preserves_ttl(self):
         # New key: 1; the same elements again: 0; one new
         # element among repeats: 1.
@@ -5040,6 +5084,205 @@ class McpTests(unittest.TestCase):
         self.assertFalse(summary["results"][0]["ok"])
         self.assertIn("WRONGTYPE", summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 3)
+
+    def test_kv_pfmerge_merges_sources_and_clears_ttl(self):
+        # Two disjoint sets merge into their union; the sources
+        # are untouched.
+        self._pfadd_result({"key": "m1",
+                            "elements": ["a", "b", "c"]})
+        self._pfadd_result({"key": "m2",
+                            "elements": ["b", "c", "d", "e"]})
+        self.assertEqual(
+            self._pfmerge_result({"destination": "u",
+                                  "sources": ["m1", "m2"]}),
+            "OK")
+        self.assertEqual(self._pfcount_result({"keys": ["u"]}), 5)
+        self.assertEqual(self._pfcount_result({"keys": ["m1"]}), 3)
+        self.assertEqual(self._pfcount_result({"keys": ["m2"]}), 4)
+        # The destination is overwritten wholesale: its old
+        # registers are discarded, not unioned in.
+        self._pfadd_result({"key": "old",
+                            "elements": ["x%d" % i for i in range(10)]})
+        self.assertEqual(
+            self._pfmerge_result({"destination": "old",
+                                  "sources": ["m1"]}),
+            "OK")
+        self.assertEqual(self._pfcount_result({"keys": ["old"]}), 3)
+        # A missing source counts as empty.
+        self.assertEqual(
+            self._pfmerge_result({"destination": "u2",
+                                  "sources": ["m1", "ghost"]}),
+            "OK")
+        self.assertEqual(self._pfcount_result({"keys": ["u2"]}), 3)
+        # Merging only missing sources creates an empty
+        # HyperLogLog: the key exists and counts 0.
+        self.assertEqual(
+            self._pfmerge_result({"destination": "empty",
+                                  "sources": ["ghost", "alsogone"]}),
+            "OK")
+        exists = self._call("tools/call", 1, {
+            "name": "kv_exists", "arguments": {"key": "empty"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "1")
+        self.assertEqual(
+            self._pfcount_result({"keys": ["empty"]}), 0)
+        # PFMERGE clears the destination's TTL.
+        self._pfadd_result({"key": "t",
+                            "elements": ["q"]})
+        self._call("tools/call", 2, {
+            "name": "kv_expire",
+            "arguments": {"key": "t", "seconds": 300},
+        })
+        self.assertEqual(
+            self._pfmerge_result({"destination": "t",
+                                  "sources": ["m1"]}),
+            "OK")
+        ttl = self._call("tools/call", 3, {
+            "name": "kv_ttl", "arguments": {"key": "t"},
+        })
+        self.assertEqual(int(ttl["result"]["content"][0]["text"]), -1)
+        # The destination may itself be a source: a self-merge
+        # unions the destination with the other sources.
+        self.assertEqual(
+            self._pfmerge_result({"destination": "m1",
+                                  "sources": ["m1", "m2"]}),
+            "OK")
+        self.assertEqual(self._pfcount_result({"keys": ["m1"]}), 5)
+        # The merged key is still a HyperLogLog string.
+        got = self._call("tools/call", 4, {
+            "name": "kv_get", "arguments": {"key": "m1"},
+        })
+        value = got["result"]["content"][0]["text"]
+        self.assertTrue(value.startswith("HLL1"))
+        self.assertEqual(len(value), 16388)
+
+    def test_kv_pfmerge_rejects_bad_arguments(self):
+        self._pfadd_result({"key": "h", "elements": ["a"]})
+        for bad in ({"destination": "u"},
+                    {"destination": "u", "sources": []},
+                    {"destination": "u", "sources": "h"},
+                    {"destination": "u", "sources": [1]},
+                    {"destination": "u", "sources": ["h", 2]},
+                    {"destination": 1, "sources": ["h"]},
+                    {"sources": ["h"]},
+                    {"destination": "u",
+                     "sources": ["h"] * 1001}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_pfmerge",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_pfmerge_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        self._pfadd_result({"key": "h", "elements": ["a"]})
+        for arguments in ({"destination": "plain", "sources": ["h"]},
+                          {"destination": "z", "sources": ["h"]},
+                          {"destination": "u", "sources": ["plain"]},
+                          {"destination": "u", "sources": ["z"]},
+                          {"destination": "u",
+                           "sources": ["h", "plain"]}):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_pfmerge",
+                "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+        # A failed merge leaves the destination and its TTL
+        # untouched.
+        self._pfadd_result({"key": "keep",
+                            "elements": ["a", "b", "c"]})
+        self._call("tools/call", 3, {
+            "name": "kv_expire",
+            "arguments": {"key": "keep", "seconds": 300},
+        })
+        reply = self._call("tools/call", 4, {
+            "name": "kv_pfmerge",
+            "arguments": {"destination": "keep",
+                          "sources": ["plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(self._pfcount_result({"keys": ["keep"]}), 3)
+        ttl = self._call("tools/call", 5, {
+            "name": "kv_ttl", "arguments": {"key": "keep"},
+        })
+        self.assertGreater(
+            int(ttl["result"]["content"][0]["text"]), 0)
+
+    def test_kv_pfmerge_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_pfadd", "key": "p1",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_pfadd", "key": "p2",
+                 "elements": ["c", "d"]},
+                {"op": "kv_pfmerge", "destination": "pu",
+                 "sources": ["p1", "p2"]},
+                {"op": "kv_pfcount", "keys": ["pu"]},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][2]["result"], "OK")
+        self.assertEqual(summary["results"][3]["result"], 4)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pfadd", "key": "q1",
+                 "elements": ["x", "y"]},
+                {"op": "kv_pfmerge", "destination": "qu",
+                 "sources": ["q1", "p1"]},
+                {"op": "kv_pfcount", "keys": ["qu"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][1]["result"], "OK")
+        self.assertEqual(summary["results"][2]["result"], 5)
+        # Bad pfmerge arguments fail an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pfadd", "key": "q3",
+                 "elements": ["a"]},
+                {"op": "kv_pfmerge", "destination": "qu2",
+                 "sources": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "q3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # An EXEC-time WRONGTYPE is recorded as that op's error,
+        # in place, and the rest still run.
+        self._call("tools/call", 5, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        wrongtype = self._call("tools/call", 6, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pfmerge", "destination": "qu3",
+                 "sources": ["plain"]},
+                {"op": "kv_pfcount", "keys": ["qu"]},
+            ]},
+        })
+        summary = json.loads(wrongtype["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("WRONGTYPE", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 5)
 
     def test_tools_call_string_mget_mset_getdel_setnx_setex_getset(self):
         # MSET sets several keys at once; MGET reads them back in
@@ -13372,6 +13615,143 @@ class LiveCinderMigrationTests(unittest.TestCase):
         self.assertEqual(summary["ok"], 2)
         self.assertEqual(summary["results"][0]["result"], 1)
         self.assertEqual(summary["results"][1]["result"], 2)
+
+    def test_live_pfmerge(self):
+        """kv_pfmerge against a real cinder 0.56.0: PFMERGE
+        merges HyperLogLog registers into a destination key and
+        answers OK, the destination is created when missing and
+        overwritten wholesale when it exists (its old registers
+        are discarded, not unioned in, unless it is itself a
+        source) and its TTL is cleared, a missing source counts
+        as empty, merging only missing sources creates an empty
+        HyperLogLog, sources are never modified, the destination
+        may itself be a source, WRONGTYPE on a plain string and
+        on a sorted set at either end, bad arguments fail as
+        invalid params, and the command queues in a MULTI/EXEC
+        transaction. The command shipped in cinder 0.56.0."""
+        for key, prefix in (("pfm:a", "a"), ("pfm:b", "b")):
+            for start in range(0, 500, 200):
+                self.assertEqual(
+                    self._tool("kv_pfadd", {
+                        "key": key,
+                        "elements": ["%s%d" % (prefix, i)
+                                     for i in range(
+                                         start,
+                                         min(start + 200, 500))]}),
+                    1)
+        self.assertEqual(
+            self._tool("kv_pfmerge", {"destination": "pfm:u",
+                                      "sources": ["pfm:a", "pfm:b"]}),
+            "OK")
+        # Two disjoint 500-element sets merge to about 1000 —
+        # the probe measured 999 on this build.
+        union = self._tool("kv_pfcount", {"keys": ["pfm:u"]})
+        self.assertGreaterEqual(union, 900)
+        self.assertLessEqual(union, 1100)
+        # Sources are untouched.
+        self.assertEqual(
+            self._tool("kv_pfcount", {"keys": ["pfm:a"]}), 501)
+        # A missing source counts as empty.
+        self.assertEqual(
+            self._tool("kv_pfmerge", {"destination": "pfm:u2",
+                                      "sources": ["pfm:a", "ghost"]}),
+            "OK")
+        one = self._tool("kv_pfcount", {"keys": ["pfm:u2"]})
+        self.assertGreaterEqual(one, 450)
+        self.assertLessEqual(one, 550)
+        # Merging only missing sources creates an empty
+        # HyperLogLog: the key exists and counts 0.
+        self.assertEqual(
+            self._tool("kv_pfmerge", {"destination": "pfm:empty",
+                                      "sources": ["ghost", "alsogone"]}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "pfm:empty"}), 1)
+        self.assertEqual(
+            self._tool("kv_pfcount", {"keys": ["pfm:empty"]}), 0)
+        # The destination is overwritten wholesale: its old
+        # registers are discarded.
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pfm:old",
+                                    "elements": ["old%d" % i
+                                                 for i in range(10)]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_pfmerge", {"destination": "pfm:old",
+                                      "sources": ["pfm:a"]}),
+            "OK")
+        overwritten = self._tool("kv_pfcount", {"keys": ["pfm:old"]})
+        self.assertGreaterEqual(overwritten, 450)
+        self.assertLessEqual(overwritten, 550)
+        # PFMERGE clears the destination's TTL.
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pfm:ttl",
+                                    "elements": ["q"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "pfm:ttl",
+                                     "seconds": 300}),
+            1)
+        self.assertEqual(
+            self._tool("kv_pfmerge", {"destination": "pfm:ttl",
+                                      "sources": ["pfm:a"]}),
+            "OK")
+        self.assertEqual(self._tool("kv_ttl", {"key": "pfm:ttl"}), -1)
+        # The destination may itself be a source.
+        self.assertEqual(
+            self._tool("kv_pfmerge", {"destination": "pfm:a",
+                                      "sources": ["pfm:a", "pfm:b"]}),
+            "OK")
+        self_merged = self._tool("kv_pfcount", {"keys": ["pfm:a"]})
+        self.assertGreaterEqual(self_merged, 900)
+        self.assertLessEqual(self_merged, 1100)
+        # WRONGTYPE on a plain string and on a sorted set, at
+        # either end, and bad arguments fail as invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "pfm:str", "value": "hello"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_zadd", {"key": "pfm:z",
+                                   "members": {"m": 1}}),
+            1)
+        for name, arguments in (
+                ("kv_pfmerge", {"destination": "pfm:str",
+                                "sources": ["pfm:b"]}),
+                ("kv_pfmerge", {"destination": "pfm:z",
+                                "sources": ["pfm:b"]}),
+                ("kv_pfmerge", {"destination": "pfm:u3",
+                                "sources": ["pfm:str"]}),
+                ("kv_pfmerge", {"destination": "pfm:u3",
+                                "sources": ["pfm:z"]})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000,
+                             arguments)
+        for name, arguments in (
+                ("kv_pfmerge", {"destination": "pfm:u4"}),
+                ("kv_pfmerge", {"destination": "pfm:u4",
+                                "sources": []}),
+                ("kv_pfmerge", {"destination": "pfm:u4",
+                                "sources": "pfm:b"}),
+                ("kv_pfmerge", {"destination": "pfm:u4",
+                                "sources": ["pfm:b"] * 1001})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602,
+                             arguments)
+        # The command queues in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_pfmerge", "destination": "pfm:tx",
+             "sources": ["pfm:a", "pfm:b"]},
+            {"op": "kv_pfcount", "keys": ["pfm:tx"]},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], "OK")
+        self.assertGreaterEqual(summary["results"][1]["result"], 900)
+        self.assertLessEqual(summary["results"][1]["result"], 1100)
 
     def test_live_dbsize(self):
         """kv_dbsize against a real cinder 0.49.0: the key count of

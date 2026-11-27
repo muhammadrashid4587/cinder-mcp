@@ -840,6 +840,18 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_pfmerge",
+        "description": "Merge several HyperLogLogs into a destination key: PFMERGE destination source [source ...]. Takes `destination` and `sources` as a list of key names, at least one, at most 1000. Returns \"OK\". The destination is created when it does not exist and overwritten wholesale when it does — its old registers are discarded, not unioned in, unless it is itself one of the sources — and its TTL is cleared. A missing source counts as an empty set, so merging only missing sources creates an empty HyperLogLog. Sources are never modified, and the destination may itself be a source. Fails with WRONGTYPE on a key holding a container or a plain string that is not a HyperLogLog, at either end. Cinder stores the HyperLogLog as a string value with an HLL1 header, so PFMERGE never changes the key's type.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "destination": {"type": "string"},
+                "sources": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["destination", "sources"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1063,7 +1075,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1199,7 +1211,7 @@ BATCHABLE_TOOLS = {
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
-    "kv_pfadd", "kv_pfcount",
+    "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1287,7 +1299,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
-    "kv_pfadd", "kv_pfcount",
+    "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1936,6 +1948,9 @@ def _op_argv(name, args):
         return ["PFADD", key] + list(elements)
     if name == "kv_pfcount":
         return ["PFCOUNT"] + _pfcount_keys_args(args)
+    if name == "kv_pfmerge":
+        destination, sources = _pfmerge_args(args)
+        return ["PFMERGE", destination] + list(sources)
     if name == "kv_sscan":
         key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
         return ["SSCAN", key, cursor or "0", "MATCH", pattern,
@@ -2951,6 +2966,10 @@ def _call_zdiff(client, args):
 # instead of sending a half-formed PFCOUNT with a huge argv.
 MAX_PFCOUNT_KEYS = 1000
 
+# The most sources one kv_pfmerge call merges; a wider call fails
+# instead of sending a half-formed PFMERGE with a huge argv.
+MAX_PFMERGE_SOURCES = 1000
+
 
 def _pfadd_args(args):
     """Validate a kv_pfadd call: (key, elements). `key` must be a
@@ -2988,6 +3007,28 @@ def _pfcount_keys_args(args):
         if not isinstance(key, str):
             raise ValueError("kv_pfcount keys must be strings")
     return list(keys)
+
+
+def _pfmerge_args(args):
+    """Validate a kv_pfmerge call: (destination, sources).
+    `destination` must be a string and `sources` a non-empty list
+    of strings, at most MAX_PFMERGE_SOURCES; anything else fails
+    the call instead of sending a half-formed PFMERGE."""
+    destination = _require(args, "destination")
+    if not isinstance(destination, str):
+        raise ValueError("kv_pfmerge destination must be a string")
+    sources = args.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("kv_pfmerge sources must be a non-empty list")
+    if len(sources) > MAX_PFMERGE_SOURCES:
+        raise ValueError(
+            "kv_pfmerge merges at most %d sources; narrow the list"
+            % MAX_PFMERGE_SOURCES
+        )
+    for source in sources:
+        if not isinstance(source, str):
+            raise ValueError("kv_pfmerge sources must be strings")
+    return destination, list(sources)
 
 
 def _call_zincrby(client, args):
