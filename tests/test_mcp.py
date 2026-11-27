@@ -3570,17 +3570,39 @@ class FakeCinder(threading.Thread):
                         reply += self._bulk(item)
             return reply
         elif name == "XGROUP":
-            # XGROUP CREATE key group id [MKSTREAM] and XGROUP
-            # SETID key group id, as in real cinder: "$" is the top
-            # ID, "0" from the beginning, or an explicit ID;
-            # MKSTREAM creates the stream empty when it is missing.
-            # SETID moves an existing group's cursor — the pending
-            # list is untouched — and answers OK; ENTRIESREAD is
-            # not supported, so a fifth argument is a wrong-number
-            # error. Other subcommands are an error.
+            # XGROUP CREATE key group id [MKSTREAM], XGROUP
+            # SETID key group id and XGROUP DESTROY key group, as
+            # in real cinder: "$" is the top ID, "0" from the
+            # beginning, or an explicit ID; MKSTREAM creates the
+            # stream empty when it is missing. SETID moves an
+            # existing group's cursor — the pending list is
+            # untouched — and answers OK; ENTRIESREAD is not
+            # supported, so a fifth argument is a wrong-number
+            # error. DESTROY drops a whole group — cursor,
+            # consumers and pending list — and answers 1, or 0
+            # when there was no such group on the stream; the
+            # stream and its entries survive. A missing key is
+            # NOGROUP, and a non-stream key is WRONGTYPE. Other
+            # subcommands are an error.
             if len(args) < 1:
                 return ("-ERR Unknown subcommand or wrong number of "
                         "arguments for 'xgroup'\r\n")
+            if args[0].upper() == "DESTROY":
+                if len(args) != 3:
+                    return ("-ERR wrong number of arguments for "
+                            "'xgroup' command\r\n")
+                key, group = args[1], args[2]
+                value = self._get(key)
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                if value is None:
+                    return ("-ERR NOGROUP No such key '%s' or consumer "
+                            "group '%s'\r\n" % (key, group))
+                if group not in value.groups:
+                    return ":0\r\n"
+                del value.groups[group]
+                return ":1\r\n"
             if args[0].upper() == "SETID":
                 if len(args) != 4:
                     return ("-ERR wrong number of arguments for "
@@ -4144,7 +4166,7 @@ class McpTests(unittest.TestCase):
                     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen",
                     "kv_xread", "kv_xreadgroup", "kv_xpending",
                     "kv_xgroup_create", "kv_xack", "kv_xclaim",
-                    "kv_xgroup_setid",
+                    "kv_xgroup_setid", "kv_xgroup_destroy",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -9216,6 +9238,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return reply["result"]["content"][0]["text"]
 
+    def _xgroup_destroy_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xgroup_destroy", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def _xack_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_xack", "arguments": arguments,
@@ -9233,7 +9262,8 @@ class McpTests(unittest.TestCase):
     def _raw(self):
         # A raw RESP client against the fake, for the commands no
         # MCP tool covers yet — XGROUP CREATE to make a group, XGROUP
-        # SETID to move one, XACK to drop entries from a pending list.
+        # SETID to move one, XGROUP DESTROY to drop one, XACK to drop
+        # entries from a pending list.
         return RespClient("127.0.0.1", self.fake.port)
 
     def test_kv_xadd_returns_ids_and_xrange_reads_entries(self):
@@ -11156,6 +11186,184 @@ class McpTests(unittest.TestCase):
         self.assertFalse(summary["results"][5]["ok"])
         self.assertIn("NOGROUP", summary["results"][5]["error"])
 
+    def test_kv_xgroup_destroy_drops_the_group(self):
+        # Three entries and two groups from the beginning: the
+        # first group reads all three, so it has three pending
+        # entries, and the second has none. Destroying the first
+        # drops it whole — cursor, consumers and pending list —
+        # while the stream, its entries and the other group
+        # survive.
+        for entry_id, fields in (("1000-0", {"name": "alice"}),
+                                 ("1000-1", {"name": "bob"}),
+                                 ("2000-0", {"name": "carol"})):
+            self.assertEqual(
+                self._xadd_result({"key": "xgd:s", "id": entry_id,
+                                   "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgd:s", "group": "g1", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgd:s", "group": "g2", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "g1", "consumer": "c1",
+                                     "streams": {"xgd:s": ">"}}),
+            [{"key": "xgd:s",
+              "entries": [{"id": "1000-0", "fields": {"name": "alice"}},
+                          {"id": "1000-1", "fields": {"name": "bob"}},
+                          {"id": "2000-0", "fields": {"name": "carol"}}]}])
+        self.assertEqual(
+            self._xpending_result({"key": "xgd:s", "group": "g1"}),
+            {"total": 3, "min_id": "1000-0", "max_id": "2000-0",
+             "consumers": [{"consumer": "c1", "count": 3}]})
+        self.assertEqual(
+            self._xgroup_destroy_result(
+                {"key": "xgd:s", "group": "g1"}),
+            1)
+        # The group is gone: pending and reads fail with NOGROUP.
+        for name, arguments in (
+                ("kv_xpending",
+                 {"key": "xgd:s", "group": "g1"}),
+                ("kv_xreadgroup",
+                 {"group": "g1", "consumer": "c1",
+                  "streams": {"xgd:s": ">"}})):
+            reply = self._call("tools/call", 1, {
+                "name": name, "arguments": arguments,
+            })
+            self.assertIn("error", reply, name)
+            self.assertEqual(reply["error"]["code"], -32000, name)
+            self.assertIn("NOGROUP", reply["error"]["message"], name)
+        # The entries stay in the stream, and the other group is
+        # untouched: it still reads all three.
+        self.assertEqual(
+            self._xrange_result({"key": "xgd:s"}),
+            [{"id": "1000-0", "fields": {"name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "2000-0", "fields": {"name": "carol"}}])
+        self.assertEqual(
+            self._xreadgroup_result({"group": "g2", "consumer": "c1",
+                                     "streams": {"xgd:s": ">"}}),
+            [{"key": "xgd:s",
+              "entries": [{"id": "1000-0", "fields": {"name": "alice"}},
+                          {"id": "1000-1", "fields": {"name": "bob"}},
+                          {"id": "2000-0", "fields": {"name": "carol"}}]}])
+        # Destroying a group that is already gone — or never was
+        # — answers 0 instead of failing, as long as the stream
+        # exists.
+        self.assertEqual(
+            self._xgroup_destroy_result(
+                {"key": "xgd:s", "group": "g1"}),
+            0)
+        self.assertEqual(
+            self._xgroup_destroy_result(
+                {"key": "xgd:s", "group": "nope"}),
+            0)
+        # Destroying a group with nothing pending still answers
+        # 1, and the stream survives it.
+        self.assertEqual(
+            self._xgroup_destroy_result(
+                {"key": "xgd:s", "group": "g2"}),
+            1)
+        self.assertEqual(
+            self._xrange_result({"key": "xgd:s"}),
+            [{"id": "1000-0", "fields": {"name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "2000-0", "fields": {"name": "carol"}}])
+        # A missing key fails with NOGROUP, and a non-stream key
+        # with WRONGTYPE, as server errors.
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "xgd:plain", "value": "v"},
+        })
+        for arguments, marker in (
+                ({"key": "xgd:ghost", "group": "grp"}, "NOGROUP"),
+                ({"key": "xgd:plain", "group": "grp"}, "WRONGTYPE")):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xgroup_destroy", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn(marker, reply["error"]["message"], arguments)
+
+    def test_kv_xgroup_destroy_rejects_bad_arguments(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xgdr:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgdr:s", "group": "grp", "id": "0"}),
+            "OK")
+        bad = [{}, {"key": "xgdr:s"}, {"group": "grp"},
+               {"key": 1, "group": "grp"},
+               {"key": "xgdr:s", "group": 1}]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xgroup_destroy", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_kv_xgroup_destroy_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xgdb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "xgdb1", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xgroup_create", "key": "xgdb1",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgdb1": ">"}},
+                {"op": "kv_xgroup_destroy", "key": "xgdb1",
+                 "group": "grp"},
+                {"op": "kv_xpending", "key": "xgdb1",
+                 "group": "grp"},
+                {"op": "kv_xgroup_destroy", "key": "xgdb1",
+                 "group": "grp"},
+                {"op": "kv_xgroup_destroy", "key": "xgdb1",
+                 "group": "nope"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 7)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][4]["result"], 1)
+        self.assertFalse(summary["results"][5]["ok"])
+        self.assertIn("NOGROUP", summary["results"][5]["error"])
+        # Destroying the same group twice answers 1 then 0.
+        self.assertEqual(summary["results"][6]["result"], 0)
+        self.assertEqual(summary["results"][7]["result"], 0)
+        # The atomic batch queues the destroy and runs it at
+        # EXEC: the group is gone, and the NOGROUP pending read
+        # is recorded in place.
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xgdb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xgroup_create", "key": "xgdb2",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgdb2": ">"}},
+                {"op": "kv_xgroup_destroy", "key": "xgdb2",
+                 "group": "grp"},
+                {"op": "kv_xpending", "key": "xgdb2",
+                 "group": "grp"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][3]["result"], 1)
+        self.assertFalse(summary["results"][4]["ok"])
+        self.assertIn("NOGROUP", summary["results"][4]["error"])
+
     def test_prompts_get_write_safety_covers_xgroup_create_and_xack(self):
         self.assertEqual(
             self._xadd_result({"key": "ws:g2", "id": "1-0",
@@ -11482,6 +11690,80 @@ class McpTests(unittest.TestCase):
             "on stream 'ws:se' to '$', the top ID; the next '>' "
             "read delivers only entries added after it, and the "
             "pending list is untouched",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_xgroup_destroy(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:wd", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:wd", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"ws:wd": ">"}}),
+            [{"key": "ws:wd",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}}]}])
+        self.assertEqual(
+            self._xadd_result({"key": "ws:we", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:we", "group": "grp", "id": "0"}),
+            "OK")
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "ws:plain", "value": "v"},
+        })
+        plan = [
+            {"op": "kv_xgroup_destroy", "key": "ws:ghost",
+             "group": "grp"},
+            {"op": "kv_xgroup_destroy", "key": "ws:wd",
+             "group": "grp"},
+            {"op": "kv_xgroup_destroy", "key": "ws:plain",
+             "group": "grp"},
+            {"op": "kv_xgroup_destroy", "key": "ws:we",
+             "group": "grp"},
+            {"op": "kv_xgroup_destroy", "key": "ws:we",
+             "group": "nope"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 5 op(s), 5 audited, 0 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_xgroup_destroy — 'ws:ghost' would fail: no "
+            "such key or consumer group 'grp'",
+            risky,
+        )
+        self.assertIn(
+            "op 1: kv_xgroup_destroy — drops consumer group 'grp' "
+            "on stream 'ws:wd' with 1 pending entry; the entries "
+            "stay in the stream, but the group's delivery state "
+            "is gone, so the pending work would have to be "
+            "re-read through another group",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_xgroup_destroy — 'ws:plain' would fail with "
+            "WRONGTYPE: the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_xgroup_destroy — drops consumer group 'grp' "
+            "on stream 'ws:we' — its cursor and consumers; the "
+            "stream and its entries survive, and a group created "
+            "again from '0' would deliver the entries again",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 4: kv_xgroup_destroy — no-op, no such consumer "
+            "group 'nope' on stream 'ws:we'",
             safe,
         )
 

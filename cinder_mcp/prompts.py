@@ -64,7 +64,8 @@ from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
 from .tools import (MAX_GEOSEARCH_MEMBERS, MAX_XPENDING_ENTRIES,
                     _xack_args, _xadd_args, _xclaim_args,
-                    _xgroup_create_args, _xgroup_setid_args,
+                    _xgroup_create_args, _xgroup_destroy_args,
+                    _xgroup_setid_args,
                     _xreadgroup_args)
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
@@ -154,7 +155,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
     "kv_xadd", "kv_xreadgroup", "kv_xgroup_create", "kv_xack",
-    "kv_xclaim", "kv_xgroup_setid",
+    "kv_xclaim", "kv_xgroup_setid", "kv_xgroup_destroy",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -2221,6 +2222,69 @@ def _audit_xgroup_setid(client, op):
     )
 
 
+def _audit_xgroup_destroy(client, op):
+    """Audit one kv_xgroup_destroy op: the stream and the group
+    are probed live, and the pending list is read with XPENDING
+    so a destroy that would drop unacknowledged work is judged
+    against it. Destroying a group drops its cursor, its
+    consumers and its pending list — the entries stay in the
+    stream, and a group created again from "0" would deliver
+    them again, but the delivery state itself is gone. A group
+    with pending entries is risky, a group with nothing pending
+    is caution, and a group that does not exist is a safe no-op
+    answering 0. Returns (verdict, line)."""
+    key, group = _xgroup_destroy_args(op)
+    if client.command("EXISTS", key) == 0:
+        return "risky", (
+            "kv_xgroup_destroy — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        # The key expired while auditing; the destroy would fail.
+        return "risky", (
+            "kv_xgroup_destroy — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    try:
+        kind, _size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        # The key expired between the TTL read and the probe.
+        return "risky", (
+            "kv_xgroup_destroy — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    if kind != "stream":
+        return "risky", (
+            "kv_xgroup_destroy — %r would fail with WRONGTYPE: the "
+            "key is a %s of %s" % (key, kind, size)
+        )
+    try:
+        total = client.command("XPENDING", key, group)[0]
+    except RespError as exc:
+        if "NOGROUP" in str(exc):
+            return "safe", (
+                "kv_xgroup_destroy — no-op, no such consumer group "
+                "%r on stream %r" % (group, key)
+            )
+        raise
+    if total == 0:
+        return "caution", (
+            "kv_xgroup_destroy — drops consumer group %r on stream "
+            "%r — its cursor and consumers; the stream and its "
+            "entries survive, and a group created again from '0' "
+            "would deliver the entries again" % (group, key)
+        )
+    return "risky", (
+        "kv_xgroup_destroy — drops consumer group %r on stream %r "
+        "with %d pending %s; the entries stay in the stream, but "
+        "the group's delivery state is gone, so the pending work "
+        "would have to be re-read through another group"
+        % (group, key, total,
+           "entry" if total == 1 else "entries")
+    )
+
+
 def _audit_lmove(client, op):
     """Audit one kv_lmove op: the source and the destination are
     both probed live, because the move reads the source, writes the
@@ -3669,6 +3733,10 @@ def _audit_write_op(client, op):
         # XGROUP SETID moves one group's last-delivered ID, so it
         # is audited on its own.
         return _audit_xgroup_setid(client, op)
+    if name == "kv_xgroup_destroy":
+        # XGROUP DESTROY drops a whole group, so it is audited
+        # on its own.
+        return _audit_xgroup_destroy(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))
