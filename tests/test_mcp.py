@@ -3066,7 +3066,8 @@ class McpTests(unittest.TestCase):
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
                     "kv_hscan",
                     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
-                    "kv_zadd", "kv_zrange", "kv_zrangebyscore",
+                    "kv_zadd", "kv_zrange", "kv_zrevrange",
+                    "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
                     "kv_zcard",
                     "kv_zscore", "kv_zmscore",
@@ -10758,6 +10759,349 @@ class McpTests(unittest.TestCase):
         self.assertIn("1000", summary["results"][1]["error"])
         self.assertEqual(summary["results"][2]["result"], 1001)
 
+    def test_tools_call_zadd_zrevrange(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10, "bo": 20, "cy": 15,
+                                      "dan": 5, "eve": 20}},
+        })
+        # Highest score first; ties by member name in reverse
+        # (eve before bo at 20).
+        reversed_ = self._call("tools/call", 2, {
+            "name": "kv_zrevrange",
+            "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(
+            json.loads(reversed_["result"]["content"][0]["text"]),
+            ["eve", "bo", "cy", "amy", "dan"],
+        )
+        scored = self._call("tools/call", 3, {
+            "name": "kv_zrevrange",
+            "arguments": {"key": "leaderboard", "start": 1, "stop": 2,
+                          "withscores": True},
+        })
+        self.assertEqual(
+            json.loads(scored["result"]["content"][0]["text"]),
+            [{"member": "bo", "score": 20.0},
+             {"member": "cy", "score": 15.0}],
+        )
+        # Negative indices count from the end of the reversed order.
+        tail = self._call("tools/call", 4, {
+            "name": "kv_zrevrange",
+            "arguments": {"key": "leaderboard", "start": -2, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(tail["result"]["content"][0]["text"]),
+            ["amy", "dan"],
+        )
+        missing = self._call("tools/call", 5, {
+            "name": "kv_zrevrange", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_zrevrange_rejects_bad_arguments(self):
+        cases = [
+            # kv_zrevrange: bad start/stop/withscores types.
+            {"name": "kv_zrevrange",
+             "arguments": {"key": "z", "start": "0"}},
+            {"name": "kv_zrevrange",
+             "arguments": {"key": "z", "stop": 1.5}},
+            {"name": "kv_zrevrange",
+             "arguments": {"key": "z", "withscores": "yes"}},
+            {"name": "kv_zrevrange", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zrevrange_rejects_too_wide_a_range(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "z",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrevrange",
+            "arguments": {"key": "z", "start": 0, "stop": 10000},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # A negative stop over a small set is fine: the window is
+        # the set's size, not the raw index span.
+        narrow = self._call("tools/call", 3, {
+            "name": "kv_zrevrange",
+            "arguments": {"key": "z", "start": 0, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(narrow["result"]["content"][0]["text"]),
+            ["c", "b", "a"],
+        )
+
+    def test_tools_call_zrevrange_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        zrange = self._call("tools/call", 2, {
+            "name": "kv_zrevrange", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", zrange)
+
+    def test_tools_call_zrevrange_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2}},
+                {"op": "kv_zrevrange", "key": "z"},
+                {"op": "kv_zrevrange", "key": "z", "withscores": True},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], ["b", "a"])
+        self.assertEqual(summary["results"][2]["result"], [
+            {"member": "b", "score": 2.0},
+            {"member": "a", "score": 1.0},
+        ])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zrevrange", "key": "z2",
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], [
+            {"member": "x", "score": 9.0},
+            {"member": "y", "score": 3.0},
+        ])
+        # A too-wide range inside an atomic batch fails the whole
+        # call up front, before anything is queued.
+        wide = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3",
+                 "members": {"a": 1}},
+                {"op": "kv_zrevrange", "key": "z3",
+                 "start": 0, "stop": 10000},
+            ]},
+        })
+        self.assertIn("error", wide)
+        self.assertEqual(wide["error"]["code"], -32602)
+
+    def test_tools_call_zadd_zrevrangebyscore(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "leaderboard",
+                          "members": {"amy": 10, "bo": 20, "cy": 15,
+                                      "dan": 5, "eve": 20}},
+        })
+        # No bounds: the whole set, highest score first (ties by
+        # member name in reverse: eve before bo at 20).
+        whole = self._call("tools/call", 2, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard"},
+        })
+        self.assertEqual(
+            json.loads(whole["result"]["content"][0]["text"]),
+            ["eve", "bo", "cy", "amy", "dan"],
+        )
+        # Numeric bounds are inclusive by default; bounds are still
+        # given min then max.
+        bounded = self._call("tools/call", 3, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard", "min": 10, "max": 20},
+        })
+        self.assertEqual(
+            json.loads(bounded["result"]["content"][0]["text"]),
+            ["eve", "bo", "cy", "amy"],
+        )
+        # A leading '(' makes a bound exclusive.
+        exclusive = self._call("tools/call", 4, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard", "min": "(10",
+                          "max": "(20"},
+        })
+        self.assertEqual(
+            json.loads(exclusive["result"]["content"][0]["text"]),
+            ["cy"],
+        )
+        # -inf / +inf as strings mean no bound on that side.
+        open_ended = self._call("tools/call", 5, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard", "min": "-inf",
+                          "max": "15"},
+        })
+        self.assertEqual(
+            json.loads(open_ended["result"]["content"][0]["text"]),
+            ["cy", "amy", "dan"],
+        )
+        # withscores returns member/score objects.
+        scored = self._call("tools/call", 6, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard", "min": 15,
+                          "withscores": True},
+        })
+        self.assertEqual(
+            json.loads(scored["result"]["content"][0]["text"]),
+            [{"member": "eve", "score": 20.0},
+             {"member": "bo", "score": 20.0},
+             {"member": "cy", "score": 15.0}],
+        )
+        # LIMIT pages through the matches, highest first.
+        page = self._call("tools/call", 7, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard", "offset": 1,
+                          "count": 2},
+        })
+        self.assertEqual(
+            json.loads(page["result"]["content"][0]["text"]),
+            ["bo", "cy"],
+        )
+        # A range with no matches, and a missing key, both return [].
+        empty = self._call("tools/call", 8, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "leaderboard", "min": 100},
+        })
+        self.assertEqual(empty["result"]["content"][0]["text"], "[]")
+        missing = self._call("tools/call", 9, {
+            "name": "kv_zrevrangebyscore", "arguments": {"key": "ghost"},
+        })
+        self.assertEqual(missing["result"]["content"][0]["text"], "[]")
+
+    def test_tools_call_zrevrangebyscore_rejects_bad_arguments(self):
+        cases = [
+            # Bad bounds: not a number, empty exclusive, NaN, bool.
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "min": "high"}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "min": "("}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "min": "nan"}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "min": float("nan")}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "max": True}},
+            # Bad flags and paging: wrong types, negative offset,
+            # count below -1, count over the 1000-member cap.
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "withscores": "yes"}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "offset": -1}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "offset": "1"}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "count": 1.5}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "count": -2}},
+            {"name": "kv_zrevrangebyscore",
+             "arguments": {"key": "z", "count": 1001}},
+            {"name": "kv_zrevrangebyscore", "arguments": {}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_zrevrangebyscore_rejects_too_wide_a_range(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "big",
+                          "members": {"m%04d" % i: i
+                                      for i in range(1001)}},
+        })
+        # No limit over 1001 matches fails instead of truncating.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrevrangebyscore", "arguments": {"key": "big"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # The same range with an explicit count inside the cap works.
+        page = self._call("tools/call", 3, {
+            "name": "kv_zrevrangebyscore",
+            "arguments": {"key": "big", "count": 1000},
+        })
+        self.assertEqual(
+            len(json.loads(page["result"]["content"][0]["text"])), 1000,
+        )
+
+    def test_tools_call_zrevrangebyscore_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zrevrangebyscore", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+
+    def test_tools_call_zrevrangebyscore_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zadd", "key": "z",
+                 "members": {"a": 1, "b": 2, "c": 3}},
+                {"op": "kv_zrevrangebyscore", "key": "z",
+                 "min": 2},
+                {"op": "kv_zrevrangebyscore", "key": "z",
+                 "min": "(1", "max": 3, "withscores": True},
+                {"op": "kv_zrevrangebyscore", "key": "z",
+                 "offset": 1, "count": 1},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], ["c", "b"])
+        self.assertEqual(summary["results"][2]["result"], [
+            {"member": "c", "score": 3.0},
+            {"member": "b", "score": 2.0},
+        ])
+        self.assertEqual(summary["results"][3]["result"], ["b"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"x": 9, "y": 3}},
+                {"op": "kv_zrevrangebyscore", "key": "z2",
+                 "withscores": True},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], [
+            {"member": "x", "score": 9.0},
+            {"member": "y", "score": 3.0},
+        ])
+        # A too-wide range inside an atomic batch is recorded as
+        # that op's error in place, while the rest still run.
+        wide = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "big",
+                 "members": {"m%04d" % i: i for i in range(1001)}},
+                {"op": "kv_zrevrangebyscore", "key": "big"},
+                {"op": "kv_zcard", "key": "big"},
+            ]},
+        })
+        summary = json.loads(wide["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], 1001)
+        self.assertFalse(summary["results"][1]["ok"])
+        self.assertIn("1000", summary["results"][1]["error"])
+        self.assertEqual(summary["results"][2]["result"], 1001)
+
     def test_tools_call_zrangebylex(self):
         self._call("tools/call", 1, {
             "name": "kv_zadd",
@@ -13009,9 +13353,11 @@ class McpTests(unittest.TestCase):
              "member2": "y"},
             {"op": "kv_geopos", "key": "a", "members": ["x"]},
             {"op": "kv_geohash", "key": "a", "members": ["x"]},
+            {"op": "kv_zrevrange", "key": "a"},
+            {"op": "kv_zrevrangebyscore", "key": "a"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 21 op(s), 1 audited, 20 not audited.", text)
+        self.assertIn("Plan: 23 op(s), 1 audited, 22 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -13032,6 +13378,9 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 18: kv_geodist is a read, not a write", text)
         self.assertIn("op 19: kv_geopos is a read, not a write", text)
         self.assertIn("op 20: kv_geohash is a read, not a write", text)
+        self.assertIn("op 21: kv_zrevrange is a read, not a write", text)
+        self.assertIn(
+            "op 22: kv_zrevrangebyscore is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
