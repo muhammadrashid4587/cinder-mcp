@@ -5,6 +5,7 @@ fragments, as the MCP spec requires for tools/list.
 """
 
 import hashlib
+import math
 
 from .resp import RespError
 from .scan import (
@@ -852,6 +853,56 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_geoadd",
+        "description": "Add members with coordinates to a geo set: GEOADD key longitude latitude member [longitude latitude member ...]. Takes `members` as an object mapping member names to [longitude, latitude] pairs. Longitude is -180 to 180, latitude -85.05112878 to 85.05112878, as in Redis. Returns the number of members newly added; re-adding a member at its current coordinates is a no-op (0), and moving a member to new coordinates returns 0 added but updates its position. Every coordinate is checked before anything is applied, so a bad one fails the whole call with nothing written. Cinder stores the set as a sorted set of 52-bit geohash scores, so it reads back as a zset (ZRANGE, ZSCORE, ZCARD all work on it), and preserves the key's TTL. Cinder has no NX / XX / CH options for GEOADD, so the tool does not offer them. Fails with WRONGTYPE on a key holding anything but a sorted set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "object"},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
+        "name": "kv_geodist",
+        "description": "The distance between two members of a geo set: GEODIST key member1 member2 [m | km | ft | mi]. Returns the distance as a number in the requested unit (\"m\" by default), or null when the key or either member does not exist. Cinder answers with four decimals, so the distance is rounded to four decimal places in the requested unit. The distance is the Haversine distance between the centres of the members' geohash cells, as in Redis, not between the coordinates as given. Fails with WRONGTYPE on a key holding anything but a sorted set, and with a bad unit even when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member1": {"type": "string"},
+                "member2": {"type": "string"},
+                "unit": {"type": "string"},
+            },
+            "required": ["key", "member1", "member2"],
+        },
+    },
+    {
+        "name": "kv_geopos",
+        "description": "The positions of several members of a geo set: GEOPOS key member [member ...]. Takes `members` as a list of member names, at most 1000. Returns the positions in the same order as a list of {\"longitude\": ..., \"latitude\": ...} objects, with null for a member that is not in the set — and null for every member when the key does not exist. The coordinates are the centres of the members' geohash cells, as in Redis, so they come back a hair off the coordinates as given. A member whose score does not decode as a geohash (a member added with ZADD holding a score of 0, a negative score, NaN, or 2^64 or more) also answers null. Fails with WRONGTYPE on a key holding anything but a sorted set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
+        "name": "kv_geohash",
+        "description": "The geohash strings of several members of a geo set: GEOHASH key member [member ...]. Takes `members` as a list of member names, at most 1000. Returns the 11-character base32 geohash strings in the same order, with null for a member that is not in the set — and null for every member when the key does not exist. The string is re-encoded from the centre of the member's geohash cell over the standard [-90, 90] latitude range, as in Redis, and its eleventh character is always \"0\": 52 bits cannot fill 55, so the last five are assumed zero. A member whose score does not decode as a geohash (a member added with ZADD holding a score of 0, a negative score, NaN, or 2^64 or more) also answers null. Fails with WRONGTYPE on a key holding anything but a sorted set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "members"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1075,7 +1126,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1212,6 +1263,7 @@ BATCHABLE_TOOLS = {
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
+    "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1300,6 +1352,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
+    "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1515,6 +1568,16 @@ def _call_batch_atomic(client, ops):
             # ZSCORE came back as a bulk score string (or nil) inside
             # the transaction; parse it like the standalone tool does.
             value = None if reply is None else float(reply)
+        elif op_name == "kv_geodist":
+            # GEODIST came back as a bulk distance string (or nil)
+            # inside the transaction; parse it like the standalone
+            # tool does.
+            value = None if reply is None else float(reply)
+        elif op_name == "kv_geopos":
+            # GEOPOS came back as a list of [longitude, latitude]
+            # pairs (or nulls) inside the transaction; shape it
+            # like the standalone tool does.
+            value = _geopos_result(reply)
         elif op_name == "kv_zmscore":
             # ZMSCORE came back as a list of bulk score strings (or
             # nils) inside the transaction; shape it like the
@@ -1951,6 +2014,21 @@ def _op_argv(name, args):
     if name == "kv_pfmerge":
         destination, sources = _pfmerge_args(args)
         return ["PFMERGE", destination] + list(sources)
+    if name == "kv_geoadd":
+        key, triples = _geoadd_args(args)
+        argv = ["GEOADD", key]
+        for member, longitude, latitude in triples:
+            argv += [repr(longitude), repr(latitude), member]
+        return argv
+    if name == "kv_geodist":
+        key, member1, member2, unit = _geodist_args(args)
+        if unit == "m":
+            return ["GEODIST", key, member1, member2]
+        return ["GEODIST", key, member1, member2, unit]
+    if name == "kv_geopos":
+        return ["GEOPOS", _require(args, "key")] + _geo_members_args(args, name)
+    if name == "kv_geohash":
+        return ["GEOHASH", _require(args, "key")] + _geo_members_args(args, name)
     if name == "kv_sscan":
         key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
         return ["SSCAN", key, cursor or "0", "MATCH", pattern,
@@ -2740,6 +2818,45 @@ def _call_zscore(client, args):
     return None if reply is None else float(reply)
 
 
+def _geopos_result(reply):
+    """Shape a GEOPOS reply into the tool's return value: one
+    {"longitude": ..., "latitude": ...} object per member, in
+    request order, or null for a member that is not in the set —
+    and for a member whose score does not decode as a geohash
+    (cinder replies with a null array for those)."""
+    positions = []
+    for pair in (reply or []):
+        if pair is None:
+            positions.append(None)
+        else:
+            positions.append({
+                "longitude": float(pair[0]),
+                "latitude": float(pair[1]),
+            })
+    return positions
+
+
+def _call_geodist(client, args):
+    """kv_geodist: the distance as a number in the requested unit,
+    or null when the key or either member does not exist (cinder
+    replies nil). Cinder answers with four decimals, so the number
+    carries that rounding."""
+    reply = client.command(*_op_argv("kv_geodist", args))
+    return None if reply is None else float(reply)
+
+
+def _call_geopos(client, args):
+    """kv_geopos: the members' positions in request order, with
+    null for a member that is not in the set."""
+    return _geopos_result(client.command(*_op_argv("kv_geopos", args)))
+
+
+def _call_geohash(client, args):
+    """kv_geohash: the members' geohash strings in request order,
+    with null for a member that is not in the set."""
+    return list(client.command(*_op_argv("kv_geohash", args)) or [])
+
+
 def _zmscore_result(reply):
     """Shape a ZMSCORE reply into the tool's return value: one score
     per member, in request order, as a number, or null for a member
@@ -3029,6 +3146,113 @@ def _pfmerge_args(args):
         if not isinstance(source, str):
             raise ValueError("kv_pfmerge sources must be strings")
     return destination, list(sources)
+
+
+# Longitude and latitude bounds for GEOADD, as in Redis: longitude
+# is -180 to 180, latitude -85.05112878 to 85.05112878 — the
+# Mercator limit, not -90 to 90.
+GEO_LON_MIN = -180.0
+GEO_LON_MAX = 180.0
+GEO_LAT_MIN = -85.05112878
+GEO_LAT_MAX = 85.05112878
+
+# The units kv_geodist accepts, as in Redis.
+GEO_UNITS = ("m", "km", "ft", "mi")
+
+# The most members one kv_geopos / kv_geohash call reads; a wider
+# call fails instead of sending a half-formed GEOPOS with a huge
+# argv.
+MAX_GEO_MEMBERS = 1000
+
+
+def _geo_coordinate(value, name):
+    """One GEOADD coordinate as a number: finite, in range, and not
+    a boolean (True is an int in Python, but it is not a
+    coordinate). Anything else fails the call instead of sending a
+    half-formed GEOADD."""
+    low, high = (GEO_LON_MIN, GEO_LON_MAX) if name == "longitude" \
+        else (GEO_LAT_MIN, GEO_LAT_MAX)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("kv_geoadd %s must be a number" % name)
+    if not math.isfinite(value):
+        raise ValueError("kv_geoadd %s must be finite" % name)
+    if value < low or value > high:
+        raise ValueError(
+            "kv_geoadd %s must be between %s and %s, got %r"
+            % (name, low, high, value)
+        )
+    return value
+
+
+def _geoadd_args(args):
+    """Validate a kv_geoadd call: (key, [(member, lon, lat), ...]).
+    `members` must be a non-empty object mapping member names to
+    [longitude, latitude] pairs; anything else fails the call
+    instead of sending a half-formed GEOADD. The triples come back
+    in the object's order, which is the order cinder adds them —
+    and cinder checks every coordinate before applying any of
+    them, so a bad one fails the whole call with nothing written."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_geoadd key must be a string")
+    members = args.get("members")
+    if not isinstance(members, dict) or not members:
+        raise ValueError("kv_geoadd members must be a non-empty object")
+    triples = []
+    for member, pair in members.items():
+        if not isinstance(member, str):
+            raise ValueError("kv_geoadd members must be strings")
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                "kv_geoadd member %r must be a [longitude, latitude] "
+                "pair" % (member,)
+            )
+        longitude = _geo_coordinate(pair[0], "longitude")
+        latitude = _geo_coordinate(pair[1], "latitude")
+        triples.append((member, longitude, latitude))
+    return key, triples
+
+
+def _geodist_args(args):
+    """Validate a kv_geodist call: (key, member1, member2, unit).
+    `unit` defaults to "m" and must be one of "m", "km", "ft",
+    "mi" in any case; anything else fails the call instead of
+    sending a half-formed GEODIST."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_geodist key must be a string")
+    member1 = _require(args, "member1")
+    if not isinstance(member1, str):
+        raise ValueError("kv_geodist member1 must be a string")
+    member2 = _require(args, "member2")
+    if not isinstance(member2, str):
+        raise ValueError("kv_geodist member2 must be a string")
+    unit = args.get("unit", "m")
+    if not isinstance(unit, str) or unit.lower() not in GEO_UNITS:
+        raise ValueError(
+            "kv_geodist unit must be one of %s, got %r"
+            % (", ".join(GEO_UNITS), unit)
+        )
+    return key, member1, member2, unit.lower()
+
+
+def _geo_members_args(args, name):
+    """Validate a kv_geopos / kv_geohash call: the member names.
+    `members` must be a non-empty list of strings, at most
+    MAX_GEO_MEMBERS; anything else fails the call instead of
+    sending a half-formed GEOPOS or GEOHASH."""
+    members = args.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("%s members must be a non-empty list" % name)
+    if len(members) > MAX_GEO_MEMBERS:
+        raise ValueError(
+            "%s reads at most %d members; narrow the list"
+            % (name, MAX_GEO_MEMBERS)
+        )
+    for member in members:
+        if not isinstance(member, str):
+            raise ValueError("%s members must be strings" % name)
+    return list(members)
 
 
 def _call_zincrby(client, args):
@@ -3680,4 +3904,10 @@ def _call_single(client, name, args):
         return _call_zpop(client, args, name)
     if name == "kv_zrandmember":
         return _call_zrandmember(client, args)
+    if name == "kv_geodist":
+        return _call_geodist(client, args)
+    if name == "kv_geopos":
+        return _call_geopos(client, args)
+    if name == "kv_geohash":
+        return _call_geohash(client, args)
     return client.command(*_op_argv(name, args))

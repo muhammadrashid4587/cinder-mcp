@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -14,6 +14,7 @@ value so the per-key resource's type probing can be exercised.
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import shutil
@@ -70,6 +71,100 @@ class HLL:
 
     def __init__(self):
         self.elements = set()
+
+
+# The 52-bit geohash Redis stores as a sorted-set score: 26
+# latitude bits and 26 longitude bits interleaved, latitude in the
+# even bit positions, longitude in the odd ones — the same layout
+# cinder's store.c uses. Latitude is -85.05112878 to 85.05112878
+# (the Mercator limit), longitude -180 to 180.
+_GEO_LAT_MIN = -85.05112878
+_GEO_LAT_MAX = 85.05112878
+_GEO_EARTH_RADIUS = 6372797.560856  # metres, as in Redis
+_GEO_ALPHABET = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def _geo_encode(lon, lat, lat_min=_GEO_LAT_MIN, lat_max=_GEO_LAT_MAX):
+    """The 52-bit geohash of a coordinate pair over a latitude
+    range: each axis scaled to a 26-bit fixed-point value over its
+    range (truncated, as in Redis), then interleaved with latitude
+    in the even bit positions and longitude in the odd ones."""
+    ilat = int((lat - lat_min) / (lat_max - lat_min) * (1 << 26))
+    ilon = int((lon + 180.0) / 360.0 * (1 << 26))
+    h = 0
+    for i in range(26):
+        h |= ((ilat >> i) & 1) << (2 * i)
+        h |= ((ilon >> i) & 1) << (2 * i + 1)
+    return h
+
+
+def _geo_decode(h):
+    """The centre of the geohash cell a hash names, as in Redis's
+    geohashDecode: the decoded coordinate is the cell centre, not
+    the coordinate that was encoded."""
+    ilat = 0
+    ilon = 0
+    for i in range(26):
+        ilat |= ((h >> (2 * i)) & 1) << i
+        ilon |= ((h >> (2 * i + 1)) & 1) << i
+    lat = _GEO_LAT_MIN + (ilat + 0.5) * (
+        _GEO_LAT_MAX - _GEO_LAT_MIN) / (1 << 26)
+    lon = -180.0 + (ilon + 0.5) * 360.0 / (1 << 26)
+    return lon, lat
+
+
+def _geo_score_to_hash(score):
+    """A sorted-set score as a geohash, as in cinder: scores
+    GEOADD writes are 52-bit integers, but a plain sorted set can
+    hold any double, so clamp before the cast — a negative score
+    or NaN becomes 0, a score of 2^52 or more becomes 2^52 - 1."""
+    if isinstance(score, float) and score != score:
+        return 0
+    if score < 0:
+        return 0
+    if score >= (1 << 52):
+        return (1 << 52) - 1
+    return int(score)
+
+
+def _geo_decode_score(score):
+    """Decode a sorted-set score as a geohash, as in cinder: NaN,
+    a negative score, a score of 2^64 or more, and a score of
+    exactly 0 all fail to decode, so a member holding such a score
+    has no position. Returns (longitude, latitude) or None."""
+    if isinstance(score, float) and score != score:
+        return None
+    if score < 0 or score >= (1 << 64) or score == 0:
+        return None
+    return _geo_decode(int(score))
+
+
+def _geo_hash_string(h):
+    """The 11-character base32 geohash string of a 52-bit hash, as
+    in Redis: the first ten characters take five bits each from
+    the top of the hash, and the eleventh is always '0' — 52 bits
+    cannot fill 55, so the last five are assumed zero."""
+    out = ""
+    for i in range(10):
+        out += _GEO_ALPHABET[(h >> (52 - 5 * (i + 1))) & 31]
+    return out + "0"
+
+
+def _geo_distance_m(lon1, lat1, lon2, lat2):
+    """Haversine distance in metres, as in Redis's
+    geohashGetDistance. The sqrt argument is clamped to 1:
+    antipodal points can round a hair past it, and asin of that
+    is NaN."""
+    lat1r = math.radians(lat1)
+    lon1r = math.radians(lon1)
+    lat2r = math.radians(lat2)
+    lon2r = math.radians(lon2)
+    u = math.sin((lat2r - lat1r) / 2.0)
+    v = math.sin((lon2r - lon1r) / 2.0)
+    a = u * u + math.cos(lat1r) * math.cos(lat2r) * v * v
+    if a > 1.0:
+        a = 1.0
+    return 2.0 * _GEO_EARTH_RADIUS * math.asin(math.sqrt(a))
 
 
 class FakeCinder(threading.Thread):
@@ -1405,6 +1500,127 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     out += self._bulk(repr(first[member]))
             return out
+        elif name == "GEOADD" and len(args) >= 4 \
+                and (len(args) - 1) % 3 == 0:
+            # GEOADD key longitude latitude member [...]: the
+            # members are stored in a sorted set with 52-bit
+            # geohash scores, as in real cinder. Every coordinate
+            # is parsed before any member is added, so a bad one
+            # fails the whole call with nothing written. A re-add
+            # at the same coordinates is a no-op; moving a member
+            # returns 0 added. The key's expiry is preserved: the
+            # stored tuple is only replaced when the key is
+            # created.
+            coords = []
+            for k in range(1, len(args), 3):
+                try:
+                    lon = float(args[k])
+                    lat = float(args[k + 1])
+                except ValueError:
+                    return "-ERR value is not a valid float\r\n"
+                if lon != lon or lat != lat:
+                    return "-ERR value is not a valid float\r\n"
+                if lon < -180.0 or lon > 180.0 \
+                        or lat < _GEO_LAT_MIN or lat > _GEO_LAT_MAX:
+                    return ("-ERR invalid longitude,latitude pair "
+                            "%s,%s\r\n" % (args[k], args[k + 1]))
+                coords.append((lon, lat, args[k + 2]))
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            added = 0
+            for lon, lat, member in coords:
+                score = _geo_encode(lon, lat)
+                if value is None:
+                    value = ZSet()
+                    self.store[args[0]] = (value, None)
+                if member in value.members \
+                        and value.members[member] == score:
+                    continue
+                if member not in value.members:
+                    added += 1
+                value.members[member] = score
+            return ":%d\r\n" % added
+        elif name == "GEODIST" and 3 <= len(args) <= 4:
+            # GEODIST key member1 member2 [m|km|ft|mi]: the
+            # Haversine distance between the centres of the
+            # members' geohash cells, as a bulk string with four
+            # decimals. The unit is checked first, as in Redis: a
+            # bad unit is an error even when the key is missing.
+            # A missing key or member answers nil.
+            factors = {"m": 1.0, "km": 0.001,
+                       "ft": 3.280839895013123,
+                       "mi": 0.000621371192237334}
+            factor = 1.0
+            if len(args) == 4:
+                unit = args[3].lower()
+                if unit not in factors:
+                    return ("-ERR unsupported unit provided. please "
+                            "use m, km, ft, mi\r\n")
+                factor = factors[unit]
+            value = self._get(args[0])
+            if value is None:
+                return self._bulk(None)
+            if not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            if args[1] not in value.members \
+                    or args[2] not in value.members:
+                return self._bulk(None)
+            lon1, lat1 = _geo_decode(
+                _geo_score_to_hash(value.members[args[1]]))
+            lon2, lat2 = _geo_decode(
+                _geo_score_to_hash(value.members[args[2]]))
+            return self._bulk(
+                "%.4f" % (_geo_distance_m(lon1, lat1, lon2, lat2)
+                          * factor))
+        elif name == "GEOPOS" and len(args) >= 2:
+            # GEOPOS key member [member ...]: one [longitude,
+            # latitude] pair per member, as bulk strings, with a
+            # null array for a member that is not in the set — and
+            # for one whose score does not decode as a geohash (0,
+            # negative, NaN, or 2^64 or more), as in real cinder.
+            # A missing key answers null for every member.
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            out = "*%d\r\n" % (len(args) - 1)
+            for member in args[1:]:
+                pos = None
+                if value is not None and member in value.members:
+                    pos = _geo_decode_score(value.members[member])
+                if pos is None:
+                    out += "*-1\r\n"
+                else:
+                    lon, lat = pos
+                    out += ("*2\r\n" + self._bulk(repr(lon))
+                            + self._bulk(repr(lat)))
+            return out
+        elif name == "GEOHASH" and len(args) >= 2:
+            # GEOHASH key member [member ...]: one 11-character
+            # base32 geohash string per member, with null for a
+            # member that is not in the set or whose score does not
+            # decode as a geohash. The string is re-encoded from
+            # the centre of the member's geohash cell over the
+            # standard [-90, 90] latitude range, as in real cinder,
+            # and its eleventh character is always '0'.
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, ZSet):
+                return ("-WRONGTYPE Operation against a key holding the "
+                        "wrong kind of value\r\n")
+            out = "*%d\r\n" % (len(args) - 1)
+            for member in args[1:]:
+                pos = None
+                if value is not None and member in value.members:
+                    pos = _geo_decode_score(value.members[member])
+                if pos is None:
+                    out += self._bulk(None)
+                else:
+                    out += self._bulk(_geo_hash_string(
+                        _geo_encode(pos[0], pos[1], -90.0, 90.0)))
+            return out
         elif name == "PFADD" and len(args) >= 2:
             # PFADD key element [element ...]: 1 when at least one
             # register moved, 0 when every element was already
@@ -2322,6 +2538,7 @@ class McpTests(unittest.TestCase):
                     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
                     "kv_zdiff",
                     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
+                    "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -5283,6 +5500,434 @@ class McpTests(unittest.TestCase):
         self.assertFalse(summary["results"][0]["ok"])
         self.assertIn("WRONGTYPE", summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 5)
+
+    def _geoadd_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_geoadd", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _geodist_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_geodist", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _geopos_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_geopos", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _geohash_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_geohash", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_geoadd_returns_added_count_and_moves_members(self):
+        # The Redis-documented Sicily example: Palermo and Catania.
+        self.assertEqual(
+            self._geoadd_result({"key": "sicily", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }}), 2)
+        # Re-adding at the same coordinates is a no-op.
+        self.assertEqual(
+            self._geoadd_result({"key": "sicily", "members": {
+                "Palermo": [13.361389, 38.115556],
+            }}), 0)
+        # Moving a member returns 0 added, but its position changes.
+        self.assertEqual(
+            self._geoadd_result({"key": "sicily", "members": {
+                "Palermo": [13.5, 38.2],
+            }}), 0)
+        pos = self._geopos_result(
+            {"key": "sicily", "members": ["Palermo"]})
+        self.assertAlmostEqual(pos[0]["longitude"], 13.5, places=4)
+        self.assertAlmostEqual(pos[0]["latitude"], 38.2, places=4)
+        # Move it back for the distance checks below.
+        self.assertEqual(
+            self._geoadd_result({"key": "sicily", "members": {
+                "Palermo": [13.361389, 38.115556],
+            }}), 0)
+        # The geo set is a sorted set of geohash scores: ZCARD
+        # counts the members, and ZSCORE reads the Palermo score
+        # back as the 52-bit geohash.
+        self.assertEqual(
+            self._call("tools/call", 2, {
+                "name": "kv_zcard", "arguments": {"key": "sicily"},
+            })["result"]["content"][0]["text"], "2")
+        score = self._call("tools/call", 3, {
+            "name": "kv_zscore",
+            "arguments": {"key": "sicily", "member": "Palermo"},
+        })
+        self.assertEqual(
+            float(score["result"]["content"][0]["text"]),
+            3479099956230698)
+        # GEOADD preserves the TTL.
+        self._call("tools/call", 4, {
+            "name": "kv_expire",
+            "arguments": {"key": "sicily", "seconds": 300},
+        })
+        self.assertEqual(
+            self._geoadd_result({"key": "sicily", "members": {
+                "Messina": [15.55, 38.19],
+            }}), 1)
+        ttl = self._call("tools/call", 5, {
+            "name": "kv_ttl", "arguments": {"key": "sicily"},
+        })
+        self.assertGreater(
+            int(ttl["result"]["content"][0]["text"]), 0)
+
+    def test_kv_geoadd_rejects_bad_arguments(self):
+        for bad in ({"key": "g"},
+                    {"key": "g", "members": {}},
+                    {"key": "g", "members": []},
+                    {"key": "g", "members": {"a": [13.3]}},
+                    {"key": "g", "members": {"a": [13.3, 38.1, 0]}},
+                    {"key": "g", "members": {"a": ["13.3", 38.1]}},
+                    {"key": "g", "members": {"a": [13.3, "38.1"]}},
+                    {"key": "g", "members": {"a": [True, 38.1]}},
+                    {"key": "g", "members": {"a": [200, 38.1]}},
+                    {"key": "g", "members": {"a": [-180.1, 38.1]}},
+                    {"key": "g", "members": {"a": [13.3, 90]}},
+                    {"key": "g", "members": {"a": [13.3, -85.05112879]}},
+                    {"key": 1, "members": {"a": [13.3, 38.1]}},
+                    {"members": {"a": [13.3, 38.1]}}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_geoadd",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        # A bad coordinate fails the whole call: a good member in
+        # the same call is not written either.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "g2", "members": {
+                "good": [13.3, 38.1],
+                "bad": [200, 38.1],
+            }},
+        })
+        self.assertIn("error", reply)
+        exists = self._call("tools/call", 3, {
+            "name": "kv_exists", "arguments": {"key": "g2"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+
+    def test_kv_geoadd_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"f": "v"}},
+        })
+        for key in ("plain", "h"):
+            reply = self._call("tools/call", 3, {
+                "name": "kv_geoadd",
+                "arguments": {"key": key,
+                              "members": {"a": [13.3, 38.1]}},
+            })
+            self.assertIn("error", reply, key)
+
+    def test_kv_geodist_returns_distance_in_each_unit(self):
+        self._geoadd_result({"key": "sicily", "members": {
+            "Palermo": [13.361389, 38.115556],
+            "Catania": [15.087269, 37.502669],
+        }})
+        # The distance is between the geohash cell centres, as in
+        # Redis — the same numbers the live cinder returns.
+        self.assertEqual(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Palermo",
+                                  "member2": "Catania"}),
+            166274.1516)
+        self.assertEqual(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Palermo",
+                                  "member2": "Catania",
+                                  "unit": "km"}),
+            166.2742)
+        self.assertEqual(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Palermo",
+                                  "member2": "Catania",
+                                  "unit": "mi"}),
+            103.318)
+        self.assertEqual(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Palermo",
+                                  "member2": "Catania",
+                                  "unit": "ft"}),
+            545518.87)
+        # Units are case-insensitive, and the distance is symmetric.
+        self.assertEqual(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Catania",
+                                  "member2": "Palermo",
+                                  "unit": "KM"}),
+            166.2742)
+        # A member to itself is 0, and a missing member or key is
+        # null, not an error.
+        self.assertEqual(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Palermo",
+                                  "member2": "Palermo"}),
+            0.0)
+        self.assertIsNone(
+            self._geodist_result({"key": "sicily",
+                                  "member1": "Palermo",
+                                  "member2": "Ghost"}))
+        self.assertIsNone(
+            self._geodist_result({"key": "ghost",
+                                  "member1": "Palermo",
+                                  "member2": "Catania"}))
+        # A bad unit fails even when the key does not exist.
+        for arguments in ({"key": "ghost", "member1": "a",
+                           "member2": "b", "unit": "parsec"},
+                          {"key": "sicily", "member1": "Palermo",
+                           "member2": "Catania", "unit": "m2"},
+                          {"key": "sicily", "member1": "Palermo",
+                           "member2": "Catania", "unit": 5}):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_geodist",
+                "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_kv_geodist_rejects_bad_arguments(self):
+        self._geoadd_result({"key": "sicily", "members": {
+            "Palermo": [13.361389, 38.115556],
+        }})
+        for bad in ({"key": "sicily", "member1": "Palermo"},
+                    {"key": "sicily", "member2": "Palermo"},
+                    {"member1": "Palermo", "member2": "Palermo"},
+                    {"key": "sicily", "member1": 1,
+                     "member2": "Palermo"},
+                    {"key": "sicily", "member1": "Palermo",
+                     "member2": "Palermo", "unit": "yards"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_geodist",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_geopos_returns_cell_centres(self):
+        self._geoadd_result({"key": "sicily", "members": {
+            "Palermo": [13.361389, 38.115556],
+            "Catania": [15.087269, 37.502669],
+        }})
+        # The positions are the geohash cell centres, a hair off
+        # the coordinates as given — the same centres the live
+        # cinder returns.
+        positions = self._geopos_result(
+            {"key": "sicily",
+             "members": ["Palermo", "Catania", "Ghost"]})
+        self.assertAlmostEqual(
+            positions[0]["longitude"], 13.361389338970184, places=9)
+        self.assertAlmostEqual(
+            positions[0]["latitude"], 38.115556395496299, places=9)
+        self.assertAlmostEqual(
+            positions[1]["longitude"], 15.087267458438873, places=9)
+        self.assertAlmostEqual(
+            positions[1]["latitude"], 37.502668423331613, places=9)
+        self.assertIsNone(positions[2])
+        # A missing key answers null for every member.
+        self.assertEqual(
+            self._geopos_result({"key": "ghost",
+                                 "members": ["a", "b"]}),
+            [None, None])
+        # A member added with ZADD holding a score of 0 has no
+        # position: its score does not decode as a geohash.
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "flat",
+                          "members": {"zero": 0, "one": 1}},
+        })
+        self.assertEqual(
+            self._geopos_result({"key": "flat",
+                                 "members": ["zero", "one"]}),
+            [None, {"longitude": -179.99999731779099,
+                    "latitude": -85.05112497791826}])
+
+    def test_kv_geohash_returns_standard_hashes(self):
+        self._geoadd_result({"key": "sicily", "members": {
+            "Palermo": [13.361389, 38.115556],
+            "Catania": [15.087269, 37.502669],
+        }})
+        # The same 11-character strings the live cinder returns:
+        # re-encoded from the cell centres over [-90, 90], with
+        # the eleventh character always '0'.
+        self.assertEqual(
+            self._geohash_result(
+                {"key": "sicily",
+                 "members": ["Palermo", "Catania", "Ghost"]}),
+            ["sqc8b49rny0", "sqdtr74hyu0", None])
+        # A missing key answers null for every member.
+        self.assertEqual(
+            self._geohash_result({"key": "ghost",
+                                  "members": ["a", "b"]}),
+            [None, None])
+        # A member added with ZADD holding a score of 0 has no
+        # geohash either.
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "flat", "members": {"zero": 0}},
+        })
+        self.assertEqual(
+            self._geohash_result({"key": "flat",
+                                  "members": ["zero"]}),
+            [None])
+
+    def test_kv_geopos_geohash_reject_bad_arguments(self):
+        self._geoadd_result({"key": "sicily", "members": {
+            "Palermo": [13.361389, 38.115556],
+        }})
+        for name in ("kv_geopos", "kv_geohash"):
+            for bad in ({"key": "sicily"},
+                        {"key": "sicily", "members": []},
+                        {"key": "sicily", "members": "Palermo"},
+                        {"key": "sicily", "members": [1]},
+                        {"key": "sicily", "members": ["Palermo", 2]},
+                        {"key": "sicily",
+                         "members": ["Palermo"] * 1001},
+                        {"members": ["Palermo"]}):
+                reply = self._call("tools/call", 1, {
+                    "name": name,
+                    "arguments": bad,
+                })
+                self.assertIn("error", reply, (name, bad))
+                self.assertEqual(reply["error"]["code"], -32602,
+                                 (name, bad))
+
+    def test_kv_geo_reads_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"f": "v"}},
+        })
+        for key in ("plain", "h"):
+            for name, arguments in (
+                    ("kv_geodist", {"key": key, "member1": "a",
+                                    "member2": "b"}),
+                    ("kv_geopos", {"key": key, "members": ["a"]}),
+                    ("kv_geohash", {"key": key, "members": ["a"]})):
+                reply = self._call("tools/call", 3, {
+                    "name": name,
+                    "arguments": arguments,
+                })
+                self.assertIn("error", reply, (name, key))
+
+    def test_kv_geo_tools_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_geoadd", "key": "b1", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                {"op": "kv_geodist", "key": "b1",
+                 "member1": "Palermo", "member2": "Catania",
+                 "unit": "km"},
+                {"op": "kv_geopos", "key": "b1",
+                 "members": ["Palermo", "Ghost"]},
+                {"op": "kv_geohash", "key": "b1",
+                 "members": ["Palermo", "Catania"]},
+                {"op": "kv_geoadd", "key": "b1", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                }},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 166.2742)
+        self.assertAlmostEqual(
+            summary["results"][2]["result"][0]["longitude"],
+            13.361389338970184, places=9)
+        self.assertIsNone(summary["results"][2]["result"][1])
+        self.assertEqual(summary["results"][3]["result"],
+                         ["sqc8b49rny0", "sqdtr74hyu0"])
+        self.assertEqual(summary["results"][4]["result"], 0)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b2", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                {"op": "kv_geodist", "key": "b2",
+                 "member1": "Palermo", "member2": "Catania"},
+                {"op": "kv_geopos", "key": "b2",
+                 "members": ["Catania"]},
+                {"op": "kv_geohash", "key": "b2",
+                 "members": ["Catania", "Ghost"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 166274.1516)
+        self.assertAlmostEqual(
+            summary["results"][2]["result"][0]["latitude"],
+            37.502668423331613, places=9)
+        self.assertEqual(summary["results"][3]["result"],
+                         ["sqdtr74hyu0", None])
+        # Bad geoadd arguments fail an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b3", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                }},
+                {"op": "kv_geodist", "key": "b3",
+                 "member1": "Palermo", "member2": "Catania",
+                 "unit": "parsec"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "b3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # An EXEC-time WRONGTYPE is recorded as that op's error,
+        # in place, and the rest still run.
+        self._call("tools/call", 5, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        wrongtype = self._call("tools/call", 6, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geodist", "key": "plain",
+                 "member1": "a", "member2": "b"},
+                {"op": "kv_geodist", "key": "b2",
+                 "member1": "Palermo", "member2": "Catania",
+                 "unit": "km"},
+            ]},
+        })
+        summary = json.loads(wrongtype["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("WRONGTYPE", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 166.2742)
 
     def test_tools_call_string_mget_mset_getdel_setnx_setex_getset(self):
         # MSET sets several keys at once; MGET reads them back in
@@ -10024,9 +10669,13 @@ class McpTests(unittest.TestCase):
             {"op": "kv_zunion", "keys": ["a", "b"]},
             {"op": "kv_zinter", "keys": ["a", "b"]},
             {"op": "kv_pfcount", "keys": ["a", "b"]},
+            {"op": "kv_geodist", "key": "a", "member1": "x",
+             "member2": "y"},
+            {"op": "kv_geopos", "key": "a", "members": ["x"]},
+            {"op": "kv_geohash", "key": "a", "members": ["x"]},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 18 op(s), 1 audited, 17 not audited.", text)
+        self.assertIn("Plan: 21 op(s), 1 audited, 20 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -10044,6 +10693,9 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 15: kv_zunion is a read, not a write", text)
         self.assertIn("op 16: kv_zinter is a read, not a write", text)
         self.assertIn("op 17: kv_pfcount is a read, not a write", text)
+        self.assertIn("op 18: kv_geodist is a read, not a write", text)
+        self.assertIn("op 19: kv_geopos is a read, not a write", text)
+        self.assertIn("op 20: kv_geohash is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
@@ -11338,6 +11990,123 @@ class McpTests(unittest.TestCase):
         self.assertIn(
             "op 12: kv_pfmerge 'empty-hll' — merges the union of 0 "
             "source(s) into an empty HyperLogLog",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_geoadd(self):
+        self._call("tools/call", 1, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "cities", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "soon-cities", "members": {
+                "Palermo": [13.361389, 38.115556],
+            }},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-cities", "seconds": 3600},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_geoadd", "key": "cities", "members": {
+                "Messina": [15.55, 38.19],
+            }},
+            {"op": "kv_geoadd", "key": "cities", "members": {
+                "Palermo": [13.5, 38.2],
+            }},
+            {"op": "kv_geoadd", "key": "cities", "members": {
+                "Palermo": [13.5, 38.2],
+                "Messina": [15.55, 38.19],
+            }},
+            {"op": "kv_geoadd", "key": "soon-cities", "members": {
+                "Palermo": [13.5, 38.2],
+            }},
+            {"op": "kv_geoadd", "key": "name", "members": {
+                "a": [13.3, 38.1],
+            }},
+            {"op": "kv_geoadd", "key": "todo", "members": {
+                "a": [13.3, 38.1],
+            }},
+            {"op": "kv_geoadd", "key": "brand-new", "members": {
+                "a": [13.3, 38.1],
+            }},
+            {"op": "kv_geoadd", "key": "cities"},
+            {"op": "kv_geoadd", "key": "cities", "members": {
+                "a": [200, 38.1],
+            }},
+            {"op": "kv_geoadd", "key": "cities", "members": {
+                "a": [13.3, 38.1, 0],
+            }},
+            {"op": "kv_geodist", "key": "cities",
+             "member1": "Palermo", "member2": "Catania"},
+            {"op": "kv_geopos", "key": "cities",
+             "members": ["Palermo"]},
+            {"op": "kv_geohash", "key": "cities",
+             "members": ["Palermo"]},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 13 op(s), 7 audited, 6 not audited.", text)
+        self.assertIn(
+            "op 7: kv_geoadd members must be a non-empty object: None",
+            text)
+        self.assertIn(
+            "op 8: kv_geoadd longitude must be between -180.0 and "
+            "180.0: 200",
+            text)
+        self.assertIn(
+            "op 9: kv_geoadd member 'a' must be a [longitude, "
+            "latitude] pair: [13.3, 38.1, 0]",
+            text)
+        self.assertIn("op 10: kv_geodist is a read, not a write", text)
+        self.assertIn("op 11: kv_geopos is a read, not a write", text)
+        self.assertIn("op 12: kv_geohash is a read, not a write", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 4: kv_geoadd 'name' — would fail with WRONGTYPE: the "
+            "key is a string of 5 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 5: kv_geoadd 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_geoadd 'cities' — moves 1 existing member(s) "
+            "to new coordinates and adds 0 new member(s) in a geo "
+            "set of 2 elements that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 2: kv_geoadd 'cities' — moves 1 existing member(s) "
+            "to new coordinates and adds 1 new member(s) in a geo "
+            "set of 2 elements that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 3: kv_geoadd 'soon-cities' — moves 1 existing "
+            "member(s) to new coordinates and adds 0 new member(s) "
+            "in a geo set of 1 elements that expires in ",
+            caution,
+        )
+        self.assertIn(
+            "op 6: kv_geoadd 'brand-new' — creates a new geo sorted "
+            "set with no expiry",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_geoadd 'cities' — adds 1 new member(s) to a "
+            "geo set of 2 elements that no expiry",
             safe,
         )
 
@@ -13906,6 +14675,198 @@ class LiveCinderMigrationTests(unittest.TestCase):
         self.assertEqual(summary["results"][0]["result"], "OK")
         self.assertGreaterEqual(summary["results"][1]["result"], 900)
         self.assertLessEqual(summary["results"][1]["result"], 1100)
+
+    def test_live_geoadd_geodist_geopos_geohash(self):
+        """kv_geoadd / kv_geodist / kv_geopos / kv_geohash against
+        a real cinder 0.58.0: GEOADD stores the members as a sorted
+        set of 52-bit geohash scores (ZCARD counts them, ZSCORE
+        reads the Palermo score back), a re-add at the same
+        coordinates is a no-op and moving a member returns 0 added
+        but changes its position, GEODIST answers the Haversine
+        distance between the geohash cell centres in m/km/ft/mi
+        with four decimals (the Redis-documented Palermo/Catania
+        pair: 166274.1516 m), GEOPOS returns the cell centres, and
+        GEOHASH the standard 11-character strings with the
+        eleventh character always '0'. A missing key or member is
+        null, a bad unit fails even on a missing key, a bad
+        coordinate fails the whole GEOADD with nothing written,
+        and all four tools are WRONGTYPE on a plain string. The
+        commands shipped in cinder 0.57.0 (GEOADD/GEODIST) and
+        0.58.0 (GEOPOS/GEOHASH)."""
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:sicily", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }}),
+            2)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:sicily", "members": {
+                "Palermo": [13.361389, 38.115556],
+            }}),
+            0)
+        self.assertEqual(
+            self._tool("kv_zcard", {"key": "geo:sicily"}), 2)
+        self.assertEqual(
+            self._tool("kv_zscore", {"key": "geo:sicily",
+                                     "member": "Palermo"}),
+            3479099956230698)
+        # The distances are the live cinder's own numbers.
+        self.assertEqual(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Catania"}),
+            166274.1516)
+        self.assertEqual(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Catania",
+                                      "unit": "km"}),
+            166.2742)
+        self.assertEqual(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Catania",
+                                      "unit": "mi"}),
+            103.318)
+        self.assertEqual(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Catania",
+                                      "unit": "ft"}),
+            545518.87)
+        self.assertEqual(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Palermo"}),
+            0.0)
+        self.assertIsNone(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Ghost"}))
+        self.assertIsNone(
+            self._tool("kv_geodist", {"key": "geo:ghost",
+                                      "member1": "Palermo",
+                                      "member2": "Catania"}))
+        # The positions are the geohash cell centres, a hair off
+        # the coordinates as given.
+        positions = self._tool("kv_geopos", {"key": "geo:sicily",
+                                             "members": ["Palermo",
+                                                         "Catania",
+                                                         "Ghost"]})
+        self.assertAlmostEqual(
+            positions[0]["longitude"], 13.361389338970184, places=9)
+        self.assertAlmostEqual(
+            positions[0]["latitude"], 38.115556395496299, places=9)
+        self.assertAlmostEqual(
+            positions[1]["longitude"], 15.087267458438873, places=9)
+        self.assertAlmostEqual(
+            positions[1]["latitude"], 37.502668423331613, places=9)
+        self.assertIsNone(positions[2])
+        self.assertEqual(
+            self._tool("kv_geopos", {"key": "geo:ghost",
+                                     "members": ["a"]}),
+            [None])
+        self.assertEqual(
+            self._tool("kv_geohash", {"key": "geo:sicily",
+                                      "members": ["Palermo",
+                                                  "Catania",
+                                                  "Ghost"]}),
+            ["sqc8b49rny0", "sqdtr74hyu0", None])
+        self.assertEqual(
+            self._tool("kv_geohash", {"key": "geo:ghost",
+                                      "members": ["a"]}),
+            [None])
+        # Moving a member returns 0 added, and the distance moves
+        # with it.
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:sicily", "members": {
+                "Palermo": [13.5, 38.2],
+            }}),
+            0)
+        moved = self._tool("kv_geodist", {"key": "geo:sicily",
+                                          "member1": "Palermo",
+                                          "member2": "Catania"})
+        self.assertNotEqual(moved, 166274.1516)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:sicily", "members": {
+                "Palermo": [13.361389, 38.115556],
+            }}),
+            0)
+        self.assertEqual(
+            self._tool("kv_geodist", {"key": "geo:sicily",
+                                      "member1": "Palermo",
+                                      "member2": "Catania"}),
+            166274.1516)
+        # GEOADD preserves the TTL.
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "geo:sicily",
+                                     "seconds": 300}),
+            1)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:sicily", "members": {
+                "Messina": [15.55, 38.19],
+            }}),
+            1)
+        self.assertGreater(self._tool("kv_ttl", {"key": "geo:sicily"}), 0)
+        # A bad coordinate fails the whole call with nothing
+        # written, and a bad unit fails even on a missing key.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "geo:plain", "value": "v"}),
+            "OK")
+        for name, arguments in (
+                ("kv_geoadd", {"key": "geo:bad", "members": {
+                    "good": [13.3, 38.1],
+                    "bad": [200, 38.1],
+                }}),
+                ("kv_geoadd", {"key": "geo:bad", "members": {
+                    "bad": [13.3, 90],
+                }}),
+                ("kv_geoadd", {"key": "geo:plain", "members": {
+                    "a": [13.3, 38.1],
+                }}),
+                ("kv_geodist", {"key": "geo:ghost",
+                                "member1": "a", "member2": "b",
+                                "unit": "parsec"}),
+                ("kv_geodist", {"key": "geo:plain",
+                                "member1": "a", "member2": "b"}),
+                ("kv_geopos", {"key": "geo:plain",
+                               "members": ["a"]}),
+                ("kv_geohash", {"key": "geo:plain",
+                                "members": ["a"]}),
+                ("kv_geoadd", {"key": "geo:bad",
+                               "members": {}}),
+                ("kv_geopos", {"key": "geo:sicily",
+                               "members": []}),
+                ("kv_geohash", {"key": "geo:sicily",
+                                "members": ["a"] * 1001})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "geo:bad"}), 0)
+        # The tools queue in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_geoadd", "key": "geo:tx", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }},
+            {"op": "kv_geodist", "key": "geo:tx",
+             "member1": "Palermo", "member2": "Catania",
+             "unit": "km"},
+            {"op": "kv_geopos", "key": "geo:tx",
+             "members": ["Palermo"]},
+            {"op": "kv_geohash", "key": "geo:tx",
+             "members": ["Catania"]},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 166.2742)
+        self.assertAlmostEqual(
+            summary["results"][2]["result"][0]["longitude"],
+            13.361389338970184, places=9)
+        self.assertEqual(summary["results"][3]["result"],
+                         ["sqdtr74hyu0"])
 
     def test_live_dbsize(self):
         """kv_dbsize against a real cinder 0.49.0: the key count of

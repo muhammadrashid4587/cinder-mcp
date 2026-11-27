@@ -48,6 +48,7 @@ move, and the prompt says so.
 
 import bisect
 import json
+import math
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
@@ -131,6 +132,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_zpopmin", "kv_zpopmax",
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_pfadd", "kv_pfmerge",
+    "kv_geoadd",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
@@ -142,6 +144,7 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_zrandmember", "kv_zscan", "kv_zrangebylex",
                          "kv_zlexcount", "kv_zmscore", "kv_zunion",
                          "kv_zinter", "kv_zdiff", "kv_pfcount",
+                         "kv_geodist", "kv_geopos", "kv_geohash",
                          "kv_lindex", "kv_sscan")
 
 # A largest-string recommendation only fires when the biggest string
@@ -270,7 +273,9 @@ PROMPTS = [
             "on a container or drain a source list, PFADDs that "
             "would fail on a plain string or a container, PFMERGEs "
             "that would discard a destination's registers or fail "
-            "on a plain string or a container, and EXPIREs with "
+            "on a plain string or a container, GEOADDs that would "
+            "fail on a key that is not a sorted set or move "
+            "members of a geo set, and EXPIREs with "
             "a bad timeout, and give a go/no-go per risky op."
         ),
         "arguments": [
@@ -1087,6 +1092,51 @@ def _pfadd_audit_elements(op):
                 "kv_pfadd elements must be strings: %r" % (elements,)
             )
     return elements
+
+
+def _geoadd_audit_members(op):
+    """The members for a kv_geoadd op in a write plan, validated
+    like the tool's own arguments: a non-empty object mapping
+    member names to [longitude, latitude] pairs, each coordinate
+    finite and in range (longitude -180 to 180, latitude
+    -85.05112878 to 85.05112878). Anything else raises ValueError,
+    so the caller reports the op as not audited instead of
+    guessing. Returns the member names, in the object's order."""
+    members = op.get("members")
+    if not isinstance(members, dict) or not members:
+        raise ValueError(
+            "kv_geoadd members must be a non-empty object: %r"
+            % (members,)
+        )
+    for member, pair in members.items():
+        if not isinstance(member, str):
+            raise ValueError(
+                "kv_geoadd members must be strings: %r" % (members,)
+            )
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                "kv_geoadd member %r must be a [longitude, latitude] "
+                "pair: %r" % (member, pair)
+            )
+        for value, low, high, axis in (
+            (pair[0], -180.0, 180.0, "longitude"),
+            (pair[1], -85.05112878, 85.05112878, "latitude"),
+        ):
+            if isinstance(value, bool) \
+                    or not isinstance(value, (int, float)):
+                raise ValueError(
+                    "kv_geoadd %s must be a number: %r" % (axis, value)
+                )
+            if not math.isfinite(value):
+                raise ValueError(
+                    "kv_geoadd %s must be finite: %r" % (axis, value)
+                )
+            if value < low or value > high:
+                raise ValueError(
+                    "kv_geoadd %s must be between %s and %s: %r"
+                    % (axis, low, high, value)
+                )
+    return list(members)
 
 
 def _ltrim_audit_args(op):
@@ -2024,7 +2074,9 @@ def _audit_write_op(client, op):
     that shortens a list that never expires or deletes a list
     that expires soon, a SETRANGE that overwrites part of a large
     string, or an LMOVE that moves one element out of a list with
-    more to spare or empties a source that expires soon. SETNX on
+    more to spare or empties a source that expires soon, a GEOADD
+    that creates a geo set with no expiry or moves members of an
+    existing one. SETNX on
     a key that
     already exists writes nothing, so it is safe, and so is HSETNX
     on a field that already exists, an LSET that writes the value
@@ -2110,6 +2162,12 @@ def _audit_write_op(client, op):
             _pfadd_audit_elements(op)
             return "caution", (
                 "kv_pfadd %r — creates a new HyperLogLog with no "
+                "expiry" % key
+            )
+        if name == "kv_geoadd":
+            _geoadd_audit_members(op)
+            return "caution", (
+                "kv_geoadd %r — creates a new geo sorted set with no "
                 "expiry" % key
             )
         if name in ("kv_decr", "kv_decrby"):
@@ -2469,6 +2527,41 @@ def _audit_write_op(client, op):
             "kv_pfadd %r — adds %d element(s) to a HyperLogLog "
             "currently counting %d distinct element(s) that %s"
             % (key, len(elements), estimate, ttl_text)
+        )
+    if name == "kv_geoadd":
+        # GEOADD adds members to a sorted set of geohash scores
+        # and moves any member it re-adds to new coordinates, so
+        # the members it would move are the risk: their stored
+        # positions are overwritten, while new members only grow
+        # the set. A ZMSCORE probe, chunked at 1000, tells which
+        # members already exist — the set's size is no risk on its
+        # own, since nothing is removed.
+        members = _geoadd_audit_members(op)
+        if kind != "zset":
+            return "risky", (
+                "kv_geoadd %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        existing = 0
+        for i in range(0, len(members), 1000):
+            scores = client.command(
+                "ZMSCORE", key, *members[i:i + 1000]
+            ) or []
+            existing += sum(
+                1 for score in scores if score is not None
+            )
+        if existing:
+            return "caution", (
+                "kv_geoadd %r — moves %d existing member(s) to new "
+                "coordinates and adds %d new member(s) in a geo set "
+                "of %s that %s"
+                % (key, existing, len(members) - existing,
+                   size, ttl_text)
+            )
+        return "safe", (
+            "kv_geoadd %r — adds %d new member(s) to a geo set of "
+            "%s that %s"
+            % (key, len(members), size, ttl_text)
         )
     if name == "kv_setrange":
         # SETRANGE rewrites part of the string in place and keeps
