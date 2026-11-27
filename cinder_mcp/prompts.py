@@ -63,8 +63,8 @@ import time
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
 from .tools import (MAX_GEOSEARCH_MEMBERS, MAX_XPENDING_ENTRIES,
-                    _xack_args, _xadd_args, _xgroup_create_args,
-                    _xreadgroup_args)
+                    _xack_args, _xadd_args, _xclaim_args,
+                    _xgroup_create_args, _xreadgroup_args)
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
 # The prompts process one batch at a time and keep only bounded
@@ -153,6 +153,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
     "kv_xadd", "kv_xreadgroup", "kv_xgroup_create", "kv_xack",
+    "kv_xclaim",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -1990,6 +1991,141 @@ def _xack_normalised_id(id_value):
     return id_value
 
 
+def _audit_xclaim(client, op):
+    """Audit one kv_xclaim op: the stream and the group are probed
+    live, and the pending list is read with the extended XPENDING
+    form so the ids that are actually pending — and how long each
+    has been idle — are known. A claim moves pending entries to
+    another consumer and bumps their delivery count (or sets it
+    with retrycount); the entries stay in the stream, so nothing
+    is lost, but a claim on a stream that never expires leaves
+    the moved entries pending there until XACK. With FORCE,
+    entries in the stream but not pending are claimed too,
+    creating new pending records — the audit cannot tell from the
+    pending list alone whether such an id is in the stream, so it
+    says so instead of guessing. A bare-millisecond id is
+    normalised to its first sequence before comparing, as cinder
+    reads it. Returns (verdict, line)."""
+    (key, group, consumer, min_idle_ms, ids, idle_ms, time_ms,
+     retrycount, force, justid) = _xclaim_args(op)
+    if client.command("EXISTS", key) == 0:
+        return "risky", (
+            "kv_xclaim — %r would fail: no such key or consumer "
+            "group %r" % (key, group)
+        )
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        # The key expired while auditing; the claim would fail.
+        return "risky", (
+            "kv_xclaim — %r would fail: no such key or consumer "
+            "group %r" % (key, group)
+        )
+    try:
+        kind, _size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        # The key expired between the TTL read and the probe.
+        return "risky", (
+            "kv_xclaim — %r would fail: no such key or consumer "
+            "group %r" % (key, group)
+        )
+    if kind != "stream":
+        return "risky", (
+            "kv_xclaim — %r would fail with WRONGTYPE: the key is "
+            "a %s of %s" % (key, kind, size)
+        )
+    try:
+        total = client.command("XPENDING", key, group)[0]
+    except RespError as exc:
+        if "NOGROUP" in str(exc):
+            return "risky", (
+                "kv_xclaim — %r would fail: no such consumer group "
+                "%r" % (key, group)
+            )
+        raise
+    checked = min(total, MAX_XPENDING_ENTRIES)
+    pending = (client.command("XPENDING", key, group, "-", "+", checked)
+               if checked else [])
+    pending_by_id = {entry[0]: entry for entry in pending}
+    wanted = []
+    for id_value in ids:
+        normalised = _xack_normalised_id(id_value)
+        if normalised not in wanted:
+            wanted.append(normalised)
+    claimable = []
+    too_fresh = []
+    forced = []
+    left_out = []
+    for normalised in wanted:
+        entry = pending_by_id.get(normalised)
+        if entry is not None:
+            if force or entry[2] >= min_idle_ms:
+                claimable.append(normalised)
+            else:
+                too_fresh.append(normalised)
+        elif force:
+            forced.append(normalised)
+        else:
+            left_out.append(normalised)
+    if total > MAX_XPENDING_ENTRIES and (too_fresh or left_out):
+        # Only the first 1000 pending entries were checked, so an
+        # id outside them may still be pending — and idle enough.
+        return "caution", (
+            "kv_xclaim — moves %d pending %s to consumer %r in "
+            "group %r on stream %r, but only the first %d of %d "
+            "pending entries were checked, so the other %d %s may "
+            "still be claimed"
+            % (len(claimable), "entry" if len(claimable) == 1
+               else "entries", consumer, group, key,
+               MAX_XPENDING_ENTRIES, total,
+               len(too_fresh) + len(left_out),
+               "id" if len(too_fresh) + len(left_out) == 1 else "ids")
+        )
+    if not claimable and not forced:
+        return "safe", (
+            "kv_xclaim — no-op, none of the %d %s can be claimed "
+            "by consumer %r in group %r on stream %r"
+            % (len(wanted), "id" if len(wanted) == 1 else "ids",
+               consumer, group, key)
+        )
+    retry = (" with the delivery count set to %d" % retrycount
+             if retrycount is not None else "")
+    parts = []
+    if claimable:
+        parts.append(
+            "moves %d pending %s to consumer %r%s"
+            % (len(claimable),
+               "entry" if len(claimable) == 1 else "entries",
+               consumer, retry)
+        )
+    if forced:
+        parts.append(
+            "claims %d %s not currently pending — only the ones "
+            "in the stream — creating pending records for them"
+            % (len(forced), "entry" if len(forced) == 1 else "entries")
+        )
+    if too_fresh:
+        parts.append(
+            "%d %s are not idle enough yet and stay where they are"
+            % (len(too_fresh),
+               "id" if len(too_fresh) == 1 else "ids")
+        )
+    if left_out:
+        parts.append(
+            "%d %s are not pending and stay out of the claim"
+            % (len(left_out),
+               "id" if len(left_out) == 1 else "ids")
+        )
+    line = ("kv_xclaim — %s in group %r on stream %r; the entries "
+            "stay in the stream"
+            % ("; ".join(parts), group, key))
+    if ttl == -1:
+        return "caution", (
+            "%s, on a stream that never expires, where they stay "
+            "pending until XACK" % line
+        )
+    return "safe", line
+
+
 def _audit_lmove(client, op):
     """Audit one kv_lmove op: the source and the destination are
     both probed live, because the move reads the source, writes the
@@ -3326,8 +3462,8 @@ def _audit_write_op(client, op):
     entries off a never-expiring stream, or a MAXLEN 0 that would
     delete a stream outright, an XREADGROUP on a missing key or a
     missing group, an XGROUP CREATE on a missing key or a group
-    that already exists, or an XACK on a missing key or group, or
-    an EXPIRE,
+    that already exists, an XACK on a missing key or group, or an
+    XCLAIM on a missing key or group, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
     of a key that expires soon anyway, a SET, MSET, SETNX, APPEND,
@@ -3340,7 +3476,9 @@ def _audit_write_op(client, op):
     delivers new entries into a group's pending list, an XGROUP
     CREATE that creates a group on a stream that never expires or
     a new stream with no expiry, an XACK whose pending list is
-    wider than the audit can read, a HSETNX
+    wider than the audit can read, an XCLAIM that moves pending
+    entries to another consumer on a stream that never expires, or
+    whose pending list is wider than the audit can read, a HSETNX
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
@@ -3428,6 +3566,10 @@ def _audit_write_op(client, op):
         # XACK drops entries from one group's pending list, so it
         # is audited on its own.
         return _audit_xack(client, op)
+    if name == "kv_xclaim":
+        # XCLAIM moves pending entries of one group's pending list
+        # to another consumer, so it is audited on its own.
+        return _audit_xclaim(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

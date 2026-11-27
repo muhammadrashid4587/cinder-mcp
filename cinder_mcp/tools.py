@@ -730,6 +730,26 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_xclaim",
+        "description": "Claim pending entries of a consumer group for another consumer: XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID]. Takes `key`, `group` and `consumer` as strings, `min_idle_ms` as the milliseconds an entry must have been idle since its last delivery before it can be claimed (0 claims at once), and `ids` as a list of entry IDs (\"ms-seq\", or a bare millisecond for the first sequence of that millisecond; at least one, at most 1000). Returns the claimed entries as [{\"id\": ..., \"fields\": {...}}] in the order the IDs were given — an entry that is not in the stream, is not idle enough, or is not pending is left out, and a repeated ID is claimed once. Pass `force: true` to claim an entry even when it has not been idle long enough, and to claim an entry that is in the stream but not pending at all, creating a pending record for it. Pass `idle_ms` to set the claimed entries' delivery time that many milliseconds ago, or `time_ms` for an absolute Unix time in milliseconds — the two cannot be combined. Pass `retrycount` to set the delivery count instead of bumping it by one, and `justid: true` to answer only the claimed IDs instead of the entries. A claimed entry moves to this consumer, its delivery count bumps by one (or is set by `retrycount`), and it stays pending until XACK. A missing key or a group that does not exist fails with NOGROUP.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "group": {"type": "string"},
+                "consumer": {"type": "string"},
+                "min_idle_ms": {"type": "integer"},
+                "ids": {"type": "array"},
+                "idle_ms": {"type": "integer"},
+                "time_ms": {"type": "integer"},
+                "retrycount": {"type": "integer"},
+                "force": {"type": "boolean"},
+                "justid": {"type": "boolean"},
+            },
+            "required": ["key", "group", "consumer", "min_idle_ms", "ids"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -1547,7 +1567,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1682,6 +1702,7 @@ BATCHABLE_TOOLS = {
     "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
+    "kv_xclaim",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1780,6 +1801,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
+    "kv_xclaim",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1797,7 +1819,8 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
-    "kv_sadd", "kv_smembers", "kv_sscan", "kv_scard", "kv_srem", "kv_sismember",
+    "kv_sadd", "kv_smembers", "kv_sscan", "kv_scard", "kv_srem",
+    "kv_sismember",
 }
 
 
@@ -2072,6 +2095,14 @@ def _call_batch_atomic(client, ops):
             # transaction; shape it like the standalone tool does.
             value = _xpending_result(
                 reply, _xpending_args(op)[2] is not None)
+        elif op_name == "kv_xclaim":
+            # XCLAIM came back as [[id, [field, value, ...]], ...]
+            # — or only the IDs with JUSTID — inside the
+            # transaction; shape it like the standalone tool does,
+            # into id/fields objects in the order the IDs were
+            # given. An EXEC-time NOGROUP or WRONGTYPE is recorded
+            # in place, like any other EXEC-time failure.
+            value = _xclaim_result(reply, _xclaim_args(op)[9])
         elif op_name in ("kv_zpopmin", "kv_zpopmax"):
             # ZPOPMIN/ZPOPMAX came back as a flat list inside the
             # transaction; shape it like the standalone tool does,
@@ -2607,6 +2638,25 @@ def _op_argv(name, args):
         # dropped from the group's pending list.
         key, group, ids = _xack_args(args)
         return ["XACK", key, group] + ids
+    if name == "kv_xclaim":
+        # XCLAIM key group consumer min-idle-time id [id ...]
+        # [IDLE ms] [TIME ms] [RETRYCOUNT n] [FORCE] [JUSTID] —
+        # the options are sent in that order, as in cinder's
+        # parser, and IDLE and TIME never combine.
+        (key, group, consumer, min_idle_ms, ids, idle_ms, time_ms,
+         retrycount, force, justid) = _xclaim_args(args)
+        cmd = ["XCLAIM", key, group, consumer, min_idle_ms] + ids
+        if idle_ms is not None:
+            cmd += ["IDLE", idle_ms]
+        if time_ms is not None:
+            cmd += ["TIME", time_ms]
+        if retrycount is not None:
+            cmd += ["RETRYCOUNT", retrycount]
+        if force:
+            cmd.append("FORCE")
+        if justid:
+            cmd.append("JUSTID")
+        return cmd
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -4059,6 +4109,112 @@ def _call_xack(client, args):
     answering how many were dropped."""
     reply = client.command(*_op_argv("kv_xack", args))
     return reply
+
+
+# The most entry IDs one kv_xclaim call claims; a wider call
+# fails instead of sending a huge claim.
+MAX_XCLAIM_IDS = 1000
+
+
+def _xclaim_args(args):
+    """Validate a kv_xclaim call: (key, group, consumer,
+    min_idle_ms, ids, idle_ms, time_ms, retrycount, force,
+    justid). `key`, `group` and `consumer` must be strings.
+    `min_idle_ms` is the milliseconds an entry must have been
+    idle since its last delivery, 0 or more. `ids` must be a
+    non-empty list of entry IDs, at most MAX_XCLAIM_IDS, each
+    validated like kv_xack's — "ms-seq", or a bare millisecond,
+    which cinder reads as the first sequence of that millisecond.
+    `idle_ms` sets the claimed entries' delivery time that many
+    milliseconds ago and `time_ms` an absolute Unix time in
+    milliseconds — both 0 or more, and never together, since
+    cinder errors when they combine. `retrycount` sets the
+    delivery count instead of bumping it, 0 or more. `force` and
+    `justid` must be booleans when given."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xclaim key must be a string")
+    group = _require(args, "group")
+    if not isinstance(group, str):
+        raise ValueError("kv_xclaim group must be a string")
+    consumer = _require(args, "consumer")
+    if not isinstance(consumer, str):
+        raise ValueError("kv_xclaim consumer must be a string")
+    min_idle_ms = _require(args, "min_idle_ms")
+    if isinstance(min_idle_ms, bool) or not isinstance(min_idle_ms, int):
+        raise ValueError("kv_xclaim min_idle_ms must be an integer")
+    if min_idle_ms < 0:
+        raise ValueError(
+            "kv_xclaim min_idle_ms must be 0 or more, got %d" % min_idle_ms
+        )
+    ids = args.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("kv_xclaim ids must be a non-empty list")
+    if len(ids) > MAX_XCLAIM_IDS:
+        raise ValueError(
+            "kv_xclaim claims at most %d entries; narrow the list"
+            % MAX_XCLAIM_IDS
+        )
+    checked = []
+    for id_value in ids:
+        checked.append(_stream_bound(id_value, "kv_xclaim"))
+    idle_ms = args.get("idle_ms")
+    if idle_ms is not None:
+        if isinstance(idle_ms, bool) or not isinstance(idle_ms, int):
+            raise ValueError("kv_xclaim idle_ms must be an integer")
+        if idle_ms < 0:
+            raise ValueError(
+                "kv_xclaim idle_ms must be 0 or more, got %d" % idle_ms
+            )
+    time_ms = args.get("time_ms")
+    if time_ms is not None:
+        if isinstance(time_ms, bool) or not isinstance(time_ms, int):
+            raise ValueError("kv_xclaim time_ms must be an integer")
+        if time_ms < 0:
+            raise ValueError(
+                "kv_xclaim time_ms must be 0 or more, got %d" % time_ms
+            )
+    if idle_ms is not None and time_ms is not None:
+        raise ValueError(
+            "kv_xclaim idle_ms and time_ms cannot be used at the same time"
+        )
+    retrycount = args.get("retrycount")
+    if retrycount is not None:
+        if isinstance(retrycount, bool) or not isinstance(retrycount, int):
+            raise ValueError("kv_xclaim retrycount must be an integer")
+        if retrycount < 0:
+            raise ValueError(
+                "kv_xclaim retrycount must be 0 or more, got %d"
+                % retrycount
+            )
+    force = args.get("force", False)
+    if not isinstance(force, bool):
+        raise ValueError("kv_xclaim force must be true or false")
+    justid = args.get("justid", False)
+    if not isinstance(justid, bool):
+        raise ValueError("kv_xclaim justid must be true or false")
+    return (key, group, consumer, min_idle_ms, checked, idle_ms,
+            time_ms, retrycount, force, justid)
+
+
+def _xclaim_result(reply, justid):
+    """Shape an XCLAIM reply. The full form [[id, [field, value,
+    ...]], ...] becomes [{"id": ..., "fields": {...}}, ...] in the
+    order the IDs were given, like kv_xrange's; JUSTID answers
+    only the IDs, as a list of strings. An empty claim is []."""
+    if justid:
+        return reply or []
+    return _xrange_result(reply or [])
+
+
+def _call_xclaim(client, args):
+    """kv_xclaim: claim pending entries of a consumer group for
+    another consumer, answering the claimed entries — or only
+    their IDs with justid."""
+    (key, group, consumer, min_idle_ms, ids, idle_ms, time_ms,
+     retrycount, force, justid) = _xclaim_args(args)
+    reply = client.command(*_op_argv("kv_xclaim", args))
+    return _xclaim_result(reply, justid)
 
 
 # The most members one kv_zrange call returns; a wider range fails
@@ -5797,6 +5953,8 @@ def _call_single(client, name, args):
         return _call_xgroup_create(client, args)
     if name == "kv_xack":
         return _call_xack(client, args)
+    if name == "kv_xclaim":
+        return _call_xclaim(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":

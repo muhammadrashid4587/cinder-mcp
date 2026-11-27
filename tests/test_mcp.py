@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, XGROUP, XREADGROUP, XACK, XPENDING, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, XGROUP, XREADGROUP, XACK, XCLAIM, XPENDING, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -3765,6 +3765,161 @@ class FakeCinder(threading.Thread):
                     del grp["pel"][bound]
                     removed += 1
             return ":%d\r\n" % removed
+        elif name == "XCLAIM":
+            # XCLAIM key group consumer min-idle-time id [id ...]
+            # [IDLE ms] [TIME ms] [RETRYCOUNT n] [FORCE] [JUSTID],
+            # as in real cinder: an entry is claimed when it has
+            # been idle at least min-idle-time since its last
+            # delivery, or when FORCE is given (which also claims
+            # entries that are in the stream but not pending at
+            # all, creating a PEL entry for them); the claimed
+            # entry moves to this consumer, its delivery time is
+            # set to now (or to IDLE ms ago, or to the absolute
+            # TIME given — IDLE and TIME cannot combine) and its
+            # delivery count is bumped (or set by RETRYCOUNT).
+            # JUSTID answers only the IDs. IDs that are not in
+            # the stream, are not idle enough, or are not pending
+            # (without FORCE) are left out, in request order; a
+            # repeated ID is claimed once. The consumer joins the
+            # group only when at least one entry is claimed.
+            if len(args) < 5:
+                return ("-ERR wrong number of arguments for 'xclaim' "
+                        "command\r\n")
+            key, group, consumer = args[0], args[1], args[2]
+            try:
+                min_idle = int(args[3])
+            except ValueError:
+                return "-ERR Invalid min-idle-time\r\n"
+            if min_idle < 0:
+                return "-ERR Invalid min-idle-time\r\n"
+            i = 4
+            id_texts = []
+            while (i < len(args)
+                   and args[i].upper() not in ("IDLE", "TIME",
+                                               "RETRYCOUNT", "FORCE",
+                                               "JUSTID")):
+                id_texts.append(args[i])
+                i += 1
+            if not id_texts:
+                return ("-ERR wrong number of arguments for 'xclaim' "
+                        "command\r\n")
+            bounds = []
+            for id_text in id_texts:
+                bound = _stream_parse_bound(id_text, False)
+                if bound is None:
+                    return ("-ERR Invalid stream ID specified as stream "
+                            "command argument\r\n")
+                bounds.append(bound)
+            idle_ms = None
+            time_ms = None
+            retrycount = None
+            force = False
+            justid = False
+            seen_idle = False
+            seen_time = False
+            seen_retry = False
+            while i < len(args):
+                opt = args[i].upper()
+                if opt == "IDLE":
+                    if seen_idle or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        idle_ms = int(args[i + 1])
+                    except ValueError:
+                        return "-ERR syntax error\r\n"
+                    if idle_ms < 0:
+                        return "-ERR syntax error\r\n"
+                    seen_idle = True
+                    i += 2
+                elif opt == "TIME":
+                    if seen_time or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        time_ms = int(args[i + 1])
+                    except ValueError:
+                        return "-ERR syntax error\r\n"
+                    if time_ms < 0:
+                        return "-ERR syntax error\r\n"
+                    seen_time = True
+                    i += 2
+                elif opt == "RETRYCOUNT":
+                    if seen_retry or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        retrycount = int(args[i + 1])
+                    except ValueError:
+                        return "-ERR syntax error\r\n"
+                    if retrycount < 0:
+                        return "-ERR syntax error\r\n"
+                    seen_retry = True
+                    i += 2
+                elif opt == "FORCE":
+                    force = True
+                    i += 1
+                elif opt == "JUSTID":
+                    justid = True
+                    i += 1
+                else:
+                    return "-ERR syntax error\r\n"
+            if seen_idle and seen_time:
+                return ("-ERR IDLE and TIME cannot be used at the same "
+                        "time\r\n")
+            value = self._get(key)
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            grp = value.groups.get(group) if value is not None else None
+            if grp is None:
+                return ("-ERR NOGROUP No such key '%s' or consumer "
+                        "group '%s'\r\n" % (key, group))
+            now_ms = int(time.time() * 1000)
+            delivery_time = now_ms
+            if time_ms is not None:
+                delivery_time = time_ms
+            elif idle_ms is not None:
+                delivery_time = now_ms - idle_ms
+            by_id = {(ms, seq): pairs
+                     for ms, seq, pairs in value.entries}
+            claimed = []
+            seen = set()
+            for bound in bounds:
+                if bound in seen:
+                    continue
+                seen.add(bound)
+                pairs = by_id.get(bound)
+                if pairs is None:
+                    continue
+                pel = grp["pel"].get(bound)
+                if pel is not None:
+                    if now_ms - pel[1] < min_idle and not force:
+                        continue
+                    pel[0] = consumer
+                    pel[1] = delivery_time
+                    pel[2] = (retrycount if retrycount is not None
+                              else pel[2] + 1)
+                elif not force:
+                    continue
+                else:
+                    grp["pel"][bound] = [
+                        consumer, delivery_time,
+                        retrycount if retrycount is not None else 1]
+                claimed.append((bound[0], bound[1], pairs))
+            if claimed and consumer not in grp["consumers"]:
+                grp["consumers"].append(consumer)
+            if justid:
+                reply = "*%d\r\n" % len(claimed)
+                for ms, seq, _pairs in claimed:
+                    reply += self._bulk("%d-%d" % (ms, seq))
+                return reply
+            reply = "*%d\r\n" % len(claimed)
+            for ms, seq, pairs in claimed:
+                reply += "*2\r\n"
+                reply += self._bulk("%d-%d" % (ms, seq))
+                flat = [item for pair in pairs for item in pair]
+                reply += "*%d\r\n" % len(flat)
+                for item in flat:
+                    reply += self._bulk(item)
+            return reply
         elif name == "XPENDING":
             # XPENDING key group: the summary — total, lowest and
             # highest pending IDs (nil when nothing is pending),
@@ -3953,7 +4108,7 @@ class McpTests(unittest.TestCase):
                     "kv_hpersist",
                     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen",
                     "kv_xread", "kv_xreadgroup", "kv_xpending",
-                    "kv_xgroup_create", "kv_xack",
+                    "kv_xgroup_create", "kv_xack", "kv_xclaim",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -9025,6 +9180,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _xclaim_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xclaim", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def _raw(self):
         # A raw RESP client against the fake, for the commands no
         # MCP tool covers yet — XGROUP CREATE to make a group, XACK
@@ -10453,6 +10615,303 @@ class McpTests(unittest.TestCase):
         self.assertFalse(summary["results"][4]["ok"])
         self.assertIn("NOGROUP", summary["results"][4]["error"])
 
+    def test_kv_xclaim_moves_pending_entries_to_another_consumer(self):
+        # Three entries, then a group from the beginning: a ">"
+        # read delivers all three to c1, and kv_xclaim moves them
+        # to c2 one claim at a time.
+        for entry_id, fields in (("1000-0", {"name": "alice"}),
+                                 ("1000-1", {"name": "bob"}),
+                                 ("2000-0", {"name": "carol"})):
+            self.assertEqual(
+                self._xadd_result({"key": "xc:s", "id": entry_id,
+                                   "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xc:s", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xc:s": ">"}}),
+            [{"key": "xc:s",
+              "entries": [{"id": "1000-0", "fields": {"name": "alice"}},
+                          {"id": "1000-1", "fields": {"name": "bob"}},
+                          {"id": "2000-0", "fields": {"name": "carol"}}]}])
+        # The claim answers the entries in the order the IDs were
+        # given, not in ID order, and the delivery counts bump.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["2000-0", "1000-0"]}),
+            [{"id": "2000-0", "fields": {"name": "carol"}},
+             {"id": "1000-0", "fields": {"name": "alice"}}])
+        self.assertEqual(
+            self._xpending_result({"key": "xc:s", "group": "grp"}),
+            {"total": 3, "min_id": "1000-0", "max_id": "2000-0",
+             "consumers": [{"consumer": "c1", "count": 1},
+                           {"consumer": "c2", "count": 2}]})
+        extended = self._xpending_result(
+            {"key": "xc:s", "group": "grp", "start": "-",
+             "end": "+", "count": 10})
+        self.assertEqual(
+            [(e["id"], e["consumer"], e["deliveries"]) for e in extended],
+            [("1000-0", "c2", 2), ("1000-1", "c1", 1),
+             ("2000-0", "c2", 2)])
+        # An entry delivered a moment ago is not idle enough for a
+        # 60-second minimum, so the claim answers an empty list
+        # and changes nothing.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c3", "min_idle_ms": 60000,
+                                 "ids": ["1000-0"]}),
+            [])
+        # JUSTID answers only the IDs, and the delivery count
+        # bumps again.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c3", "min_idle_ms": 0,
+                                 "ids": ["1000-0"], "justid": True}),
+            ["1000-0"])
+        extended = self._xpending_result(
+            {"key": "xc:s", "group": "grp", "start": "-",
+             "end": "+", "count": 10})
+        self.assertEqual(
+            [(e["id"], e["consumer"], e["deliveries"]) for e in extended],
+            [("1000-0", "c3", 3), ("1000-1", "c1", 1),
+             ("2000-0", "c2", 2)])
+        # IDLE sets the delivery time that many milliseconds ago,
+        # so the entry reads back idle by about that long.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000-1"], "idle_ms": 5000}),
+            [{"id": "1000-1", "fields": {"name": "bob"}}])
+        extended = self._xpending_result(
+            {"key": "xc:s", "group": "grp", "start": "-",
+             "end": "+", "count": 10})
+        idle = {e["id"]: e["idle_ms"] for e in extended}
+        self.assertGreaterEqual(idle["1000-1"], 5000)
+        self.assertLess(idle["1000-1"], 6000)
+        self.assertEqual(
+            {e["id"]: e["deliveries"] for e in extended}["1000-1"], 2)
+        # RETRYCOUNT sets the delivery count instead of bumping
+        # it, and TIME sets an absolute delivery time.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000-1"], "retrycount": 7}),
+            [{"id": "1000-1", "fields": {"name": "bob"}}])
+        past = int(time.time() * 1000) - 30000
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000-1"], "time_ms": past}),
+            [{"id": "1000-1", "fields": {"name": "bob"}}])
+        extended = self._xpending_result(
+            {"key": "xc:s", "group": "grp", "start": "-",
+             "end": "+", "count": 10})
+        entry = {e["id"]: e for e in extended}["1000-1"]
+        self.assertEqual(entry["deliveries"], 8)
+        self.assertGreaterEqual(entry["idle_ms"], 30000)
+        self.assertLess(entry["idle_ms"], 31000)
+        # A repeated ID in one call is claimed once, and a bare
+        # millisecond is the first sequence of that millisecond.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000-1", "1000-1"]}),
+            [{"id": "1000-1", "fields": {"name": "bob"}}])
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000"]}),
+            [{"id": "1000-0", "fields": {"name": "alice"}}])
+        # Acking an entry drops it from the pending list, so a
+        # claim without FORCE leaves it out; FORCE claims it back
+        # with a fresh delivery count of 1.
+        self.assertEqual(
+            self._xack_result({"key": "xc:s", "group": "grp",
+                               "ids": ["1000-1"]}),
+            1)
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000-1"]}),
+            [])
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["1000-1"], "force": True}),
+            [{"id": "1000-1", "fields": {"name": "bob"}}])
+        extended = self._xpending_result(
+            {"key": "xc:s", "group": "grp", "start": "-",
+             "end": "+", "count": 10})
+        self.assertEqual(
+            {e["id"]: e["deliveries"] for e in extended}["1000-1"], 1)
+        # FORCE also claims an entry that was never delivered to
+        # anyone, creating its pending record.
+        self.assertEqual(
+            self._xadd_result({"key": "xc:s", "id": "3000-0",
+                               "fields": {"name": "dan"}}),
+            "3000-0")
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["3000-0"]}),
+            [])
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["3000-0"], "force": True}),
+            [{"id": "3000-0", "fields": {"name": "dan"}}])
+        # An ID that is not in the stream is left out.
+        self.assertEqual(
+            self._xclaim_result({"key": "xc:s", "group": "grp",
+                                 "consumer": "c2", "min_idle_ms": 0,
+                                 "ids": ["9999-0"]}),
+            [])
+        # A missing key or group fails with NOGROUP, and a
+        # non-stream key with WRONGTYPE, as server errors.
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "xc:plain", "value": "v"},
+        })
+        for name, arguments, marker in (
+                ("kv_xclaim",
+                 {"key": "xc:ghost", "group": "grp", "consumer": "c2",
+                  "min_idle_ms": 0, "ids": ["1000-0"]},
+                 "NOGROUP"),
+                ("kv_xclaim",
+                 {"key": "xc:s", "group": "nope", "consumer": "c2",
+                  "min_idle_ms": 0, "ids": ["1000-0"]},
+                 "NOGROUP"),
+                ("kv_xclaim",
+                 {"key": "xc:plain", "group": "grp", "consumer": "c2",
+                  "min_idle_ms": 0, "ids": ["1000-0"]},
+                 "WRONGTYPE")):
+            reply = self._call("tools/call", 1, {
+                "name": name, "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn(marker, reply["error"]["message"], arguments)
+
+    def test_kv_xclaim_rejects_bad_arguments(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xcr:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xcr:s", "group": "grp", "id": "0"}),
+            "OK")
+        base = {"key": "xcr:s", "group": "grp", "consumer": "c2",
+                "min_idle_ms": 0, "ids": ["1-0"]}
+        bad = [{}, {"key": "xcr:s"}, {"group": "grp"},
+               {"consumer": "c2"}, {"min_idle_ms": 0},
+               {"ids": ["1-0"]},
+               {"key": 1, "group": "grp", "consumer": "c2",
+                "min_idle_ms": 0, "ids": ["1-0"]},
+               {"key": "xcr:s", "group": 1, "consumer": "c2",
+                "min_idle_ms": 0, "ids": ["1-0"]},
+               {"key": "xcr:s", "group": "grp", "consumer": 1,
+                "min_idle_ms": 0, "ids": ["1-0"]},
+               dict(base, min_idle_ms="0"),
+               dict(base, min_idle_ms=True),
+               dict(base, min_idle_ms=-1),
+               dict(base, ids=[]),
+               dict(base, ids="1-0"),
+               dict(base, ids=[1]),
+               dict(base, ids=["abc"]),
+               dict(base, ids=["7-"]),
+               dict(base, ids=["1-0"] * 1001),
+               dict(base, idle_ms="1"),
+               dict(base, idle_ms=True),
+               dict(base, idle_ms=-1),
+               dict(base, time_ms="1"),
+               dict(base, time_ms=-1),
+               dict(base, idle_ms=1, time_ms=2),
+               dict(base, retrycount="1"),
+               dict(base, retrycount=True),
+               dict(base, retrycount=-1),
+               dict(base, force=1),
+               dict(base, force="yes"),
+               dict(base, justid=1),
+               dict(base, justid="yes")]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xclaim", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_kv_xclaim_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xcb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "xcb1", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xgroup_create", "key": "xcb1",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xcb1": ">"}},
+                {"op": "kv_xclaim", "key": "xcb1", "group": "grp",
+                 "consumer": "c2", "min_idle_ms": 0,
+                 "ids": ["1-0"]},
+                {"op": "kv_xclaim", "key": "xcb1", "group": "grp",
+                 "consumer": "c2", "min_idle_ms": 0,
+                 "ids": ["2-0"], "justid": True},
+                {"op": "kv_xpending", "key": "xcb1", "group": "grp"},
+                {"op": "kv_xclaim", "key": "xcb1", "group": "nope",
+                 "consumer": "c2", "min_idle_ms": 0,
+                 "ids": ["1-0"]},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 7)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][4]["result"], [
+            {"id": "1-0", "fields": {"v": "a"}}])
+        self.assertEqual(summary["results"][5]["result"], ["2-0"])
+        self.assertEqual(summary["results"][6]["result"], {
+            "total": 2, "min_id": "1-0", "max_id": "2-0",
+            "consumers": [{"consumer": "c2", "count": 2}]})
+        self.assertFalse(summary["results"][7]["ok"])
+        self.assertIn("NOGROUP", summary["results"][7]["error"])
+        # The atomic batch queues the claim and runs it at EXEC,
+        # and the NOGROUP claim is recorded in place.
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xcb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xgroup_create", "key": "xcb2",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xcb2": ">"}},
+                {"op": "kv_xclaim", "key": "xcb2", "group": "grp",
+                 "consumer": "c2", "min_idle_ms": 0,
+                 "ids": ["5-0"]},
+                {"op": "kv_xclaim", "key": "xcb2", "group": "grp",
+                 "consumer": "c2", "min_idle_ms": 0,
+                 "ids": ["5-0"], "justid": True},
+                {"op": "kv_xclaim", "key": "xcb2", "group": "nope",
+                 "consumer": "c2", "min_idle_ms": 0,
+                 "ids": ["5-0"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][3]["result"], [
+            {"id": "5-0", "fields": {"v": "x"}}])
+        self.assertEqual(summary["results"][4]["result"], ["5-0"])
+        self.assertFalse(summary["results"][5]["ok"])
+        self.assertIn("NOGROUP", summary["results"][5]["error"])
+
     def test_prompts_get_write_safety_covers_xgroup_create_and_xack(self):
         self.assertEqual(
             self._xadd_result({"key": "ws:g2", "id": "1-0",
@@ -10548,6 +11007,117 @@ class McpTests(unittest.TestCase):
         self.assertIn(
             "op 6: kv_xack — no-op, none of the 1 id are pending "
             "in consumer group 'grp' on stream 'ws:g2'",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_xclaim(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:c", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:c", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"ws:c": ">"}}),
+            [{"key": "ws:c",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}}]}])
+        self.assertEqual(
+            self._xadd_result({"key": "ws:ce", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:ce", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"ws:ce": ">"}}),
+            [{"key": "ws:ce",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}}]}])
+        reply = self._call("tools/call", 1, {
+            "name": "kv_expire",
+            "arguments": {"key": "ws:ce", "seconds": 1000},
+        })
+        self.assertNotIn("error", reply)
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "ws:plain", "value": "v"},
+        })
+        plan = [
+            {"op": "kv_xclaim", "key": "ws:ghost", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["1-0"]},
+            {"op": "kv_xclaim", "key": "ws:c", "group": "nope",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["1-0"]},
+            {"op": "kv_xclaim", "key": "ws:plain", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["1-0"]},
+            {"op": "kv_xclaim", "key": "ws:c", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["1-0"]},
+            {"op": "kv_xclaim", "key": "ws:ce", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["1-0"]},
+            {"op": "kv_xclaim", "key": "ws:c", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 60000,
+             "ids": ["1-0"]},
+            {"op": "kv_xclaim", "key": "ws:c", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["9-0"]},
+            {"op": "kv_xclaim", "key": "ws:c", "group": "grp",
+             "consumer": "c2", "min_idle_ms": 0, "ids": ["9-0"],
+             "force": True},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 8 op(s), 8 audited, 0 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_xclaim — 'ws:ghost' would fail: no such key "
+            "or consumer group 'grp'",
+            risky,
+        )
+        self.assertIn(
+            "op 1: kv_xclaim — 'ws:c' would fail: no such consumer "
+            "group 'nope'",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_xclaim — 'ws:plain' would fail with "
+            "WRONGTYPE: the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_xclaim — moves 1 pending entry to consumer "
+            "'c2' in group 'grp' on stream 'ws:c'; the entries "
+            "stay in the stream, on a stream that never expires, "
+            "where they stay pending until XACK",
+            caution,
+        )
+        self.assertIn(
+            "op 7: kv_xclaim — claims 1 entry not currently "
+            "pending — only the ones in the stream — creating "
+            "pending records for them in group 'grp' on stream "
+            "'ws:c'; the entries stay in the stream, on a stream "
+            "that never expires, where they stay pending until "
+            "XACK",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 4: kv_xclaim — moves 1 pending entry to consumer "
+            "'c2' in group 'grp' on stream 'ws:ce'; the entries "
+            "stay in the stream",
+            safe,
+        )
+        self.assertIn(
+            "op 5: kv_xclaim — no-op, none of the 1 id can be "
+            "claimed by consumer 'c2' in group 'grp' on stream "
+            "'ws:c'",
+            safe,
+        )
+        self.assertIn(
+            "op 6: kv_xclaim — no-op, none of the 1 id can be "
+            "claimed by consumer 'c2' in group 'grp' on stream "
+            "'ws:c'",
             safe,
         )
 
