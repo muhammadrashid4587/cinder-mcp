@@ -130,6 +130,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
+    "kv_pfadd", "kv_pfmerge",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
@@ -266,7 +267,10 @@ PROMPTS = [
             "one, LPUSHXes and "
             "RPUSHXes that would fail on a container, LTRIMs that "
             "would delete a list outright, LMOVEs that would fail "
-            "on a container or drain a source list, and EXPIREs with "
+            "on a container or drain a source list, PFADDs that "
+            "would fail on a plain string or a container, PFMERGEs "
+            "that would discard a destination's registers or fail "
+            "on a plain string or a container, and EXPIREs with "
             "a bad timeout, and give a go/no-go per risky op."
         ),
         "arguments": [
@@ -1067,6 +1071,24 @@ def _lpushx_audit_elements(op):
     return elements
 
 
+def _pfadd_audit_elements(op):
+    """The elements for a kv_pfadd op in a write plan, validated
+    like the tool's own argument: a non-empty list of strings.
+    Anything else raises ValueError, so the caller reports the op
+    as not audited instead of guessing."""
+    elements = op.get("elements")
+    if not isinstance(elements, list) or not elements:
+        raise ValueError(
+            "kv_pfadd elements must be a non-empty list: %r" % (elements,)
+        )
+    for element in elements:
+        if not isinstance(element, str):
+            raise ValueError(
+                "kv_pfadd elements must be strings: %r" % (elements,)
+            )
+    return elements
+
+
 def _ltrim_audit_args(op):
     """The start and stop for a kv_ltrim op in a write plan,
     validated like the tool's own arguments: both must be integers.
@@ -1269,6 +1291,35 @@ def _bitop_audit_args(op):
             % (operation, op)
         )
     return operation, destination, sources
+
+
+def _pfmerge_audit_args(op):
+    """The (destination, sources) for a kv_pfmerge op in a write
+    plan, validated like the tool's own arguments: the
+    destination a string and the sources a non-empty list of
+    strings, at most 1000. Anything else raises ValueError, so
+    the caller reports the op as not audited instead of
+    guessing."""
+    destination = op.get("destination")
+    if not isinstance(destination, str):
+        raise ValueError(
+            "kv_pfmerge destination must be a string: %r" % (destination,)
+        )
+    sources = op.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError(
+            "kv_pfmerge sources must be a non-empty list: %r" % (sources,)
+        )
+    if len(sources) > 1000:
+        raise ValueError(
+            "kv_pfmerge merges at most 1000 sources; narrow the list"
+        )
+    for source in sources:
+        if not isinstance(source, str):
+            raise ValueError(
+                "kv_pfmerge sources must be strings: %r" % (sources,)
+            )
+    return destination, sources
 
 
 def _bitfield_audit_args(op):
@@ -1670,6 +1721,144 @@ def _audit_bitop(client, op):
     )
 
 
+def _hll_estimate(client, key):
+    """The PFCOUNT estimate for a key, or None when the key is not
+    a HyperLogLog. PFCOUNT is the probe: it answers for a
+    HyperLogLog and fails with WRONGTYPE for a plain string or a
+    container. GET alone cannot tell them apart — a HyperLogLog
+    reads back as a string value with an HLL1 header — so the
+    audit asks PFCOUNT instead of trusting the GET type."""
+    try:
+        return client.command("PFCOUNT", key)
+    except RespError:
+        return None
+
+
+def _audit_pfmerge(client, op):
+    """Audit one kv_pfmerge op: the destination and every source
+    are probed live, because the merge reads the sources,
+    overwrites the destination wholesale and clears its TTL — or
+    creates it when it does not exist. Cinder checks the
+    destination first, then the sources in order, and a failed
+    merge leaves the destination and its TTL untouched, so the
+    audit follows that order. A missing source counts as empty;
+    the destination may itself be a source, in which case its
+    own registers are unioned in instead of discarded. Returns
+    (verdict, line)."""
+    destination, sources = _pfmerge_audit_args(op)
+    dest_exists = client.command("EXISTS", destination) != 0
+    dest_estimate = None
+    dest_ttl = None
+    if dest_exists:
+        dest_ttl = client.command("TTL", destination)
+        if dest_ttl == -2:
+            # The destination expired while auditing; the merge
+            # creates it.
+            dest_exists = False
+        else:
+            try:
+                kind, _sv, size, _sample = _inspect_key(
+                    client, destination)
+            except ValueError:
+                # The destination expired between the TTL read and
+                # the probe; the merge creates it.
+                dest_exists = False
+            else:
+                if kind != "string":
+                    return "risky", (
+                        "kv_pfmerge %r — would fail with WRONGTYPE: "
+                        "the destination is a %s of %s"
+                        % (destination, kind, size)
+                    )
+                dest_estimate = _hll_estimate(client, destination)
+                if dest_estimate is None:
+                    return "risky", (
+                        "kv_pfmerge %r — would fail with WRONGTYPE: "
+                        "the destination is a plain string, not a "
+                        "HyperLogLog" % destination
+                    )
+    # Sources next, in order: a bad source fails the merge before
+    # the destination is touched, and sources are never modified.
+    live = 0
+    for source in sources:
+        if source == destination and dest_exists:
+            # Already probed as the destination: it is a
+            # HyperLogLog, and it counts as a live source.
+            live += 1
+            continue
+        if client.command("EXISTS", source) == 0:
+            continue
+        try:
+            kind, _sv, size, _sample = _inspect_key(client, source)
+        except ValueError:
+            # The source expired while auditing; it counts as
+            # missing now.
+            continue
+        if kind != "string":
+            return "risky", (
+                "kv_pfmerge %r — would fail with WRONGTYPE: source "
+                "%r is a %s of %s"
+                % (destination, source, kind, size)
+            )
+        if _hll_estimate(client, source) is None:
+            return "risky", (
+                "kv_pfmerge %r — would fail with WRONGTYPE: source "
+                "%r is a plain string, not a HyperLogLog"
+                % (destination, source)
+            )
+        live += 1
+    if not dest_exists:
+        return "caution", (
+            "kv_pfmerge %r — creates a new HyperLogLog with no "
+            "expiry from the union of %d source(s)"
+            % (destination, live)
+        )
+    if destination in sources:
+        # The destination's own registers are unioned in, so the
+        # merge can only keep or grow its estimate — but it
+        # clears the destination's TTL.
+        if dest_ttl == -1:
+            return "safe", (
+                "kv_pfmerge %r — merges %d source(s) including "
+                "itself; its estimate of %d stays or grows"
+                % (destination, live, dest_estimate)
+            )
+        return "caution", (
+            "kv_pfmerge %r — merges %d source(s) including itself; "
+            "its estimate of %d stays or grows, but its expiry "
+            "(currently %s) is cleared"
+            % (destination, live, dest_estimate,
+               _format_ttl(dest_ttl))
+        )
+    if dest_estimate > 0:
+        # The merge overwrites the destination wholesale: its own
+        # registers are discarded, not unioned in.
+        if dest_ttl == -1:
+            return "risky", (
+                "kv_pfmerge %r — would discard the destination's "
+                "registers, currently counting %d distinct "
+                "element(s), from a HyperLogLog that never expires"
+                % (destination, dest_estimate)
+            )
+        return "caution", (
+            "kv_pfmerge %r — discards the destination's registers, "
+            "currently counting %d distinct element(s), replacing "
+            "them with the union of %d source(s); its expiry is "
+            "cleared too"
+            % (destination, dest_estimate, live)
+        )
+    if dest_ttl == -1:
+        return "safe", (
+            "kv_pfmerge %r — merges the union of %d source(s) into "
+            "an empty HyperLogLog" % (destination, live)
+        )
+    return "caution", (
+        "kv_pfmerge %r — merges the union of %d source(s) into an "
+        "empty HyperLogLog, clearing its expiry (currently %s)"
+        % (destination, live, _format_ttl(dest_ttl))
+    )
+
+
 def _zremrangebyscore_audit_bounds(op):
     """The min/max bounds for a kv_zremrangebyscore op in a write
     plan, as RESP arguments, validated like the tool's own: numbers
@@ -1815,11 +2004,15 @@ def _audit_write_op(client, op):
     LMOVE out of a container, into a container, or that would
     delete a never-expiring source by taking its only element,
     a ZPOP that would drain a never-expiring or large
-    sorted set, or an EXPIRE,
+    sorted set, a PFMERGE that would discard a never-expiring
+    destination's registers, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
     of a key that expires soon anyway, a SET, MSET, SETNX, APPEND,
-    SETRANGE or GETSET that creates a key with no expiry, a HSETNX
+    SETRANGE or GETSET that creates a key with no expiry, a PFADD
+    or PFMERGE that creates a HyperLogLog with no expiry, a
+    PFMERGE that discards an expiring destination's registers or
+    clears its expiry, a HSETNX
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
@@ -1852,7 +2045,8 @@ def _audit_write_op(client, op):
     kv_lmove has two keys — a source and a destination — so it is
     audited by _audit_lmove instead. kv_bitop writes a destination
     from several sources, so it is audited by _audit_bitop
-    instead."""
+    instead. kv_pfmerge writes a destination from several sources,
+    so it is audited by _audit_pfmerge instead."""
     name = op.get("op")
     if name not in WRITE_SAFETY_WRITE_OPS:
         raise ValueError("not a write op: %s" % name)
@@ -1867,6 +2061,10 @@ def _audit_write_op(client, op):
         # BITOP writes a destination from several sources, so it
         # is audited on its own.
         return _audit_bitop(client, op)
+    if name == "kv_pfmerge":
+        # PFMERGE writes a destination from several sources, so it
+        # is audited on its own.
+        return _audit_pfmerge(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))
@@ -1907,6 +2105,12 @@ def _audit_write_op(client, op):
             return "caution", (
                 "kv_append %r — creates a new string key with no expiry"
                 % key
+            )
+        if name == "kv_pfadd":
+            _pfadd_audit_elements(op)
+            return "caution", (
+                "kv_pfadd %r — creates a new HyperLogLog with no "
+                "expiry" % key
             )
         if name in ("kv_decr", "kv_decrby"):
             if name == "kv_decrby" and "by" not in op:
@@ -2242,6 +2446,29 @@ def _audit_write_op(client, op):
         return "safe", (
             "kv_append %r — appends to a string of %s that %s"
             % (key, size, ttl_text)
+        )
+    if name == "kv_pfadd":
+        # PFADD grows the registers in place and never destroys
+        # data, so a HyperLogLog's size is no risk on its own —
+        # only a key that is not a HyperLogLog at all can fail.
+        # The register blob reads back as a 16KB string, so the
+        # `large` flag above does not apply here.
+        elements = _pfadd_audit_elements(op)
+        if kind != "string":
+            return "risky", (
+                "kv_pfadd %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        estimate = _hll_estimate(client, key)
+        if estimate is None:
+            return "risky", (
+                "kv_pfadd %r — would fail with WRONGTYPE: the key is "
+                "a plain string, not a HyperLogLog" % key
+            )
+        return "safe", (
+            "kv_pfadd %r — adds %d element(s) to a HyperLogLog "
+            "currently counting %d distinct element(s) that %s"
+            % (key, len(elements), estimate, ttl_text)
         )
     if name == "kv_setrange":
         # SETRANGE rewrites part of the string in place and keeps

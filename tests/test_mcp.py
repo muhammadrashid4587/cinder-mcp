@@ -11187,6 +11187,160 @@ class McpTests(unittest.TestCase):
             safe,
         )
 
+    def test_prompts_get_write_safety_covers_hyperloglog_write_ops(self):
+        self._call("tools/call", 1, {
+            "name": "kv_pfadd",
+            "arguments": {"key": "hll", "elements": ["a", "b", "c"]},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_pfadd",
+            "arguments": {"key": "soon-hll", "elements": ["x"]},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-hll", "seconds": 3600},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_pfmerge",
+            "arguments": {"destination": "empty-hll",
+                          "sources": ["ghost"]},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        plan = [
+            {"op": "kv_pfadd", "key": "hll", "elements": ["d"]},
+            {"op": "kv_pfadd", "key": "soon-hll", "elements": ["y"]},
+            {"op": "kv_pfadd", "key": "name", "elements": ["z"]},
+            {"op": "kv_pfadd", "key": "todo", "elements": ["z"]},
+            {"op": "kv_pfadd", "key": "brand-new", "elements": ["z"]},
+            {"op": "kv_pfadd", "key": "hll"},
+            {"op": "kv_pfmerge", "destination": "merged",
+             "sources": ["hll", "soon-hll"]},
+            {"op": "kv_pfmerge", "destination": "hll",
+             "sources": ["soon-hll"]},
+            {"op": "kv_pfmerge", "destination": "soon-hll",
+             "sources": ["hll"]},
+            {"op": "kv_pfmerge", "destination": "hll",
+             "sources": ["hll", "soon-hll"]},
+            {"op": "kv_pfmerge", "destination": "soon-hll",
+             "sources": ["soon-hll"]},
+            {"op": "kv_pfmerge", "destination": "empty-hll",
+             "sources": ["hll"]},
+            {"op": "kv_pfmerge", "destination": "empty-hll",
+             "sources": ["ghost"]},
+            {"op": "kv_pfmerge", "destination": "name",
+             "sources": ["hll"]},
+            {"op": "kv_pfmerge", "destination": "merged2",
+             "sources": ["name"]},
+            {"op": "kv_pfmerge", "destination": "merged3",
+             "sources": ["todo"]},
+            {"op": "kv_pfmerge", "destination": "merged4",
+             "sources": []},
+            {"op": "kv_pfmerge", "destination": "hll",
+             "sources": ["ghost"]},
+            {"op": "kv_pfcount", "keys": ["hll"]},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 19 op(s), 16 audited, 3 not audited.", text)
+        self.assertIn(
+            "op 5: kv_pfadd elements must be a non-empty list: None",
+            text)
+        self.assertIn(
+            "op 16: kv_pfmerge sources must be a non-empty list: []",
+            text)
+        self.assertIn("op 18: kv_pfcount is a read, not a write", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_pfadd 'name' — would fail with WRONGTYPE: the "
+            "key is a plain string, not a HyperLogLog",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_pfadd 'todo' — would fail with WRONGTYPE: the "
+            "key is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 7: kv_pfmerge 'hll' — would discard the destination's "
+            "registers, currently counting 3 distinct element(s), "
+            "from a HyperLogLog that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 13: kv_pfmerge 'name' — would fail with WRONGTYPE: "
+            "the destination is a plain string, not a HyperLogLog",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_pfmerge 'merged2' — would fail with WRONGTYPE: "
+            "source 'name' is a plain string, not a HyperLogLog",
+            risky,
+        )
+        self.assertIn(
+            "op 15: kv_pfmerge 'merged3' — would fail with WRONGTYPE: "
+            "source 'todo' is a list of 2 elements",
+            risky,
+        )
+        self.assertIn(
+            "op 17: kv_pfmerge 'hll' — would discard the destination's "
+            "registers, currently counting 3 distinct element(s), "
+            "from a HyperLogLog that never expires",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 4: kv_pfadd 'brand-new' — creates a new HyperLogLog "
+            "with no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 6: kv_pfmerge 'merged' — creates a new HyperLogLog "
+            "with no expiry from the union of 2 source(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 8: kv_pfmerge 'soon-hll' — discards the destination's "
+            "registers, currently counting 1 distinct element(s), "
+            "replacing them with the union of 1 source(s); its "
+            "expiry is cleared too",
+            caution,
+        )
+        self.assertIn(
+            "op 10: kv_pfmerge 'soon-hll' — merges 1 source(s) "
+            "including itself; its estimate of 1 stays or grows, "
+            "but its expiry (currently ",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_pfadd 'hll' — adds 1 element(s) to a HyperLogLog "
+            "currently counting 3 distinct element(s) that no expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 1: kv_pfadd 'soon-hll' — adds 1 element(s) to a "
+            "HyperLogLog currently counting 1 distinct element(s) "
+            "that expires in ",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_pfmerge 'hll' — merges 2 source(s) including "
+            "itself; its estimate of 3 stays or grows",
+            safe,
+        )
+        self.assertIn(
+            "op 11: kv_pfmerge 'empty-hll' — merges the union of 1 "
+            "source(s) into an empty HyperLogLog",
+            safe,
+        )
+        self.assertIn(
+            "op 12: kv_pfmerge 'empty-hll' — merges the union of 0 "
+            "source(s) into an empty HyperLogLog",
+            safe,
+        )
+
     def _renewal_text(self, arguments=None, batch_size=None):
         return self._prompt_text("ttl-renewal", arguments, batch_size)
 
