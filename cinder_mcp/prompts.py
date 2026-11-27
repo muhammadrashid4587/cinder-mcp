@@ -62,7 +62,7 @@ import time
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
-from .tools import MAX_GEOSEARCH_MEMBERS, _xadd_args
+from .tools import MAX_GEOSEARCH_MEMBERS, _xadd_args, _xreadgroup_args
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
 # The prompts process one batch at a time and keep only bounded
@@ -150,7 +150,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_georadius", "kv_georadiusbymember", "kv_geosearchstore",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
-    "kv_xadd",
+    "kv_xadd", "kv_xreadgroup",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -166,7 +166,8 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_geosearch", "kv_georadius_ro",
                          "kv_georadiusbymember_ro",
                          "kv_lindex", "kv_sscan",
-                         "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread")
+                         "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
+                         "kv_xpending")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -304,9 +305,14 @@ PROMPTS = [
             "GEORADIUSBYMEMBER_RO are reads too — "
             "GEOSEARCHSTOREs that would store their hits at a "
             "destination, overwriting it whatever it held, clearing "
-            "its TTL, or deleting it on an empty result, "
+            "its TTL, or deleting it on an empty result, XADDs that "
+            "would fail on a container or trim entries off a stream, "
+            "XREADGROUPs that would fail on a missing key or group "
+            "or deliver new entries into a group's pending list, "
             "and EXPIREs with "
-            "a bad timeout, and give a go/no-go per risky op."
+            "a bad timeout, and give a go/no-go per risky op. Read "
+            "ops in the plan are not audited — XRANGE, XREVRANGE, "
+            "XLEN, XREAD and XPENDING are reads, like GET."
         ),
         "arguments": [
             {
@@ -1724,6 +1730,86 @@ def _audit_mset(client, op):
     )
 
 
+def _audit_xreadgroup(client, op):
+    """Audit one kv_xreadgroup op: every stream in `streams` is
+    probed live, because one read can deliver entries on several
+    streams at once and each has its own type, TTL, and group. A
+    ">" read delivers new entries to the consumer and records them
+    in the group's pending list until XACK; an explicit-ID read
+    only re-reads this consumer's pending entries and changes no
+    delivery state. Returns (verdict, line)."""
+    group, consumer, keys, ids, _count = _xreadgroup_args(op)
+    risky = []
+    caution = []
+    safe = []
+    for key, id_value in zip(keys, ids):
+        if client.command("EXISTS", key) == 0:
+            risky.append(
+                "%r would fail: no such key or consumer group %r"
+                % (key, group)
+            )
+            continue
+        ttl = client.command("TTL", key)
+        if ttl == -2:
+            # The key expired while auditing; the read would fail.
+            risky.append(
+                "%r would fail: no such key or consumer group %r"
+                % (key, group)
+            )
+            continue
+        try:
+            kind, _size_value, size, _sample = _inspect_key(client, key)
+        except ValueError:
+            # The key expired between the TTL read and the probe.
+            risky.append(
+                "%r would fail: no such key or consumer group %r"
+                % (key, group)
+            )
+            continue
+        if kind != "stream":
+            risky.append(
+                "%r would fail with WRONGTYPE: the key is a %s of %s"
+                % (key, kind, size)
+            )
+            continue
+        try:
+            client.command("XPENDING", key, group)
+        except RespError as exc:
+            if "NOGROUP" in str(exc):
+                risky.append(
+                    "%r would fail: no such consumer group %r"
+                    % (key, group)
+                )
+                continue
+            raise
+        if id_value == ">":
+            if ttl == -1:
+                caution.append(
+                    "delivers new entries to consumer %r in group %r "
+                    "on stream %r, recording them in the pending list "
+                    "until XACK, on a stream that never expires"
+                    % (consumer, group, key)
+                )
+            else:
+                caution.append(
+                    "delivers new entries to consumer %r in group %r "
+                    "on stream %r, recording them in the pending list "
+                    "until XACK" % (consumer, group, key)
+                )
+        else:
+            safe.append(
+                "re-reads the pending entries of consumer %r in group "
+                "%r on stream %r without changing delivery state"
+                % (consumer, group, key)
+            )
+    if risky:
+        return "risky", "kv_xreadgroup — %s" % "; ".join(
+            risky + caution + safe)
+    if caution:
+        return "caution", "kv_xreadgroup — %s" % "; ".join(caution + safe)
+    return "safe", "kv_xreadgroup — %s" % "; ".join(safe)
+
+
 def _audit_lmove(client, op):
     """Audit one kv_lmove op: the source and the destination are
     both probed live, because the move reads the source, writes the
@@ -3058,7 +3144,8 @@ def _audit_write_op(client, op):
     sorted set, a PFMERGE that would discard a never-expiring
     destination's registers, an XADD with a MAXLEN that would trim
     entries off a never-expiring stream, or a MAXLEN 0 that would
-    delete a stream outright, or an EXPIRE,
+    delete a stream outright, an XREADGROUP on a missing key or a
+    missing group, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
     of a key that expires soon anyway, a SET, MSET, SETNX, APPEND,
@@ -3067,7 +3154,8 @@ def _audit_write_op(client, op):
     PFMERGE that discards an expiring destination's registers or
     clears its expiry, an XADD that creates a stream with no
     expiry, appends to a stream that never expires, or trims
-    entries off a stream that expires soon, a HSETNX
+    entries off a stream that expires soon, an XREADGROUP that
+    delivers new entries into a group's pending list, a HSETNX
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
@@ -3141,6 +3229,11 @@ def _audit_write_op(client, op):
         # A sorted-set store writes a destination from several
         # sources, so it is audited on its own.
         return _audit_zstore(client, op)
+    if name == "kv_xreadgroup":
+        # XREADGROUP reads several streams at once — a group and a
+        # consumer per call, not one key — so it is audited on its
+        # own.
+        return _audit_xreadgroup(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, XGROUP, XREADGROUP, XACK, XPENDING, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -78,12 +78,17 @@ class Stream:
     (ms, seq, [(field, value), ...]) triple, plus the top ID, so
     the next auto or partial ID is derived without scanning, as
     in real cinder. Field pairs keep the order they were given,
-    duplicates included."""
+    duplicates included. Consumer groups live on the stream: group
+    name to a dict with the last-delivered ID ("cursor"), the
+    pending list ("pel": (ms, seq) -> [consumer, delivered_ms,
+    delivery count]) and the consumers in the order they first
+    read ("consumers")."""
 
     def __init__(self):
         self.entries = []
         self.top_ms = 0
         self.top_seq = 0
+        self.groups = {}
 
     def __len__(self):
         return len(self.entries)
@@ -3563,6 +3568,254 @@ class FakeCinder(threading.Thread):
                     for item in flat:
                         reply += self._bulk(item)
             return reply
+        elif name == "XGROUP":
+            # XGROUP CREATE key group id [MKSTREAM], as in real
+            # cinder: "$" is the top ID at creation, "0" from the
+            # beginning, or an explicit ID; MKSTREAM creates the
+            # stream empty when it is missing. Only CREATE exists.
+            if len(args) < 1 or args[0].upper() != "CREATE":
+                return ("-ERR Unknown subcommand or wrong number of "
+                        "arguments for 'xgroup'\r\n")
+            if len(args) < 4 or len(args) > 5:
+                return ("-ERR wrong number of arguments for 'xgroup' "
+                        "command\r\n")
+            key, group, id_text = args[1], args[2], args[3]
+            mkstream = False
+            if len(args) == 5:
+                if args[4].upper() != "MKSTREAM":
+                    return "-ERR syntax error\r\n"
+                mkstream = True
+            value = self._get(key)
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            if id_text == "$":
+                cursor = ((value.top_ms, value.top_seq)
+                          if value is not None else (0, 0))
+            else:
+                cursor = _stream_parse_bound(id_text, False)
+                if cursor is None:
+                    return ("-ERR Invalid stream ID specified as stream "
+                            "command argument\r\n")
+            if value is None:
+                if not mkstream:
+                    return ("-ERR The XGROUP subcommand requires the key "
+                            "to exist. Use MKSTREAM to create the "
+                            "stream.\r\n")
+                expires = (self.store[key][1] if key in self.store
+                           else None)
+                value = Stream()
+                self.store[key] = (value, expires)
+            if group in value.groups:
+                return ("-ERR BUSYGROUP Consumer Group name already "
+                        "exists\r\n")
+            value.groups[group] = {"cursor": cursor, "pel": {},
+                                   "consumers": []}
+            return "+OK\r\n"
+        elif name == "XREADGROUP":
+            # XREADGROUP GROUP group consumer [COUNT count] STREAMS
+            # key [key ...] id [id ...], as in real cinder: ">"
+            # delivers the entries after the group's cursor,
+            # records them in the pending list with delivery count
+            # 1 and advances the cursor; an explicit ID re-reads
+            # this consumer's pending entries after that ID without
+            # changing delivery state. "$" is not valid here, and
+            # BLOCK is not supported yet. A per-stream failure
+            # answers an error, and the streams already collected
+            # are discarded with it — though entries already
+            # delivered stay delivered, as in real cinder.
+            if len(args) < 6 or args[0].upper() != "GROUP":
+                return ("-ERR wrong number of arguments for 'xreadgroup' "
+                        "command\r\n")
+            group, consumer = args[1], args[2]
+            count = -1
+            i = 3
+            while i < len(args) and args[i].upper() != "STREAMS":
+                opt = args[i].upper()
+                if opt == "COUNT":
+                    if i + 1 >= len(args):
+                        return ("-ERR wrong number of arguments for "
+                                "'xreadgroup' command\r\n")
+                    try:
+                        count = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR COUNT must be a positive "
+                                "integer\r\n")
+                    if count < 1:
+                        return ("-ERR COUNT must be a positive "
+                                "integer\r\n")
+                    i += 2
+                elif opt == "BLOCK":
+                    return ("-ERR BLOCK is not supported by XREADGROUP "
+                            "yet\r\n")
+                else:
+                    return "-ERR syntax error\r\n"
+            if i >= len(args):
+                return ("-ERR wrong number of arguments for 'xreadgroup' "
+                        "command\r\n")
+            i += 1
+            rest = args[i:]
+            if len(rest) < 2 or len(rest) % 2 != 0:
+                return ("-ERR Unbalanced XREADGROUP list of streams: for "
+                        "each stream key an ID must be specified.\r\n")
+            n = len(rest) // 2
+            keys = rest[:n]
+            ids = rest[n:]
+            out = []
+            for key, id_text in zip(keys, ids):
+                value = self._get(key)
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key holding "
+                            "the wrong kind of value\r\n")
+                grp = value.groups.get(group) if value is not None else None
+                if grp is None:
+                    return ("-ERR NOGROUP No such key '%s' or consumer "
+                            "group '%s'\r\n" % (key, group))
+                if id_text == ">":
+                    new_only = True
+                    bound = grp["cursor"]
+                elif id_text == "$":
+                    return ("-ERR Invalid stream ID specified as stream "
+                            "command argument\r\n")
+                else:
+                    new_only = False
+                    bound = _stream_parse_bound(id_text, False)
+                    if bound is None:
+                        return ("-ERR Invalid stream ID specified as stream "
+                                "command argument\r\n")
+                entries = []
+                now_ms = int(time.time() * 1000)
+                if value is not None:
+                    for ms, seq, pairs in value.entries:
+                        if (ms, seq) <= bound:
+                            continue
+                        if not new_only:
+                            pel = grp["pel"].get((ms, seq))
+                            if pel is None or pel[0] != consumer:
+                                continue
+                        if count >= 0 and len(entries) >= count:
+                            break
+                        entries.append((ms, seq, pairs))
+                if new_only and entries:
+                    for ms, seq, _pairs in entries:
+                        grp["pel"][(ms, seq)] = [consumer, now_ms, 1]
+                    grp["cursor"] = (entries[-1][0], entries[-1][1])
+                if consumer not in grp["consumers"]:
+                    grp["consumers"].append(consumer)
+                if entries:
+                    out.append((key, entries))
+            reply = "*%d\r\n" % len(out)
+            for key, entries in out:
+                reply += "*2\r\n"
+                reply += self._bulk(key)
+                reply += "*%d\r\n" % len(entries)
+                for ms, seq, pairs in entries:
+                    reply += "*2\r\n"
+                    reply += self._bulk("%d-%d" % (ms, seq))
+                    flat = [item for pair in pairs for item in pair]
+                    reply += "*%d\r\n" % len(flat)
+                    for item in flat:
+                        reply += self._bulk(item)
+            return reply
+        elif name == "XACK":
+            # XACK key group id [id ...]: drop entries from a
+            # group's pending list, answering how many were dropped.
+            if len(args) < 3:
+                return ("-ERR wrong number of arguments for 'xack' "
+                        "command\r\n")
+            key, group = args[0], args[1]
+            ids = []
+            for id_text in args[2:]:
+                bound = _stream_parse_bound(id_text, False)
+                if bound is None:
+                    return ("-ERR Invalid stream ID specified as stream "
+                            "command argument\r\n")
+                ids.append(bound)
+            value = self._get(key)
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            grp = value.groups.get(group) if value is not None else None
+            if grp is None:
+                return ("-ERR NOGROUP No such key '%s' or consumer "
+                        "group '%s'\r\n" % (key, group))
+            removed = 0
+            for bound in ids:
+                if bound in grp["pel"]:
+                    del grp["pel"][bound]
+                    removed += 1
+            return ":%d\r\n" % removed
+        elif name == "XPENDING":
+            # XPENDING key group: the summary — total, lowest and
+            # highest pending IDs (nil when nothing is pending),
+            # and a per-consumer count in the order the consumers
+            # first read. XPENDING key group start end count
+            # [consumer]: the pending entries in that ID range as
+            # [id, consumer, idle-ms, deliveries], optionally only
+            # the ones delivered to one consumer.
+            if len(args) != 2 and len(args) != 5 and len(args) != 6:
+                return ("-ERR wrong number of arguments for 'xpending' "
+                        "command\r\n")
+            key, group = args[0], args[1]
+            value = self._get(key)
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            grp = value.groups.get(group) if value is not None else None
+            if grp is None:
+                return ("-ERR NOGROUP No such key '%s' or consumer "
+                        "group '%s'\r\n" % (key, group))
+            if len(args) == 2:
+                pel = grp["pel"]
+                reply = "*4\r\n:%d\r\n" % len(pel)
+                if pel:
+                    ids = sorted(pel)
+                    reply += self._bulk("%d-%d" % ids[0])
+                    reply += self._bulk("%d-%d" % ids[-1])
+                else:
+                    reply += "$-1\r\n$-1\r\n"
+                counts = {}
+                for _id, (consumer, _t, _c) in pel.items():
+                    counts[consumer] = counts.get(consumer, 0) + 1
+                ordered = [c for c in grp["consumers"] if c in counts]
+                reply += "*%d\r\n" % len(ordered)
+                for consumer in ordered:
+                    reply += "*2\r\n"
+                    reply += self._bulk(consumer)
+                    reply += ":%d\r\n" % counts[consumer]
+                return reply
+            start = _stream_parse_bound(args[2], False)
+            end = _stream_parse_bound(args[3], True)
+            if start is None or end is None:
+                return ("-ERR Invalid stream ID specified as stream "
+                        "command argument\r\n")
+            try:
+                count = int(args[4])
+            except ValueError:
+                return "-ERR COUNT must be a positive integer\r\n"
+            if count < 1:
+                return "-ERR COUNT must be a positive integer\r\n"
+            consumer = args[5] if len(args) == 6 else None
+            now_ms = int(time.time() * 1000)
+            out = []
+            for (ms, seq) in sorted(grp["pel"]):
+                if (ms, seq) < start or (ms, seq) > end:
+                    continue
+                pel_consumer, delivered_ms, deliveries = grp["pel"][(ms, seq)]
+                if consumer is not None and pel_consumer != consumer:
+                    continue
+                if len(out) >= count:
+                    break
+                out.append((ms, seq, pel_consumer,
+                            now_ms - delivered_ms, deliveries))
+            reply = "*%d\r\n" % len(out)
+            for ms, seq, pel_consumer, idle, deliveries in out:
+                reply += "*4\r\n"
+                reply += self._bulk("%d-%d" % (ms, seq))
+                reply += self._bulk(pel_consumer)
+                reply += ":%d\r\n" % idle
+                reply += ":%d\r\n" % deliveries
+            return reply
         elif name == "XLEN" and len(args) == 1:
             value = self._get(args[0])
             if value is not None and not isinstance(value, Stream):
@@ -3679,7 +3932,7 @@ class McpTests(unittest.TestCase):
                     "kv_hpexpireat", "kv_httl", "kv_hpttl",
                     "kv_hpersist",
                     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen",
-                    "kv_xread",
+                    "kv_xread", "kv_xreadgroup", "kv_xpending",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -8723,6 +8976,26 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _xreadgroup_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xreadgroup", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _xpending_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xpending", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _raw(self):
+        # A raw RESP client against the fake, for the commands no
+        # MCP tool covers yet — XGROUP CREATE to make a group, XACK
+        # to drop entries from a pending list.
+        return RespClient("127.0.0.1", self.fake.port)
+
     def test_kv_xadd_returns_ids_and_xrange_reads_entries(self):
         # Explicit IDs, then a partial ID in the same millisecond,
         # then an auto ID: the IDs sort in insertion order.
@@ -9432,6 +9705,450 @@ class McpTests(unittest.TestCase):
             "name": "kv_exists", "arguments": {"key": "xb3"},
         })
         self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
+    def test_kv_xreadgroup_delivers_and_re_reads_pending(self):
+        # Three entries, then a group from the beginning: a ">"
+        # read delivers all three, a second ">" finds nothing new,
+        # and the pending list holds all three for the consumer.
+        for entry_id, fields in (("1000-0", {"name": "alice"}),
+                                 ("1000-1", {"name": "bob"}),
+                                 ("2000-0", {"name": "carol"})):
+            self.assertEqual(
+                self._xadd_result({"key": "xg:s", "id": entry_id,
+                                   "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xg:s", "grp", "0"),
+            "OK")
+        delivered = [{"id": "1000-0", "fields": {"name": "alice"}},
+                     {"id": "1000-1", "fields": {"name": "bob"}},
+                     {"id": "2000-0", "fields": {"name": "carol"}}]
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xg:s": ">"}}),
+            [{"key": "xg:s", "entries": delivered}])
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xg:s": ">"}}),
+            [])
+        self.assertEqual(
+            self._xpending_result({"key": "xg:s", "group": "grp"}),
+            {"total": 3, "min_id": "1000-0", "max_id": "2000-0",
+             "consumers": [{"consumer": "c1", "count": 3}]})
+        # The extended form lists each pending entry with its
+        # consumer, idle time and delivery count — idle is real
+        # time, so only the shape and the count are exact.
+        extended = self._xpending_result(
+            {"key": "xg:s", "group": "grp",
+             "start": "-", "end": "+", "count": 10})
+        self.assertEqual(
+            [(e["id"], e["consumer"], e["deliveries"]) for e in extended],
+            [("1000-0", "c1", 1), ("1000-1", "c1", 1),
+             ("2000-0", "c1", 1)])
+        for entry in extended:
+            self.assertGreaterEqual(entry["idle_ms"], 0)
+        # An explicit ID re-reads this consumer's pending entries
+        # after that ID, without changing delivery state.
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xg:s": "0"}}),
+            [{"key": "xg:s", "entries": delivered}])
+        self.assertEqual(
+            [(e["id"], e["deliveries"]) for e in self._xpending_result(
+                {"key": "xg:s", "group": "grp",
+                 "start": "-", "end": "+", "count": 10})],
+            [("1000-0", 1), ("1000-1", 1), ("2000-0", 1)])
+        # COUNT bounds the delivery, and the range and consumer
+        # filter bound the pending list.
+        self.assertEqual(
+            self._xadd_result({"key": "xg:s", "id": "3000-0",
+                               "fields": {"name": "dan"}}),
+            "3000-0")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c2",
+                                     "streams": {"xg:s": ">"},
+                                     "count": 1}),
+            [{"key": "xg:s",
+              "entries": [{"id": "3000-0", "fields": {"name": "dan"}}]}])
+        self.assertEqual(
+            self._xpending_result({"key": "xg:s", "group": "grp"}),
+            {"total": 4, "min_id": "1000-0", "max_id": "3000-0",
+             "consumers": [{"consumer": "c1", "count": 3},
+                           {"consumer": "c2", "count": 1}]})
+        self.assertEqual(
+            [e["id"] for e in self._xpending_result(
+                {"key": "xg:s", "group": "grp",
+                 "start": "1000-1", "end": "2000-0", "count": 10})],
+            ["1000-1", "2000-0"])
+        self.assertEqual(
+            [e["id"] for e in self._xpending_result(
+                {"key": "xg:s", "group": "grp",
+                 "start": "-", "end": "+", "count": 10,
+                 "consumer": "c2"})],
+            ["3000-0"])
+        self.assertEqual(
+            self._xpending_result(
+                {"key": "xg:s", "group": "grp",
+                 "start": "-", "end": "+", "count": 10,
+                 "consumer": "nobody"}),
+            [])
+        self.assertEqual(
+            [e["id"] for e in self._xpending_result(
+                {"key": "xg:s", "group": "grp",
+                 "start": "-", "end": "+", "count": 1})],
+            ["1000-0"])
+        # XACK drops one entry from the pending list.
+        self.assertEqual(
+            self._raw().command("XACK", "xg:s", "grp", "1000-0"), 1)
+        self.assertEqual(
+            self._raw().command("XACK", "xg:s", "grp", "9999-0"), 0)
+        self.assertEqual(
+            self._xpending_result({"key": "xg:s", "group": "grp"}),
+            {"total": 3, "min_id": "1000-1", "max_id": "3000-0",
+             "consumers": [{"consumer": "c1", "count": 2},
+                           {"consumer": "c2", "count": 1}]})
+        # A group on an empty stream has an empty pending list:
+        # total 0, no lowest or highest ID, no consumers.
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xg:empty", "grp",
+                                "$", "MKSTREAM"),
+            "OK")
+        self.assertEqual(
+            self._xpending_result({"key": "xg:empty", "group": "grp"}),
+            {"total": 0, "min_id": None, "max_id": None,
+             "consumers": []})
+        # Two streams at once, in stream order — and a per-stream
+        # failure answers an error while the entries already
+        # delivered to the first stream stay delivered.
+        self.assertEqual(
+            self._xadd_result({"key": "xg:t", "id": "1-0",
+                               "fields": {"v": "x"}}),
+            "1-0")
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xg:t", "grp", "0"),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result(
+                {"group": "grp", "consumer": "c1",
+                 "streams": {"xg:s": ">", "xg:t": ">"}}),
+            [{"key": "xg:t",
+              "entries": [{"id": "1-0", "fields": {"v": "x"}}]}])
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xreadgroup",
+            "arguments": {"group": "grp", "consumer": "c1",
+                          "streams": {"xg:t": ">", "xg:ghost": ">"}},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertIn("NOGROUP", reply["error"]["message"])
+
+    def test_kv_xreadgroup_rejects_bad_arguments(self):
+        self.assertEqual(
+            self._xadd_result({"key": "s", "id": "1-0",
+                               "fields": {"f": "v"}}),
+            "1-0")
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "s", "grp", "0"),
+            "OK")
+        bad = [{}, {"group": "grp", "consumer": "c1"},
+               {"group": "grp", "streams": {"s": ">"}},
+               {"consumer": "c1", "streams": {"s": ">"}},
+               {"group": 1, "consumer": "c1", "streams": {"s": ">"}},
+               {"group": "grp", "consumer": 1, "streams": {"s": ">"}},
+               {"group": "grp", "consumer": "c1", "streams": {}},
+               {"group": "grp", "consumer": "c1", "streams": []},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": 1}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {1: ">"}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": "$"}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": "abc"}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": "7-"}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": "1-2-3"}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": "18446744073709551616"}},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "count": 0},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "count": -1},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "count": 1001},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "count": 1.5},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "count": True},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s%d" % i: ">" for i in range(101)}}]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xreadgroup", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+        # A missing key, a missing group, and a non-stream key all
+        # fail as server errors, not invalid params.
+        for arguments in (
+                {"group": "grp", "consumer": "c1",
+                 "streams": {"ghost": ">"}},
+                {"group": "nope", "consumer": "c1",
+                 "streams": {"s": ">"}}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xreadgroup", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn("NOGROUP", reply["error"]["message"], arguments)
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xreadgroup",
+            "arguments": {"group": "grp", "consumer": "c1",
+                          "streams": {"plain": ">"}},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertIn("WRONGTYPE", reply["error"]["message"])
+
+    def test_kv_xpending_forms_and_errors(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xp:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xp:s", "grp", "0"),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xp:s": ">"}}),
+            [{"key": "xp:s",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}}]}])
+        # The summary and the extended form, and the extended form
+        # with a consumer filter.
+        self.assertEqual(
+            self._xpending_result({"key": "xp:s", "group": "grp"}),
+            {"total": 1, "min_id": "1-0", "max_id": "1-0",
+             "consumers": [{"consumer": "c1", "count": 1}]})
+        extended = self._xpending_result(
+            {"key": "xp:s", "group": "grp",
+             "start": "-", "end": "+", "count": 10})
+        self.assertEqual(len(extended), 1)
+        self.assertEqual(extended[0]["id"], "1-0")
+        self.assertEqual(extended[0]["consumer"], "c1")
+        self.assertEqual(extended[0]["deliveries"], 1)
+        self.assertGreaterEqual(extended[0]["idle_ms"], 0)
+        self.assertEqual(
+            [(e["id"], e["consumer"], e["deliveries"]) for e in
+             self._xpending_result(
+                {"key": "xp:s", "group": "grp",
+                 "start": "-", "end": "+", "count": 10,
+                 "consumer": "c1"})],
+            [("1-0", "c1", 1)])
+        # A partial range form fails as invalid params, as do a
+        # bad bound, a bad count, and a non-string consumer.
+        bad = [{}, {"key": "xp:s"}, {"group": "grp"},
+               {"key": 1, "group": "grp"},
+               {"key": "xp:s", "group": 1},
+               {"key": "xp:s", "group": "grp", "start": "-"},
+               {"key": "xp:s", "group": "grp", "end": "+"},
+               {"key": "xp:s", "group": "grp", "count": 10},
+               {"key": "xp:s", "group": "grp", "consumer": "c1"},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "+", "count": 10,
+                "consumer": 1},
+               {"key": "xp:s", "group": "grp",
+                "start": "abc", "end": "+", "count": 10},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "7-", "count": 10},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "+", "count": 0},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "+", "count": -1},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "+", "count": 1001},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "+", "count": 1.5},
+               {"key": "xp:s", "group": "grp",
+                "start": "-", "end": "+", "count": True}]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xpending", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+        # A missing key, a missing group, and a non-stream key all
+        # fail as server errors, not invalid params.
+        for arguments in ({"key": "ghost", "group": "grp"},
+                          {"key": "xp:s", "group": "nope"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xpending", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn("NOGROUP", reply["error"]["message"], arguments)
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xpending",
+            "arguments": {"key": "plain", "group": "grp"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertIn("WRONGTYPE", reply["error"]["message"])
+
+    def test_kv_xreadgroup_and_xpending_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "xb1", "id": "2-0",
+                 "fields": {"v": "b"}},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xb1", "grp", "0"),
+            "OK")
+        plain = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xb1": ">"}},
+                {"op": "kv_xpending", "key": "xb1", "group": "grp"},
+                {"op": "kv_xpending", "key": "xb1", "group": "grp",
+                 "start": "-", "end": "+", "count": 10},
+                {"op": "kv_xreadgroup", "group": "nope",
+                 "consumer": "c1", "streams": {"xb1": ">"}},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], [
+            {"key": "xb1",
+             "entries": [{"id": "1-0", "fields": {"v": "a"}},
+                         {"id": "2-0", "fields": {"v": "b"}}]},
+        ])
+        self.assertEqual(summary["results"][1]["result"], {
+            "total": 2, "min_id": "1-0", "max_id": "2-0",
+            "consumers": [{"consumer": "c1", "count": 2}]})
+        self.assertEqual(
+            [(e["id"], e["consumer"], e["deliveries"])
+             for e in summary["results"][2]["result"]],
+            [("1-0", "c1", 1), ("2-0", "c1", 1)])
+        self.assertFalse(summary["results"][3]["ok"])
+        self.assertIn("NOGROUP", summary["results"][3]["error"])
+        # The atomic batch queues both and runs them at EXEC: the
+        # group read delivers, the pending summary counts it, and
+        # the NOGROUP op is recorded in place.
+        atomic = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xb2", "grp", "0"),
+            "OK")
+        atomic = self._call("tools/call", 4, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xb2": ">"}},
+                {"op": "kv_xpending", "key": "xb2", "group": "grp"},
+                {"op": "kv_xpending", "key": "xb2", "group": "nope"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], [
+            {"key": "xb2",
+             "entries": [{"id": "5-0", "fields": {"v": "x"}}]},
+        ])
+        self.assertEqual(summary["results"][1]["result"], {
+            "total": 1, "min_id": "5-0", "max_id": "5-0",
+            "consumers": [{"consumer": "c1", "count": 1}]})
+        self.assertFalse(summary["results"][2]["ok"])
+        self.assertIn("NOGROUP", summary["results"][2]["error"])
+
+    def test_prompts_get_write_safety_covers_xreadgroup_and_xpending(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:g", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "ws:g", "grp", "0"),
+            "OK")
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "ws:plain", "value": "v"},
+        })
+        plan = [
+            {"op": "kv_xreadgroup", "group": "grp", "consumer": "c1",
+             "streams": {"ws:g": ">"}},
+            {"op": "kv_xreadgroup", "group": "grp", "consumer": "c1",
+             "streams": {"ws:g": "0"}},
+            {"op": "kv_xreadgroup", "group": "nope", "consumer": "c1",
+             "streams": {"ws:g": ">"}},
+            {"op": "kv_xreadgroup", "group": "grp", "consumer": "c1",
+             "streams": {"ws:ghost": ">"}},
+            {"op": "kv_xreadgroup", "group": "grp", "consumer": "c1",
+             "streams": {"ws:plain": ">"}},
+            {"op": "kv_xpending", "key": "ws:g", "group": "grp"},
+            {"op": "kv_xpending", "key": "ws:g", "group": "grp",
+             "start": "-", "end": "+", "count": 10},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 7 op(s), 5 audited, 2 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_xreadgroup — 'ws:g' would fail: no such "
+            "consumer group 'nope'",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_xreadgroup — 'ws:ghost' would fail: no such "
+            "key or consumer group 'grp'",
+            risky,
+        )
+        self.assertIn(
+            "op 4: kv_xreadgroup — 'ws:plain' would fail with "
+            "WRONGTYPE: the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_xreadgroup — delivers new entries to consumer "
+            "'c1' in group 'grp' on stream 'ws:g', recording them "
+            "in the pending list until XACK, on a stream that never "
+            "expires",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_xreadgroup — re-reads the pending entries of "
+            "consumer 'c1' in group 'grp' on stream 'ws:g' without "
+            "changing delivery state",
+            safe,
+        )
+        self.assertIn(
+            "op 5: kv_xpending is a read, not a write", text)
+        self.assertIn(
+            "op 6: kv_xpending is a read, not a write", text)
 
     def test_resources_read_key_stream_returns_type_and_length(self):
         self.assertEqual(
@@ -21742,6 +22459,204 @@ class LiveCinderMigrationTests(unittest.TestCase):
             ])},
         })["result"]["messages"][0]["content"]["text"]
         self.assertIn("op 0: kv_xrevrange is a read, not a write", text)
+
+    def test_live_consumer_group_tools(self):
+        """kv_xreadgroup / kv_xpending against a real cinder
+        (consumer groups in cinder 0.68.0, XPENDING in 0.69.0):
+        ">" delivery with PEL recording, an empty second read, the
+        pending summary and extended forms with real idle times,
+        a pending re-read that changes no delivery state, COUNT,
+        XACK, NOGROUP and WRONGTYPE errors, "$" rejected as
+        invalid params, no BLOCK option in the tool schema, the
+        tools queueing in one MULTI/EXEC transaction, and the
+        write-safety audit classifying XREADGROUP as a write and
+        XPENDING as a read."""
+        raw = RespClient("127.0.0.1", self.PORT)
+        for entry_id, fields in (
+                ("1000-0", {"name": "alice"}),
+                ("1000-1", {"name": "bob"}),
+                ("2000-0", {"name": "carol"})):
+            self.assertEqual(
+                self._tool("kv_xadd", {"key": "stream:grp",
+                                       "id": entry_id,
+                                       "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            raw.command("XGROUP", "CREATE", "stream:grp", "grp", "0"),
+            "OK")
+        # ">" delivers all three, and a second ">" finds nothing
+        # new — the group cursor advanced past them.
+        delivered = [{"id": "1000-0", "fields": {"name": "alice"}},
+                     {"id": "1000-1", "fields": {"name": "bob"}},
+                     {"id": "2000-0", "fields": {"name": "carol"}}]
+        self.assertEqual(
+            self._tool("kv_xreadgroup",
+                       {"group": "grp", "consumer": "c1",
+                        "streams": {"stream:grp": ">"}}),
+            [{"key": "stream:grp", "entries": delivered}])
+        self.assertEqual(
+            self._tool("kv_xreadgroup",
+                       {"group": "grp", "consumer": "c1",
+                        "streams": {"stream:grp": ">"}}),
+            [])
+        self.assertEqual(
+            self._tool("kv_xpending",
+                       {"key": "stream:grp", "group": "grp"}),
+            {"total": 3, "min_id": "1000-0", "max_id": "2000-0",
+             "consumers": [{"consumer": "c1", "count": 3}]})
+        # The extended form reports real idle times: they grow
+        # between two reads, and the delivery count stays 1.
+        first = self._tool("kv_xpending",
+                           {"key": "stream:grp", "group": "grp",
+                            "start": "-", "end": "+", "count": 10})
+        self.assertEqual(
+            [(e["id"], e["consumer"], e["deliveries"]) for e in first],
+            [("1000-0", "c1", 1), ("1000-1", "c1", 1),
+             ("2000-0", "c1", 1)])
+        time.sleep(0.06)
+        second = self._tool("kv_xpending",
+                            {"key": "stream:grp", "group": "grp",
+                             "start": "-", "end": "+", "count": 10})
+        self.assertGreater(second[0]["idle_ms"], first[0]["idle_ms"])
+        self.assertGreaterEqual(second[0]["idle_ms"], 50)
+        # An explicit ID re-reads this consumer's pending entries
+        # after that ID, without changing delivery state.
+        self.assertEqual(
+            self._tool("kv_xreadgroup",
+                       {"group": "grp", "consumer": "c1",
+                        "streams": {"stream:grp": "0"}}),
+            [{"key": "stream:grp", "entries": delivered}])
+        self.assertEqual(
+            [(e["id"], e["deliveries"]) for e in self._tool(
+                "kv_xpending",
+                {"key": "stream:grp", "group": "grp",
+                 "start": "-", "end": "+", "count": 10})],
+            [("1000-0", 1), ("1000-1", 1), ("2000-0", 1)])
+        # COUNT bounds the delivery, and XACK drops one entry from
+        # the pending list.
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:grp", "id": "3000-0",
+                                   "fields": {"name": "dan"}}),
+            "3000-0")
+        self.assertEqual(
+            self._tool("kv_xreadgroup",
+                       {"group": "grp", "consumer": "c2",
+                        "streams": {"stream:grp": ">"}, "count": 1}),
+            [{"key": "stream:grp",
+              "entries": [{"id": "3000-0", "fields": {"name": "dan"}}]}])
+        self.assertEqual(
+            self._tool("kv_xpending",
+                       {"key": "stream:grp", "group": "grp"}),
+            {"total": 4, "min_id": "1000-0", "max_id": "3000-0",
+             "consumers": [{"consumer": "c1", "count": 3},
+                           {"consumer": "c2", "count": 1}]})
+        self.assertEqual(raw.command("XACK", "stream:grp", "grp",
+                                     "1000-0"),
+                         1)
+        self.assertEqual(
+            self._tool("kv_xpending",
+                       {"key": "stream:grp", "group": "grp"}),
+            {"total": 3, "min_id": "1000-1", "max_id": "3000-0",
+             "consumers": [{"consumer": "c1", "count": 2},
+                           {"consumer": "c2", "count": 1}]})
+        # A group on an empty stream has an empty pending list.
+        self.assertEqual(
+            raw.command("XGROUP", "CREATE", "stream:gempty", "grp",
+                        "$", "MKSTREAM"),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_xpending",
+                       {"key": "stream:gempty", "group": "grp"}),
+            {"total": 0, "min_id": None, "max_id": None,
+             "consumers": []})
+        # NOGROUP and WRONGTYPE fail as server errors, and "$" and
+        # a partial range form fail as invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "stream:plain3", "value": "v"}),
+            "OK")
+        for name, arguments in (
+                ("kv_xreadgroup",
+                 {"group": "nope", "consumer": "c1",
+                  "streams": {"stream:grp": ">"}}),
+                ("kv_xreadgroup",
+                 {"group": "grp", "consumer": "c1",
+                  "streams": {"stream:plain3": ">"}}),
+                ("kv_xpending",
+                 {"key": "stream:grp", "group": "nope"}),
+                ("kv_xpending",
+                 {"key": "stream:plain3", "group": "grp"}),
+                ("kv_xreadgroup",
+                 {"group": "grp", "consumer": "c1",
+                  "streams": {"stream:grp": "$"}}),
+                ("kv_xpending",
+                 {"key": "stream:grp", "group": "grp",
+                  "start": "-", "end": "+"})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+        # The tool offers no BLOCK: cinder refuses BLOCK on
+        # XREADGROUP, so it is not in the schema at all.
+        listed = self._call("tools/list", 2)["result"]["tools"]
+        schema = [t for t in listed
+                  if t["name"] == "kv_xreadgroup"][0]["inputSchema"]
+        self.assertNotIn("block", schema["properties"])
+        # The tools queue in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_xadd", "key": "stream:grptx", "id": "5-0",
+             "fields": {"v": "x"}},
+        ]})
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(
+            raw.command("XGROUP", "CREATE", "stream:grptx", "grp", "0"),
+            "OK")
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_xreadgroup", "group": "grp",
+             "consumer": "c1", "streams": {"stream:grptx": ">"}},
+            {"op": "kv_xpending", "key": "stream:grptx",
+             "group": "grp"},
+            {"op": "kv_xpending", "key": "stream:grptx",
+             "group": "nope"},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], [
+            {"key": "stream:grptx",
+             "entries": [{"id": "5-0", "fields": {"v": "x"}}]},
+        ])
+        self.assertEqual(summary["results"][1]["result"], {
+            "total": 1, "min_id": "5-0", "max_id": "5-0",
+            "consumers": [{"consumer": "c1", "count": 1}]})
+        self.assertFalse(summary["results"][2]["ok"])
+        self.assertIn("NOGROUP", summary["results"][2]["error"])
+        # The write-safety audit classifies XREADGROUP as a write
+        # and XPENDING as a read.
+        text = self._call("prompts/get", 98, {
+            "name": "write-safety",
+            "arguments": {"plan": json.dumps([
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"stream:grp": ">"}},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"stream:grp": "0"}},
+                {"op": "kv_xpending", "key": "stream:grp",
+                 "group": "grp"},
+            ])},
+        })["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Plan: 3 op(s), 2 audited, 1 not audited.", text)
+        self.assertIn(
+            "op 0: kv_xreadgroup — delivers new entries to consumer "
+            "'c1' in group 'grp' on stream 'stream:grp', recording "
+            "them in the pending list until XACK, on a stream that "
+            "never expires",
+            text.split("Caution (")[1].split("\n\n")[0],
+        )
+        self.assertIn(
+            "op 1: kv_xreadgroup — re-reads the pending entries of "
+            "consumer 'c1' in group 'grp' on stream 'stream:grp' "
+            "without changing delivery state",
+            text.split("Safe (")[1].split("\n\n")[0],
+        )
+        self.assertIn("op 2: kv_xpending is a read, not a write", text)
 
 
 if __name__ == "__main__":
