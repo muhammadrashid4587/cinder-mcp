@@ -29,7 +29,8 @@ HINCRBYs that would fail
 on a non-integer field or a container, HINCRBYFLOATs that would fail
 on a non-float field or a container, HEXPIREs that would delete
 fields at once or fail on a bad timeout, condition, or container,
-and HPERSISTs that would strip a field's expiry, GEORADIUSes and
+and HPERSISTs that would strip a field's expiry, XADDs that would
+fail on a container or trim entries off a stream, GEORADIUSes and
 GEORADIUSBYMEMBERs that would store their hits at a destination —
 a plain GEORADIUS is a read, and GEOSEARCH is a read too — and
 GEOSEARCHSTOREs that would store their hits at a destination,
@@ -61,7 +62,7 @@ import time
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
-from .tools import MAX_GEOSEARCH_MEMBERS
+from .tools import MAX_GEOSEARCH_MEMBERS, _xadd_args
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
 # The prompts process one batch at a time and keep only bounded
@@ -149,6 +150,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_georadius", "kv_georadiusbymember", "kv_geosearchstore",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
+    "kv_xadd",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -163,7 +165,8 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_geodist", "kv_geopos", "kv_geohash",
                          "kv_geosearch", "kv_georadius_ro",
                          "kv_georadiusbymember_ro",
-                         "kv_lindex", "kv_sscan")
+                         "kv_lindex", "kv_sscan",
+                         "kv_xrange", "kv_xlen")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the
@@ -473,14 +476,15 @@ def _inspect_key(client, key):
     the human rendering ("5 bytes", "2 elements"). Cinder has no
     TYPE command, so the type is probed the same way the per-key
     resource does: GET succeeds for strings, otherwise LLEN /
-    SCARD / HLEN / ZCARD are tried in turn and the first one that
-    does not answer WRONGTYPE names it."""
+    SCARD / HLEN / ZCARD / XLEN are tried in turn and the first one
+    that does not answer WRONGTYPE names it."""
     try:
         value = client.command("GET", key)
     except RespError:
         # Not a string: probe the container types.
         for probe, name in (("LLEN", "list"), ("SCARD", "set"),
-                            ("HLEN", "hash"), ("ZCARD", "zset")):
+                            ("HLEN", "hash"), ("ZCARD", "zset"),
+                            ("XLEN", "stream")):
             try:
                 length = client.command(probe, key)
             except RespError:
@@ -3052,14 +3056,18 @@ def _audit_write_op(client, op):
     delete a never-expiring source by taking its only element,
     a ZPOP that would drain a never-expiring or large
     sorted set, a PFMERGE that would discard a never-expiring
-    destination's registers, or an EXPIRE,
+    destination's registers, an XADD with a MAXLEN that would trim
+    entries off a never-expiring stream, or a MAXLEN 0 that would
+    delete a stream outright, or an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
     of a key that expires soon anyway, a SET, MSET, SETNX, APPEND,
     SETRANGE or GETSET that creates a key with no expiry, a PFADD
     or PFMERGE that creates a HyperLogLog with no expiry, a
     PFMERGE that discards an expiring destination's registers or
-    clears its expiry, a HSETNX
+    clears its expiry, an XADD that creates a stream with no
+    expiry, appends to a stream that never expires, or trims
+    entries off a stream that expires soon, a HSETNX
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
@@ -3195,6 +3203,20 @@ def _audit_write_op(client, op):
             return "caution", (
                 "kv_geoadd %r — creates a new geo sorted set with no "
                 "expiry" % key
+            )
+        if name == "kv_xadd":
+            # XADD on a missing key creates a stream — unless
+            # MAXLEN 0 trims the entry at once, in which case
+            # nothing persists and no key is left behind.
+            _key, _id, _fields, maxlen, _approx = _xadd_args(op)
+            if maxlen == 0:
+                return "safe", (
+                    "kv_xadd %r — no-op, MAXLEN 0 trims the entry "
+                    "at once" % key
+                )
+            return "caution", (
+                "kv_xadd %r — creates a new stream with no expiry"
+                % key
             )
         if name in ("kv_decr", "kv_decrby"):
             if name == "kv_decrby" and "by" not in op:
@@ -3628,6 +3650,58 @@ def _audit_write_op(client, op):
             "kv_geoadd %r — adds %d new member(s) to a geo set of "
             "%s that %s"
             % (key, len(members), size, ttl_text)
+        )
+    if name == "kv_xadd":
+        # XADD only appends, so it never destroys an entry on its
+        # own — but MAXLEN trims the oldest entries, and MAXLEN 0
+        # trims the whole stream at once, deleting the key. A
+        # stream that never expires also grows without bound, so
+        # appending to one is caution, not safe. The audit cannot
+        # see the stream's top ID without reading the whole
+        # stream, so an ID at or below the top still fails at
+        # runtime; only the ID's shape is validated here.
+        _key, _id, _fields, maxlen, _approx = _xadd_args(op)
+        if kind != "stream":
+            return "risky", (
+                "kv_xadd %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (key, kind, size)
+            )
+        if maxlen == 0:
+            if ttl == -1 or large:
+                return "risky", (
+                    "kv_xadd %r — would delete the whole stream of "
+                    "%s outright (MAXLEN 0 trims every entry)%s"
+                    % (key, size,
+                       " that never expires" if ttl == -1 else "")
+                )
+            return "caution", (
+                "kv_xadd %r — would delete the whole stream of %s "
+                "outright (MAXLEN 0 trims every entry), but it %s"
+                % (key, size, ttl_text)
+            )
+        if maxlen is not None and size_value > maxlen:
+            trimmed = size_value - maxlen
+            if ttl == -1:
+                return "risky", (
+                    "kv_xadd %r — would trim the %d oldest entr%s "
+                    "from a stream of %s that never expires"
+                    % (key, trimmed,
+                       "y" if trimmed == 1 else "ies", size)
+                )
+            return "caution", (
+                "kv_xadd %r — would trim the %d oldest entr%s from "
+                "a stream of %s that %s"
+                % (key, trimmed,
+                   "y" if trimmed == 1 else "ies", size, ttl_text)
+            )
+        if ttl == -1:
+            return "caution", (
+                "kv_xadd %r — appends one entry to a stream of %s "
+                "that never expires" % (key, size)
+            )
+        return "safe", (
+            "kv_xadd %r — appends one entry to a stream of %s that "
+            "%s" % (key, size, ttl_text)
         )
     if name == "kv_setrange":
         # SETRANGE rewrites part of the string in place and keeps

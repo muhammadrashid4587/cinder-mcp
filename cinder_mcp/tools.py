@@ -607,6 +607,44 @@ TOOLS = [
        },
    },
     {
+        "name": "kv_xadd",
+        "description": "Append one entry to a stream: XADD key [MAXLEN [~] threshold] id field value [field value ...]. Takes `fields` as an object of field names to values (at least one) and returns the new entry's ID as a string. The `id` defaults to \"*\" (auto: the current time in milliseconds, sequence 0, or the top ID's sequence plus one when the millisecond is not past it); \"ms-seq\" is explicit, and \"ms-*\" or \"ms-\" takes the millisecond and the next sequence in it — a bare millisecond is not an ID. An ID at or below the stream's top ID fails, and an explicit \"0-0\" fails, while a partial \"0-*\" on an empty stream resolves to \"0-0\", as in cinder. Pass `maxlen` to trim the oldest entries down to that many after the append (0 trims the entry just added, so the key is deleted at once); `approximate: true` sends MAXLEN ~, which cinder trims exactly like the plain form. Creates the stream when it does not exist, and preserves its TTL.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "id": {"type": "string"},
+                "fields": {"type": "object"},
+                "maxlen": {"type": "integer"},
+                "approximate": {"type": "boolean"},
+            },
+            "required": ["key", "fields"],
+        },
+    },
+    {
+        "name": "kv_xrange",
+        "description": "Entries of a stream in an ID range, oldest first: XRANGE key start end [COUNT count]. Takes `start` and `end` as stream IDs (\"-\" for the first entry, \"+\" for the last, a bare millisecond for the whole millisecond, or \"ms-seq\"), defaulting to \"-\" and \"+\". Returns a list of {\"id\": ..., \"fields\": {...}} objects, in ID order, the bounds inclusive. Pass `count` to take at most that many entries (0 answers an empty list); without a count at most 1000 entries are returned, and a wider range fails instead of returning a truncated list. A missing key answers an empty list, and a start past the end does too. A field named twice in one entry keeps only its last value in the object.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "start": {"type": "string"},
+                "end": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_xlen",
+        "description": "The number of entries in a stream: XLEN key. Returns 0 when the key does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -1424,7 +1462,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xlen, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1555,6 +1593,7 @@ BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
+    "kv_xadd", "kv_xrange", "kv_xlen",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1651,6 +1690,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
+    "kv_xadd", "kv_xrange", "kv_xlen",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1866,6 +1906,22 @@ def _call_batch_atomic(client, ops):
                               "narrow the range" % MAX_ZRANGE_MEMBERS})
                 continue
             value = count
+        elif op_name == "kv_xrange":
+            # XRANGE came back as [[id, [field, value, ...]], ...]
+            # inside the transaction; shape it like the standalone
+            # tool does, into id/fields objects. A range wider
+            # than the cap is recorded as this op's error, in
+            # place, like an EXEC-time failure — the rest still
+            # run.
+            entries = _xrange_result(reply or [])
+            if len(entries) > MAX_XRANGE_ENTRIES:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_xrange returns at most %d entries; "
+                              "narrow the range or pass a count"
+                              % MAX_XRANGE_ENTRIES})
+                continue
+            value = entries
         elif op_name in ("kv_zpopmin", "kv_zpopmax"):
             # ZPOPMIN/ZPOPMAX came back as a flat list inside the
             # transaction; shape it like the standalone tool does,
@@ -2317,6 +2373,27 @@ def _op_argv(name, args):
         fields = _hexpire_fields_args(args, name)
         return [command, _require(args, "key"),
                 "FIELDS", len(fields)] + fields
+    if name == "kv_xadd":
+        # XADD key [MAXLEN [~] threshold] id field value ... —
+        # the MAXLEN option comes before the ID, as in cinder.
+        key, id_value, field_argv, maxlen, approximate = _xadd_args(args)
+        cmd = ["XADD", key]
+        if maxlen is not None:
+            if approximate:
+                cmd += ["MAXLEN", "~", maxlen]
+            else:
+                cmd += ["MAXLEN", maxlen]
+        return cmd + [id_value] + field_argv
+    if name == "kv_xrange":
+        # XRANGE key start end [COUNT count] — COUNT is always
+        # sent, so the reply stays bounded even when the caller
+        # did not ask for a count: one past the cap, and the
+        # extra entry proves the range is too wide.
+        key, start, end, count = _xrange_args(args)
+        return ["XRANGE", key, start, end, "COUNT",
+                count if count is not None else MAX_XRANGE_ENTRIES + 1]
+    if name == "kv_xlen":
+        return ["XLEN", _require(args, "key")]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -3210,6 +3287,171 @@ def _hexpire_time_args(args, name, time_field, absolute, is_ms):
     condition = _hexpire_condition(args, name)
     fields = _hexpire_fields_args(args, name)
     return key, time_value, condition, fields
+
+
+# The most entries one kv_xrange call returns; a wider range fails
+# instead of dumping a huge slice of a stream into one tool result.
+MAX_XRANGE_ENTRIES = 1000
+
+# Stream IDs are two unsigned 64-bit parts; cinder's parser rejects
+# anything wider, as well as any non-digit.
+_STREAM_U64_MAX = 2 ** 64 - 1
+
+
+def _stream_u64(text, tool, what):
+    """One millisecond or sequence part of a stream ID or bound, as
+    an integer. The text must be non-empty decimal digits that fit
+    in an unsigned 64-bit integer — cinder's parser rejects
+    anything else as an invalid stream ID, so fail here as invalid
+    params instead."""
+    if (not isinstance(text, str) or not text
+            or any(ch < "0" or ch > "9" for ch in text)):
+        raise ValueError(
+            "%s %s must be decimal digits, got %r" % (tool, what, text)
+        )
+    value = int(text)
+    if value > _STREAM_U64_MAX:
+        raise ValueError(
+            "%s %s is out of range: %r" % (tool, what, text)
+        )
+    return value
+
+
+def _stream_xadd_id(value, tool="kv_xadd"):
+    """The ID for an XADD: "*" (auto), "ms-seq" (explicit), or
+    "ms-*" / "ms-" (partial, the sequence is automatic). A bare
+    millisecond is not an ID — cinder rejects it — and an explicit
+    "0-0" fails, since an ID must be greater than 0-0; a partial
+    "0-*" is allowed, and on an empty stream it resolves to 0-0.
+    The ID is returned verbatim for the argv."""
+    if not isinstance(value, str):
+        raise ValueError("%s id must be a string" % tool)
+    if value == "*":
+        return value
+    if "-" not in value:
+        raise ValueError(
+            "%s id must be \"*\", \"ms-seq\", \"ms-*\" or \"ms-\", got %r"
+            % (tool, value)
+        )
+    ms_text, seq_text = value.split("-", 1)
+    ms = _stream_u64(ms_text, tool, "id ms part")
+    if seq_text in ("*", ""):
+        # Partial ID: the sequence is automatic for this ms.
+        return value
+    seq = _stream_u64(seq_text, tool, "id sequence part")
+    if ms == 0 and seq == 0:
+        raise ValueError(
+            "%s id must be greater than 0-0" % tool
+        )
+    return value
+
+
+def _stream_bound(value, tool="kv_xrange"):
+    """One XRANGE bound: "-" (the first entry), "+" (the last), a
+    bare millisecond (the whole millisecond), or "ms-seq". A bound
+    like "7-" — a dash with no sequence — is not valid, and neither
+    is "*" or a non-numeric bound. The bound is returned verbatim
+    for the argv."""
+    if not isinstance(value, str):
+        raise ValueError("%s bound must be a string" % tool)
+    if value in ("-", "+"):
+        return value
+    if "-" not in value:
+        _stream_u64(value, tool, "bound")
+        return value
+    ms_text, seq_text = value.split("-", 1)
+    _stream_u64(ms_text, tool, "bound ms part")
+    _stream_u64(seq_text, tool, "bound sequence part")
+    return value
+
+
+def _xadd_args(args):
+    """Validate a kv_xadd call: (key, id, field argv, maxlen,
+    approximate). `fields` must be a non-empty object of string
+    field names to string values, sent in sorted field order so
+    the argv is deterministic, like kv_hset's. `maxlen` must be an
+    integer 0 or more when given; `approximate` must be a boolean
+    when given."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xadd key must be a string")
+    id_value = _stream_xadd_id(args.get("id", "*"))
+    fields = args.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("kv_xadd fields must be a non-empty object")
+    field_argv = []
+    for field in sorted(fields):
+        value = fields[field]
+        if not isinstance(field, str) or not isinstance(value, str):
+            raise ValueError(
+                "kv_xadd fields must map string field names to string values"
+            )
+        field_argv += [field, value]
+    maxlen = args.get("maxlen")
+    approximate = args.get("approximate", False)
+    if not isinstance(approximate, bool):
+        raise ValueError("kv_xadd approximate must be true or false")
+    if maxlen is not None:
+        if isinstance(maxlen, bool) or not isinstance(maxlen, int):
+            raise ValueError("kv_xadd maxlen must be an integer")
+        if maxlen < 0:
+            raise ValueError(
+                "kv_xadd maxlen must be 0 or more, got %d" % maxlen
+            )
+    return key, id_value, field_argv, maxlen, approximate
+
+
+def _xrange_args(args):
+    """Validate a kv_xrange call: (key, start, end, count). The
+    bounds default to "-" and "+". `count` must be an integer
+    between 0 and MAX_XRANGE_ENTRIES when given — 0 answers an
+    empty list, as in cinder."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xrange key must be a string")
+    start = _stream_bound(args.get("start", "-"))
+    end = _stream_bound(args.get("end", "+"))
+    count = args.get("count")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("kv_xrange count must be an integer")
+        if count < 0 or count > MAX_XRANGE_ENTRIES:
+            raise ValueError(
+                "kv_xrange count must be between 0 and %d, got %d"
+                % (MAX_XRANGE_ENTRIES, count)
+            )
+    return key, start, end, count
+
+
+def _xrange_result(reply):
+    """Shape a flat XRANGE reply [[id, [field, value, ...]], ...]
+    into [{"id": ..., "fields": {...}}, ...], in ID order. A
+    missing key replies as an empty list, which becomes []. A
+    field named twice in one entry keeps only its last value in
+    the object — cinder stores both, but the object has one slot
+    per field name, as in HGETALL's dict shaping."""
+    entries = []
+    for entry_id, flat in reply or []:
+        entries.append({
+            "id": entry_id,
+            "fields": {flat[i]: flat[i + 1]
+                       for i in range(0, len(flat), 2)},
+        })
+    return entries
+
+
+def _call_xrange(client, args):
+    """kv_xrange: the entries in [start, end], shaped into
+    id/fields objects. At most MAX_XRANGE_ENTRIES entries per call;
+    a wider range fails instead of returning a truncated list."""
+    reply = client.command(*_op_argv("kv_xrange", args))
+    entries = _xrange_result(reply or [])
+    if len(entries) > MAX_XRANGE_ENTRIES:
+        raise ValueError(
+            "kv_xrange returns at most %d entries; narrow the range "
+            "or pass a count" % MAX_XRANGE_ENTRIES
+        )
+    return entries
 
 
 # The most members one kv_zrange call returns; a wider range fails
@@ -4934,6 +5176,8 @@ def _call_single(client, name, args):
         return _call_hvals(client, args)
     if name == "kv_hincrbyfloat":
         return _call_hincrbyfloat(client, args)
+    if name == "kv_xrange":
+        return _call_xrange(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":

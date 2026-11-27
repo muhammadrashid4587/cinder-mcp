@@ -73,6 +73,93 @@ class HLL:
         self.elements = set()
 
 
+class Stream:
+    """A stream in the fake store: entries in ID order, each an
+    (ms, seq, [(field, value), ...]) triple, plus the top ID, so
+    the next auto or partial ID is derived without scanning, as
+    in real cinder. Field pairs keep the order they were given,
+    duplicates included."""
+
+    def __init__(self):
+        self.entries = []
+        self.top_ms = 0
+        self.top_seq = 0
+
+    def __len__(self):
+        return len(self.entries)
+
+
+def _stream_u64(text):
+    """One millisecond or sequence part of a stream ID or bound:
+    non-empty decimal digits fitting in an unsigned 64-bit
+    integer, as cinder's parser requires."""
+    if not text or any(ch < "0" or ch > "9" for ch in text):
+        return None
+    value = int(text)
+    if value > 2 ** 64 - 1:
+        return None
+    return value
+
+
+def _stream_resolve_id(text, stream):
+    """Resolve an XADD ID against the stream's top ID, as cinder's
+    stream_resolve_id does: "*" is fully automatic, "ms-seq" is
+    explicit, "ms-*" or "ms-" is partial. Returns (ms, seq) or an
+    error string — "invalid" for a malformed ID, "too small" for
+    one at or below the top, "zero" for an explicit 0-0."""
+    top_ms = stream.top_ms if stream else 0
+    top_seq = stream.top_seq if stream else 0
+    have_top = stream is not None and len(stream) > 0
+    if text == "*":
+        ms = int(time.time() * 1000)
+        if have_top and ms <= top_ms:
+            return top_ms, top_seq + 1
+        return ms, 0
+    if "-" not in text:
+        return "invalid"
+    ms_text, seq_text = text.split("-", 1)
+    ms = _stream_u64(ms_text)
+    if ms is None:
+        return "invalid"
+    if seq_text in ("*", ""):
+        if have_top and ms < top_ms:
+            return "too small"
+        if have_top and ms == top_ms:
+            return ms, top_seq + 1
+        return ms, 0
+    seq = _stream_u64(seq_text)
+    if seq is None:
+        return "invalid"
+    if ms == 0 and seq == 0:
+        return "zero"
+    if have_top and (ms < top_ms or (ms == top_ms and seq <= top_seq)):
+        return "too small"
+    return ms, seq
+
+
+def _stream_parse_bound(text, is_end):
+    """Parse an XRANGE bound, as cinder's stream_parse_bound does:
+    "-" is the first ID, "+" the last, a bare millisecond covers
+    the whole millisecond (first sequence for a start bound, last
+    for an end bound), and "ms-seq" is exact. Returns
+    (ms, seq) or None for a malformed bound."""
+    if text == "-":
+        return 0, 0
+    if text == "+":
+        return 2 ** 64 - 1, 2 ** 64 - 1
+    if "-" not in text:
+        ms = _stream_u64(text)
+        if ms is None:
+            return None
+        return ms, (2 ** 64 - 1 if is_end else 0)
+    ms_text, seq_text = text.split("-", 1)
+    ms = _stream_u64(ms_text)
+    seq = _stream_u64(seq_text)
+    if ms is None or seq is None:
+        return None
+    return ms, seq
+
+
 # The 52-bit geohash Redis stores as a sorted-set score: 26
 # latitude bits and 26 longitude bits interleaved, latitude in the
 # even bit positions, longitude in the odd ones — the same layout
@@ -3197,6 +3284,123 @@ class FakeCinder(threading.Thread):
             value, _ = self.store[args[0]]
             self.store[args[0]] = (value, time.time() + milliseconds / 1000.0)
             return ":1\r\n"
+        elif name == "XADD":
+            # XADD key [MAXLEN [~] threshold] id field value ...,
+            # as in real cinder: the MAXLEN option comes before
+            # the ID, an entry needs at least one field/value pair,
+            # and the ID resolves against the stream's top ID.
+            if len(args) < 3:
+                return ("-ERR wrong number of arguments for 'xadd' "
+                        "command\r\n")
+            key = args[0]
+            i = 1
+            maxlen = -1
+            if args[i].upper() == "MAXLEN":
+                if len(args) < 4:
+                    return ("-ERR wrong number of arguments for 'xadd' "
+                            "command\r\n")
+                i += 1
+                if args[i] == "~":
+                    if len(args) < 5:
+                        return ("-ERR wrong number of arguments for "
+                                "'xadd' command\r\n")
+                    i += 1
+                try:
+                    maxlen = int(args[i])
+                except ValueError:
+                    return "-ERR invalid MAXLEN\r\n"
+                if maxlen < 0:
+                    return "-ERR invalid MAXLEN\r\n"
+                i += 1
+            if len(args) - i < 3 or (len(args) - i) % 2 != 1:
+                return ("-ERR wrong number of arguments for 'xadd' "
+                        "command\r\n")
+            value = self._get(key)
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            resolved = _stream_resolve_id(args[i], value)
+            if resolved == "invalid":
+                return ("-ERR Invalid stream ID specified as stream "
+                        "command argument\r\n")
+            if resolved == "too small":
+                return ("-ERR The ID specified in XADD is equal or "
+                        "smaller than the target stream top item\r\n")
+            if resolved == "zero":
+                return ("-ERR The ID specified in XADD must be greater "
+                        "than 0-0\r\n")
+            ms, seq = resolved
+            pairs = [(args[j], args[j + 1])
+                     for j in range(i + 1, len(args), 2)]
+            if value is None:
+                expires = (self.store[key][1] if key in self.store
+                           else None)
+                value = Stream()
+                self.store[key] = (value, expires)
+            value.entries.append((ms, seq, pairs))
+            value.top_ms, value.top_seq = ms, seq
+            if maxlen >= 0:
+                # MAXLEN trims from the front; a trim that empties
+                # the stream deletes the key, as in real cinder.
+                while len(value.entries) > maxlen:
+                    value.entries.pop(0)
+                if not value.entries:
+                    del self.store[key]
+            return self._bulk("%d-%d" % (ms, seq))
+        elif name == "XRANGE":
+            # XRANGE key start end [COUNT count]: the entries whose
+            # IDs fall in [start, end] inclusive, each as
+            # [id, [field, value, ...]], oldest first.
+            if len(args) < 3:
+                return ("-ERR wrong number of arguments for 'xrange' "
+                        "command\r\n")
+            start = _stream_parse_bound(args[1], False)
+            end = _stream_parse_bound(args[2], True)
+            if start is None or end is None:
+                return ("-ERR Invalid stream ID specified as stream "
+                        "command argument\r\n")
+            count = -1
+            i = 3
+            while i < len(args):
+                if args[i].upper() != "COUNT":
+                    return "-ERR syntax error\r\n"
+                if i + 1 >= len(args):
+                    return ("-ERR wrong number of arguments for "
+                            "'xrange' command\r\n")
+                try:
+                    count = int(args[i + 1])
+                except ValueError:
+                    return "-ERR COUNT must be a positive integer\r\n"
+                if count < 0:
+                    return "-ERR COUNT must be a positive integer\r\n"
+                i += 2
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            out = []
+            if value is not None:
+                for ms, seq, pairs in value.entries:
+                    if (ms, seq) < start or (ms, seq) > end:
+                        continue
+                    if count >= 0 and len(out) >= count:
+                        break
+                    out.append((ms, seq, pairs))
+            reply = "*%d\r\n" % len(out)
+            for ms, seq, pairs in out:
+                reply += "*2\r\n"
+                reply += self._bulk("%d-%d" % (ms, seq))
+                flat = [item for pair in pairs for item in pair]
+                reply += "*%d\r\n" % len(flat)
+                for item in flat:
+                    reply += self._bulk(item)
+            return reply
+        elif name == "XLEN" and len(args) == 1:
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            return ":%d\r\n" % (0 if value is None else len(value))
         elif name == "INFO":
             info = (
                 "# Server\r\n"
@@ -3306,6 +3510,7 @@ class McpTests(unittest.TestCase):
                     "kv_hexpire", "kv_hpexpire", "kv_hexpireat",
                     "kv_hpexpireat", "kv_httl", "kv_hpttl",
                     "kv_hpersist",
+                    "kv_xadd", "kv_xrange", "kv_xlen",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -8313,6 +8518,432 @@ class McpTests(unittest.TestCase):
         self.assertFalse(summary["results"][0]["ok"])
         self.assertIn("WRONGTYPE", summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 5)
+
+    def _xadd_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xadd", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return reply["result"]["content"][0]["text"]
+
+    def _xrange_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xrange", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _xlen_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xlen", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_xadd_returns_ids_and_xrange_reads_entries(self):
+        # Explicit IDs, then a partial ID in the same millisecond,
+        # then an auto ID: the IDs sort in insertion order.
+        self.assertEqual(
+            self._xadd_result({"key": "s", "id": "1000-0",
+                               "fields": {"name": "alice", "age": "30"}}),
+            "1000-0")
+        self.assertEqual(
+            self._xadd_result({"key": "s", "id": "1000-1",
+                               "fields": {"name": "bob"}}),
+            "1000-1")
+        self.assertEqual(
+            self._xadd_result({"key": "s", "id": "1000-*",
+                               "fields": {"name": "carol"}}),
+            "1000-2")
+        auto = self._xadd_result({"key": "s",
+                                  "fields": {"name": "dan"}})
+        self.assertRegex(auto, r"^\d+-\d+$")
+        self.assertEqual(self._xlen_result({"key": "s"}), 4)
+        self.assertEqual(
+            self._xrange_result({"key": "s"}),
+            [{"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": auto, "fields": {"name": "dan"}}])
+        # Bounded ranges: exact IDs, a bare millisecond covering
+        # the whole millisecond, and COUNT.
+        self.assertEqual(
+            self._xrange_result({"key": "s", "start": "1000-1",
+                                 "end": "1000-2"}),
+            [{"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-2", "fields": {"name": "carol"}}])
+        self.assertEqual(
+            self._xrange_result({"key": "s", "start": "1000",
+                                 "end": "1000"}),
+            [{"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-2", "fields": {"name": "carol"}}])
+        self.assertEqual(
+            self._xrange_result({"key": "s", "count": 2}),
+            [{"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}}])
+        self.assertEqual(
+            self._xrange_result({"key": "s", "count": 0}), [])
+        # A missing key answers an empty list, and a start past
+        # the end does too.
+        self.assertEqual(self._xrange_result({"key": "ghost"}), [])
+        self.assertEqual(
+            self._xrange_result({"key": "s", "start": "+",
+                                 "end": "-"}),
+            [])
+        self.assertEqual(self._xlen_result({"key": "ghost"}), 0)
+        # An ID at or below the top fails, as does a duplicate.
+        for bad_id in ("1000-2", "1000-1", "500-0"):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xadd",
+                "arguments": {"key": "s", "id": bad_id,
+                              "fields": {"name": "late"}},
+            })
+            self.assertIn("error", reply, bad_id)
+
+    def test_kv_xadd_rejects_bad_arguments(self):
+        for bad in ({"key": "s"},
+                    {"key": "s", "fields": {}},
+                    {"key": "s", "fields": []},
+                    {"key": "s", "fields": {"f": 1}},
+                    {"key": "s", "fields": {"f": "v"}, "id": "abc"},
+                    {"key": "s", "fields": {"f": "v"}, "id": "1000"},
+                    {"key": "s", "fields": {"f": "v"}, "id": "0-0"},
+                    {"key": "s", "fields": {"f": "v"}, "id": "1-2-3"},
+                    {"key": "s", "fields": {"f": "v"}, "id": "-5"},
+                    {"key": "s", "fields": {"f": "v"},
+                     "id": "18446744073709551616-0"},
+                    {"key": "s", "fields": {"f": "v"}, "id": 1000},
+                    {"key": "s", "fields": {"f": "v"}, "maxlen": -1},
+                    {"key": "s", "fields": {"f": "v"}, "maxlen": 1.5},
+                    {"key": "s", "fields": {"f": "v"}, "maxlen": True},
+                    {"key": "s", "fields": {"f": "v"},
+                     "approximate": "yes"},
+                    {"key": 1, "fields": {"f": "v"}},
+                    {"fields": {"f": "v"}}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xadd",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_xadd_maxlen_trims_oldest(self):
+        self.assertEqual(
+            self._xadd_result({"key": "m", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xadd_result({"key": "m", "id": "2-0", "maxlen": 2,
+                               "fields": {"v": "b"}}),
+            "2-0")
+        self.assertEqual(
+            self._xadd_result({"key": "m", "id": "3-0", "maxlen": 2,
+                               "fields": {"v": "c"}}),
+            "3-0")
+        self.assertEqual(self._xlen_result({"key": "m"}), 2)
+        self.assertEqual(
+            self._xrange_result({"key": "m"}),
+            [{"id": "2-0", "fields": {"v": "b"}},
+             {"id": "3-0", "fields": {"v": "c"}}])
+        # MAXLEN ~ trims exactly like the plain form in cinder.
+        self.assertEqual(
+            self._xadd_result({"key": "m", "id": "4-0", "maxlen": 2,
+                               "approximate": True,
+                               "fields": {"v": "d"}}),
+            "4-0")
+        self.assertEqual(
+            self._xrange_result({"key": "m"}),
+            [{"id": "3-0", "fields": {"v": "c"}},
+             {"id": "4-0", "fields": {"v": "d"}}])
+        # MAXLEN 0 trims the entry just added, so the key is
+        # deleted at once — but the call still answers its ID.
+        self.assertEqual(
+            self._xadd_result({"key": "gone", "id": "1-0", "maxlen": 0,
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(self._xlen_result({"key": "gone"}), 0)
+        exists = self._call("tools/call", 1, {
+            "name": "kv_exists", "arguments": {"key": "gone"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+        # XADD preserves the TTL.
+        self.assertEqual(
+            self._xadd_result({"key": "t", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self._call("tools/call", 2, {
+            "name": "kv_expire",
+            "arguments": {"key": "t", "seconds": 300},
+        })
+        self.assertEqual(
+            self._xadd_result({"key": "t", "id": "2-0",
+                               "fields": {"v": "b"}}),
+            "2-0")
+        ttl = self._call("tools/call", 3, {
+            "name": "kv_ttl", "arguments": {"key": "t"},
+        })
+        self.assertGreater(
+            int(ttl["result"]["content"][0]["text"]), 0)
+
+    def test_kv_xadd_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self.fake.store["todo"] = (["buy milk"], None)
+        for key in ("plain", "todo"):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_xadd",
+                "arguments": {"key": key, "id": "1-0",
+                              "fields": {"f": "v"}},
+            })
+            self.assertIn("error", reply, key)
+            self.assertIn("WRONGTYPE", reply["error"]["message"], key)
+
+    def test_kv_xrange_rejects_bad_arguments(self):
+        self._xadd_result({"key": "s", "id": "1-0",
+                           "fields": {"f": "v"}})
+        for bad in ({"key": "s", "start": "abc"},
+                    {"key": "s", "end": "abc"},
+                    {"key": "s", "start": "7-"},
+                    {"key": "s", "start": "1-2-3"},
+                    {"key": "s", "start": "18446744073709551616"},
+                    {"key": "s", "start": 1000},
+                    {"key": "s", "count": -1},
+                    {"key": "s", "count": 1001},
+                    {"key": "s", "count": 1.5},
+                    {"key": "s", "count": True},
+                    {"key": 1},
+                    {}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xrange",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_xrange_caps_at_1000_entries(self):
+        # Seed 1001 entries in batches of 100 ops per call.
+        ops = [{"op": "kv_xadd", "key": "big", "id": "%d-0" % i,
+                "fields": {"v": str(i)}} for i in range(1, 1002)]
+        for start in range(0, len(ops), 100):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_batch",
+                "arguments": {"ops": ops[start:start + 100]},
+            })
+            summary = json.loads(reply["result"]["content"][0]["text"])
+            self.assertEqual(summary["ok"], len(ops[start:start + 100]))
+        self.assertEqual(self._xlen_result({"key": "big"}), 1001)
+        # The whole range is wider than the cap, so it fails
+        # instead of returning a truncated list.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_xrange", "arguments": {"key": "big"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # A count at the cap returns exactly 1000 entries, the
+        # first 1000 in ID order.
+        page = self._xrange_result({"key": "big", "count": 1000})
+        self.assertEqual(len(page), 1000)
+        self.assertEqual(page[0]["id"], "1-0")
+        self.assertEqual(page[-1]["id"], "1000-0")
+
+    def test_kv_xlen_counts_entries_and_wrong_type(self):
+        self.assertEqual(self._xlen_result({"key": "ghost"}), 0)
+        self.assertEqual(
+            self._xadd_result({"key": "s", "id": "1-0",
+                               "fields": {"f": "v"}}),
+            "1-0")
+        self.assertEqual(self._xlen_result({"key": "s"}), 1)
+        self.assertEqual(
+            self._xadd_result({"key": "s", "id": "2-0",
+                               "fields": {"f": "v"}}),
+            "2-0")
+        self.assertEqual(self._xlen_result({"key": "s"}), 2)
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_xlen", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+        self.assertIn("WRONGTYPE", reply["error"]["message"])
+
+    def test_kv_xadd_xrange_xlen_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "b1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "b1", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xlen", "key": "b1"},
+                {"op": "kv_xrange", "key": "b1"},
+                {"op": "kv_xadd", "key": "b1", "id": "nope",
+                 "fields": {"v": "c"}},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], "1-0")
+        self.assertEqual(summary["results"][1]["result"], "2-0")
+        self.assertEqual(summary["results"][2]["result"], 2)
+        self.assertEqual(summary["results"][3]["result"], [
+            {"id": "1-0", "fields": {"v": "a"}},
+            {"id": "2-0", "fields": {"v": "b"}},
+        ])
+        self.assertFalse(summary["results"][4]["ok"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "b2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xlen", "key": "b2"},
+                {"op": "kv_xrange", "key": "b2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], "5-0")
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], [
+            {"id": "5-0", "fields": {"v": "x"}},
+        ])
+        # A bad ID fails an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "b3", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "b3", "id": "0-0",
+                 "fields": {"v": "b"}},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "b3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # An EXEC-time WRONGTYPE is recorded as that op's error,
+        # in place, and the rest still run.
+        self._call("tools/call", 5, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        wrongtype = self._call("tools/call", 6, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "plain", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xlen", "key": "b2"},
+            ]},
+        })
+        summary = json.loads(wrongtype["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("WRONGTYPE", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 1)
+
+    def test_resources_read_key_stream_returns_type_and_length(self):
+        self.assertEqual(
+            self._xadd_result({"key": "log", "id": "1-0",
+                               "fields": {"event": "start"}}),
+            "1-0")
+        self.assertEqual(
+            self._xadd_result({"key": "log", "id": "2-0",
+                               "fields": {"event": "stop"}}),
+            "2-0")
+        reply = self._call("resources/read", 1, {"uri": "cinder://key/log"})
+        self.assertEqual(json.loads(reply["result"]["contents"][0]["text"]), {
+            "key": "log", "type": "stream", "length": 2,
+        })
+
+    def test_prompts_get_write_safety_covers_stream_tools(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xadd_result({"key": "ws:s", "id": "2-0",
+                               "fields": {"v": "b"}}),
+            "2-0")
+        self.assertEqual(
+            self._xadd_result({"key": "ws:s", "id": "3-0",
+                               "fields": {"v": "c"}}),
+            "3-0")
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "ws:plain", "value": "v"},
+        })
+        plan = [
+            {"op": "kv_xadd", "key": "ws:ghost", "id": "1-0",
+             "fields": {"v": "a"}},
+            {"op": "kv_xadd", "key": "ws:s", "id": "4-0",
+             "fields": {"v": "d"}},
+            {"op": "kv_xadd", "key": "ws:plain", "id": "1-0",
+             "fields": {"v": "a"}},
+            {"op": "kv_xadd", "key": "ws:s", "id": "4-0", "maxlen": 1,
+             "fields": {"v": "d"}},
+            {"op": "kv_xadd", "key": "ws:s", "id": "4-0", "maxlen": 0,
+             "fields": {"v": "d"}},
+            {"op": "kv_xadd", "key": "ws:ghost", "id": "1-0",
+             "maxlen": 0, "fields": {"v": "a"}},
+            {"op": "kv_xadd", "key": "ws:s", "id": "abc",
+             "fields": {"v": "d"}},
+            {"op": "kv_xrange", "key": "ws:s"},
+            {"op": "kv_xlen", "key": "ws:s"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 9 op(s), 6 audited, 3 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_xadd 'ws:plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_xadd 'ws:s' — would trim the 2 oldest entries "
+            "from a stream of 3 elements that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 4: kv_xadd 'ws:s' — would delete the whole stream "
+            "of 3 elements outright (MAXLEN 0 trims every entry) "
+            "that never expires",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_xadd 'ws:ghost' — creates a new stream with "
+            "no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 1: kv_xadd 'ws:s' — appends one entry to a stream "
+            "of 3 elements that never expires",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 5: kv_xadd 'ws:ghost' — no-op, MAXLEN 0 trims the "
+            "entry at once",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_xrange is a read, not a write", text)
+        self.assertIn(
+            "op 8: kv_xlen is a read, not a write", text)
 
     def _geoadd_result(self, arguments):
         reply = self._call("tools/call", 1, {
@@ -20125,6 +20756,205 @@ class LiveCinderMigrationTests(unittest.TestCase):
             text.split("Safe (")[1].split("\n\n")[0],
         )
         self.assertIn("op 2: kv_httl is a read, not a write", text)
+
+    def test_live_stream_tools(self):
+        """kv_xadd / kv_xrange / kv_xlen against a real cinder
+        (streams shipped in cinder 0.64.0, stream reads in
+        0.65.0): explicit, partial and auto IDs, a partial 0-*
+        resolving to 0-0 on an empty stream, XRANGE bounds
+        (exact, bare-millisecond, COUNT 0, a missing key, a
+        reversed range), MAXLEN trimming from the front (exact
+        and ~) and MAXLEN 0 deleting the key at once, XADD
+        preserving the TTL, WRONGTYPE on a string key, the tools
+        queueing in one MULTI/EXEC transaction, the write-safety
+        audit classifying XADD as a write and XRANGE/XLEN as
+        reads, and cinder://key/<stream> reporting the type."""
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:live",
+                                   "id": "1000-0",
+                                   "fields": {"name": "alice",
+                                              "age": "30"}}),
+            "1000-0")
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:live",
+                                   "id": "1000-1",
+                                   "fields": {"name": "bob"}}),
+            "1000-1")
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:live",
+                                   "id": "1000-*",
+                                   "fields": {"name": "carol"}}),
+            "1000-2")
+        # A partial 0-* on an empty stream resolves to 0-0, while
+        # an explicit 0-0 is rejected.
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:zero",
+                                   "id": "0-*",
+                                   "fields": {"name": "first"}}),
+            "0-0")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_xadd",
+            "arguments": {"key": "stream:live", "id": "0-0",
+                          "fields": {"name": "zero"}},
+        })
+        self.assertIn("error", reply)
+        # An auto ID is the wall clock in milliseconds, past the
+        # explicit IDs already in the stream — so the 2000-0 add
+        # comes before it, not after.
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:live",
+                                   "id": "2000-0",
+                                   "fields": {"name": "erin"}}),
+            "2000-0")
+        auto = self._tool("kv_xadd", {"key": "stream:live",
+                                      "fields": {"name": "dan"}})
+        self.assertRegex(auto, r"^\d+-\d+$")
+        self.assertGreater(int(auto.split("-")[0]), 2000)
+        self.assertEqual(
+            self._tool("kv_xlen", {"key": "stream:live"}), 5)
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:live"}),
+            [{"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "2000-0", "fields": {"name": "erin"}},
+             {"id": auto, "fields": {"name": "dan"}}])
+        # A bare millisecond covers the whole millisecond, and
+        # COUNT bounds the reply from the start.
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:live",
+                                     "start": "1000", "end": "1000"}),
+            [{"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-2", "fields": {"name": "carol"}}])
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:live",
+                                     "start": "1000-1",
+                                     "end": "1000-1"}),
+            [{"id": "1000-1", "fields": {"name": "bob"}}])
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:live",
+                                     "count": 0}),
+            [])
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:ghost"}), [])
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:live",
+                                     "start": "+", "end": "-"}),
+            [])
+        self.assertEqual(
+            self._tool("kv_xlen", {"key": "stream:ghost"}), 0)
+        # MAXLEN trims the oldest entries, exactly and with ~,
+        # and MAXLEN 0 trims the entry just added, deleting the
+        # key — while the call still answers its ID.
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:trim",
+                                   "id": "1-0", "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:trim",
+                                   "id": "2-0", "maxlen": 2,
+                                   "fields": {"v": "b"}}),
+            "2-0")
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:trim",
+                                   "id": "3-0", "maxlen": 2,
+                                   "approximate": True,
+                                   "fields": {"v": "c"}}),
+            "3-0")
+        self.assertEqual(
+            self._tool("kv_xlen", {"key": "stream:trim"}), 2)
+        self.assertEqual(
+            self._tool("kv_xrange", {"key": "stream:trim"}),
+            [{"id": "2-0", "fields": {"v": "b"}},
+             {"id": "3-0", "fields": {"v": "c"}}])
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:trim0",
+                                   "id": "1-0", "maxlen": 0,
+                                   "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "stream:trim0"}), 0)
+        # XADD preserves the TTL.
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:ttl",
+                                   "id": "1-0", "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "stream:ttl",
+                                     "seconds": 1000}),
+            1)
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:ttl",
+                                   "id": "2-0", "fields": {"v": "b"}}),
+            "2-0")
+        ttl = self._tool("kv_ttl", {"key": "stream:ttl"})
+        self.assertGreater(ttl, 990)
+        self.assertLessEqual(ttl, 1000)
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "stream:plain", "value": "v"}),
+            "OK")
+        for name, arguments in (
+                ("kv_xadd", {"key": "stream:plain", "id": "1-0",
+                             "fields": {"f": "v"}}),
+                ("kv_xrange", {"key": "stream:plain"}),
+                ("kv_xlen", {"key": "stream:plain"}),
+                ("kv_xadd", {"key": "stream:live", "id": "abc",
+                             "fields": {"f": "v"}}),
+                ("kv_xadd", {"key": "stream:live", "id": "1000",
+                             "fields": {"f": "v"}}),
+                ("kv_xrange", {"key": "stream:live",
+                               "start": "abc"}),
+                ("kv_xrange", {"key": "stream:live",
+                               "count": -1})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+        # The tools queue in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_xadd", "key": "stream:tx", "id": "5-0",
+             "fields": {"v": "x"}},
+            {"op": "kv_xlen", "key": "stream:tx"},
+            {"op": "kv_xrange", "key": "stream:tx"},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], "5-0")
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], [
+            {"id": "5-0", "fields": {"v": "x"}},
+        ])
+        # cinder://key/<stream> reports the type and the entry
+        # count, and the write-safety audit classifies XADD as a
+        # write and XRANGE/XLEN as reads.
+        reply = self._call("resources/read", 97,
+                           {"uri": "cinder://key/stream:live"})
+        self.assertEqual(
+            json.loads(reply["result"]["contents"][0]["text"]),
+            {"key": "stream:live", "type": "stream", "length": 5})
+        text = self._call("prompts/get", 98, {
+            "name": "write-safety",
+            "arguments": {"plan": json.dumps([
+                {"op": "kv_xadd", "key": "stream:live", "id": "3000-0",
+                 "fields": {"v": "z"}},
+                {"op": "kv_xadd", "key": "stream:plain", "id": "1-0",
+                 "fields": {"v": "z"}},
+                {"op": "kv_xrange", "key": "stream:live"},
+                {"op": "kv_xlen", "key": "stream:live"},
+            ])},
+        })["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Plan: 4 op(s), 2 audited, 2 not audited.", text)
+        self.assertIn(
+            "op 1: kv_xadd 'stream:plain' — would fail with "
+            "WRONGTYPE: the key is a string of 1 bytes",
+            text.split("Risky (")[1].split("\n\n")[0],
+        )
+        self.assertIn("op 2: kv_xrange is a read, not a write", text)
+        self.assertIn("op 3: kv_xlen is a read, not a write", text)
 
 
 if __name__ == "__main__":

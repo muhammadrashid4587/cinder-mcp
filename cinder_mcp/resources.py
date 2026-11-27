@@ -7,7 +7,7 @@ cinder://key/<key> exposes one key's value and type as JSON.
 
 Cinder has no TYPE command, so the key resource works out the type by
 probing: GET succeeds for strings, otherwise LLEN / SCARD / HLEN /
-ZCARD are tried in turn and the first one that does not answer
+ZCARD / XLEN are tried in turn and the first one that does not answer
 WRONGTYPE names the type. A missing key is a not-found error, not an
 empty resource.
 """
@@ -136,7 +136,8 @@ def _read_key_resource(client, uri):
         # Not a string: probe the container types. The first command
         # that does not answer WRONGTYPE names the type.
         for probe, kind in (("LLEN", "list"), ("SCARD", "set"),
-                            ("HLEN", "hash"), ("ZCARD", "zset")):
+                            ("HLEN", "hash"), ("ZCARD", "zset"),
+                            ("XLEN", "stream")):
             try:
                 length = client.command(probe, key)
             except RespError:
