@@ -854,12 +854,15 @@ TOOLS = [
     },
     {
         "name": "kv_geoadd",
-        "description": "Add members with coordinates to a geo set: GEOADD key longitude latitude member [longitude latitude member ...]. Takes `members` as an object mapping member names to [longitude, latitude] pairs. Longitude is -180 to 180, latitude -85.05112878 to 85.05112878, as in Redis. Returns the number of members newly added; re-adding a member at its current coordinates is a no-op (0), and moving a member to new coordinates returns 0 added but updates its position. Every coordinate is checked before anything is applied, so a bad one fails the whole call with nothing written. Cinder stores the set as a sorted set of 52-bit geohash scores, so it reads back as a zset (ZRANGE, ZSCORE, ZCARD all work on it), and preserves the key's TTL. Cinder has no NX / XX / CH options for GEOADD, so the tool does not offer them. Fails with WRONGTYPE on a key holding anything but a sorted set.",
+        "description": "Add members with coordinates to a geo set: GEOADD key [NX | XX | CH] longitude latitude member [longitude latitude member ...]. Takes `members` as an object mapping member names to [longitude, latitude] pairs. Longitude is -180 to 180, latitude -85.05112878 to 85.05112878, as in Redis. With `nx: true` only members not already in the set are added, with `xx: true` only members already in the set are updated (a new member is skipped, and on a missing key nothing is created), and `nx` and `xx` cannot be used together; with `ch: true` the call returns the number of members added or changed instead of just the number added. Returns the number of members newly added; re-adding a member at its current coordinates is a no-op (0), and moving a member to new coordinates returns 0 added but updates its position. Every coordinate is checked before anything is applied, so a bad one fails the whole call with nothing written. Cinder stores the set as a sorted set of 52-bit geohash scores, so it reads back as a zset (ZRANGE, ZSCORE, ZCARD all work on it), and preserves the key's TTL. Fails with WRONGTYPE on a key holding anything but a sorted set.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "key": {"type": "string"},
                 "members": {"type": "object"},
+                "nx": {"type": "boolean"},
+                "xx": {"type": "boolean"},
+                "ch": {"type": "boolean"},
             },
             "required": ["key", "members"],
         },
@@ -2194,7 +2197,7 @@ def _op_argv(name, args):
         return ["PFMERGE", destination] + list(sources)
     if name == "kv_geoadd":
         key, triples = _geoadd_args(args)
-        argv = ["GEOADD", key]
+        argv = ["GEOADD", key] + _geoadd_options(args)
         for member, longitude, latitude in triples:
             argv += [repr(longitude), repr(latitude), member]
         return argv
@@ -3513,6 +3516,32 @@ def _geo_coordinate(value, name, tool="kv_geoadd"):
             % (tool, name, low, high, value)
         )
     return value
+
+
+def _geoadd_options(args):
+    """The GEOADD option flags for a kv_geoadd call, as argv tokens
+    in cinder's order (NX | XX | CH, after the key and before the
+    first longitude). Each flag must be a boolean when present. NX
+    and XX are mutually exclusive, as in Redis, and fail here as
+    invalid params instead of as a server error. CH only changes
+    what the reply counts, so it composes with either."""
+    opts = []
+    nx = args.get("nx", False)
+    xx = args.get("xx", False)
+    ch = args.get("ch", False)
+    for name, value in (("nx", nx), ("xx", xx), ("ch", ch)):
+        if not isinstance(value, bool):
+            raise ValueError(
+                "kv_geoadd %s must be true or false" % name)
+    if nx and xx:
+        raise ValueError("kv_geoadd nx and xx cannot be used together")
+    if nx:
+        opts.append("NX")
+    if xx:
+        opts.append("XX")
+    if ch:
+        opts.append("CH")
+    return opts
 
 
 def _geoadd_args(args):

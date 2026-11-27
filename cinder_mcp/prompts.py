@@ -1158,6 +1158,27 @@ def _geoadd_audit_members(op):
     return list(members)
 
 
+def _geoadd_audit_options(op):
+    """The NX / XX / CH flags for a kv_geoadd op in a write plan,
+    validated like the tool's own arguments: each flag must be a
+    boolean when present, and NX with XX raises ValueError, so the
+    caller reports the op as not audited instead of guessing.
+    Returns (nx, xx, ch)."""
+    flags = []
+    for name in ("nx", "xx", "ch"):
+        value = op.get(name, False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                "kv_geoadd %s must be true or false: %r" % (name, value)
+            )
+        flags.append(value)
+    if flags[0] and flags[1]:
+        raise ValueError(
+            "kv_geoadd nx and xx cannot be used together: %r" % (op,)
+        )
+    return tuple(flags)
+
+
 def _ltrim_audit_args(op):
     """The start and stop for a kv_ltrim op in a write plan,
     validated like the tool's own arguments: both must be integers.
@@ -2626,7 +2647,10 @@ def _audit_write_op(client, op):
     string, or an LMOVE that moves one element out of a list with
     more to spare or empties a source that expires soon, a GEOADD
     that creates a geo set with no expiry or moves members of an
-    existing one. SETNX on
+    existing one (NX never moves a member, so it only adds; XX
+    never creates a key or adds a member, so it is a no-op on a
+    missing key or when none of its members are already in the
+    set). SETNX on
     a key that
     already exists writes nothing, so it is safe, and so is HSETNX
     on a field that already exists, an LSET that writes the value
@@ -2725,6 +2749,16 @@ def _audit_write_op(client, op):
             )
         if name == "kv_geoadd":
             _geoadd_audit_members(op)
+            nx, xx, _ch = _geoadd_audit_options(op)
+            if xx:
+                # GEOADD XX on a missing key adds nothing and
+                # creates nothing: only members already in the
+                # set are updated, and there is no set.
+                return "safe", (
+                    "kv_geoadd %r — no-op, xx only updates members "
+                    "already in the set and the key does not exist"
+                    % key
+                )
             return "caution", (
                 "kv_geoadd %r — creates a new geo sorted set with no "
                 "expiry" % key
@@ -3092,10 +3126,15 @@ def _audit_write_op(client, op):
         # and moves any member it re-adds to new coordinates, so
         # the members it would move are the risk: their stored
         # positions are overwritten, while new members only grow
-        # the set. A ZMSCORE probe, chunked at 1000, tells which
+        # the set. NX never moves a member, so an NX op only adds;
+        # XX never adds one, so an XX op only moves the members
+        # already in the set — and is a no-op when none of them
+        # are. CH only changes what the reply counts, not what is
+        # written. A ZMSCORE probe, chunked at 1000, tells which
         # members already exist — the set's size is no risk on its
         # own, since nothing is removed.
         members = _geoadd_audit_members(op)
+        nx, xx, _ch = _geoadd_audit_options(op)
         if kind != "zset":
             return "risky", (
                 "kv_geoadd %r — would fail with WRONGTYPE: the key is "
@@ -3109,13 +3148,39 @@ def _audit_write_op(client, op):
             existing += sum(
                 1 for score in scores if score is not None
             )
+        new = len(members) - existing
+        if xx:
+            if not existing:
+                return "safe", (
+                    "kv_geoadd %r — no-op, xx only updates members "
+                    "already in the set and none of the %d are"
+                    % (key, len(members))
+                )
+            return "caution", (
+                "kv_geoadd %r — updates %d existing member(s) to new "
+                "coordinates (xx adds no new members) in a geo set "
+                "of %s that %s"
+                % (key, existing, size, ttl_text)
+            )
+        if nx:
+            if not new:
+                return "safe", (
+                    "kv_geoadd %r — no-op, nx only adds new members "
+                    "and all %d are already in the set"
+                    % (key, len(members))
+                )
+            return "safe", (
+                "kv_geoadd %r — adds %d new member(s) (nx leaves the "
+                "%d existing member(s) alone) to a geo set of %s "
+                "that %s"
+                % (key, new, existing, size, ttl_text)
+            )
         if existing:
             return "caution", (
                 "kv_geoadd %r — moves %d existing member(s) to new "
                 "coordinates and adds %d new member(s) in a geo set "
                 "of %s that %s"
-                % (key, existing, len(members) - existing,
-                   size, ttl_text)
+                % (key, existing, new, size, ttl_text)
             )
         return "safe", (
             "kv_geoadd %r — adds %d new member(s) to a geo set of "

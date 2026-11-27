@@ -1675,22 +1675,40 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     out += self._bulk(repr(first[member]))
             return out
-        elif name == "GEOADD" and len(args) >= 4 \
-                and (len(args) - 1) % 3 == 0:
-            # GEOADD key longitude latitude member [...]: the
-            # members are stored in a sorted set with 52-bit
-            # geohash scores, as in real cinder. Every coordinate
-            # is parsed before any member is added, so a bad one
-            # fails the whole call with nothing written. A re-add
-            # at the same coordinates is a no-op; moving a member
-            # returns 0 added. The key's expiry is preserved: the
-            # stored tuple is only replaced when the key is
-            # created.
+        elif name == "GEOADD" and len(args) >= 4:
+            # GEOADD key [NX | XX | CH] longitude latitude member
+            # [...]: the members are stored in a sorted set with
+            # 52-bit geohash scores, as in real cinder. Options come
+            # after the key and before the first longitude, in any
+            # case and any order; NX and XX together are an error.
+            # Every coordinate is parsed before any member is
+            # added, so a bad one fails the whole call with nothing
+            # written. NX only adds members not already in the set,
+            # XX only updates members already in it, and the set is
+            # created lazily below, only when a member actually
+            # applies: a GEOADD whose options skip every member
+            # leaves no key behind, as in real cinder. A re-add at
+            # the same coordinates is a no-op, not counted even
+            # with CH; moving a member returns 0 added. The key's
+            # expiry is preserved: the stored tuple is only replaced
+            # when the key is created.
+            opts = set()
+            i = 1
+            while i < len(args) and args[i].upper() in ("NX", "XX", "CH"):
+                opts.add(args[i].upper())
+                i += 1
+            if "NX" in opts and "XX" in opts:
+                return ("-ERR XX and NX options at the same time are "
+                        "not compatible\r\n")
+            rest = args[i:]
+            if len(rest) < 3 or len(rest) % 3 != 0:
+                return ("-ERR wrong number of arguments for 'geoadd' "
+                        "command\r\n")
             coords = []
-            for k in range(1, len(args), 3):
+            for k in range(0, len(rest), 3):
                 try:
-                    lon = float(args[k])
-                    lat = float(args[k + 1])
+                    lon = float(rest[k])
+                    lat = float(rest[k + 1])
                 except ValueError:
                     return "-ERR value is not a valid float\r\n"
                 if lon != lon or lat != lat:
@@ -1698,25 +1716,32 @@ class FakeCinder(threading.Thread):
                 if lon < -180.0 or lon > 180.0 \
                         or lat < _GEO_LAT_MIN or lat > _GEO_LAT_MAX:
                     return ("-ERR invalid longitude,latitude pair "
-                            "%s,%s\r\n" % (args[k], args[k + 1]))
-                coords.append((lon, lat, args[k + 2]))
+                            "%s,%s\r\n" % (rest[k], rest[k + 1]))
+                coords.append((lon, lat, rest[k + 2]))
             value = self._get(args[0])
             if value is not None and not isinstance(value, ZSet):
                 return ("-WRONGTYPE Operation against a key holding the "
                         "wrong kind of value\r\n")
             added = 0
+            updated = 0
             for lon, lat, member in coords:
                 score = _geo_encode(lon, lat)
+                exists = value is not None and member in value.members
+                if ("NX" in opts and exists) \
+                        or ("XX" in opts and not exists):
+                    continue
+                if exists and value.members[member] == score:
+                    continue
                 if value is None:
                     value = ZSet()
                     self.store[args[0]] = (value, None)
-                if member in value.members \
-                        and value.members[member] == score:
-                    continue
-                if member not in value.members:
+                if exists:
+                    updated += 1
+                else:
                     added += 1
                 value.members[member] = score
-            return ":%d\r\n" % added
+            return ":%d\r\n" % (
+                added + updated if "CH" in opts else added)
         elif name == "GEODIST" and 3 <= len(args) <= 4:
             # GEODIST key member1 member2 [m|km|ft|mi]: the
             # Haversine distance between the centres of the
@@ -6952,6 +6977,141 @@ class McpTests(unittest.TestCase):
         })
         self.assertGreater(
             int(ttl["result"]["content"][0]["text"]), 0)
+
+    def test_kv_geoadd_nx_xx_ch_options(self):
+        # NX adds only new members; XX updates only existing ones;
+        # CH counts added and changed members.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }}), 2)
+        # NX skips the member already in the set and adds the new
+        # one; Palermo stays where it was.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt", "nx": True, "members": {
+                "Palermo": [13.5, 38.2],
+                "Messina": [15.55, 38.19],
+            }}), 1)
+        pos = self._geopos_result(
+            {"key": "opt", "members": ["Palermo"]})
+        self.assertAlmostEqual(pos[0]["longitude"], 13.361389, places=4)
+        # XX skips the new member and moves the existing one;
+        # without CH the moved member does not count.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt", "xx": True, "members": {
+                "Palermo": [13.5, 38.2],
+                "Agrigento": [13.5765, 37.3111],
+            }}), 0)
+        pos = self._geopos_result(
+            {"key": "opt", "members": ["Palermo", "Agrigento"]})
+        self.assertAlmostEqual(pos[0]["longitude"], 13.5, places=4)
+        self.assertIsNone(pos[1])
+        # CH counts the moved member as well as the added one.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt", "ch": True, "members": {
+                "Palermo": [13.6, 38.3],
+                "Enna": [14.28, 37.57],
+            }}), 2)
+        # Re-adding at the same coordinates changes nothing, so it
+        # counts 0 even with CH.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt", "ch": True, "members": {
+                "Palermo": [13.6, 38.3],
+            }}), 0)
+        # XX on a missing key creates nothing.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt-missing", "xx": True,
+                                 "members": {
+                                     "Palermo": [13.361389, 38.115556],
+                                 }}), 0)
+        exists = self._call("tools/call", 1, {
+            "name": "kv_exists",
+            "arguments": {"key": "opt-missing"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+        # NX on a missing key creates it.
+        self.assertEqual(
+            self._geoadd_result({"key": "opt-missing", "nx": True,
+                                 "members": {
+                                     "Palermo": [13.361389, 38.115556],
+                                 }}), 1)
+        # NX and XX together, and non-boolean flags, fail
+        # client-side as invalid params instead of as a server
+        # error — and the failed call writes nothing.
+        for bad in ({"key": "opt", "nx": True, "xx": True,
+                     "members": {"a": [13.3, 38.1]}},
+                    {"key": "opt", "nx": "yes",
+                     "members": {"a": [13.3, 38.1]}},
+                    {"key": "opt", "xx": 1,
+                     "members": {"a": [13.3, 38.1]}},
+                    {"key": "opt", "ch": None,
+                     "members": {"a": [13.3, 38.1]}}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_geoadd", "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        self.assertEqual(
+            self._geopos_result({"key": "opt", "members": ["a"]}),
+            [None])
+
+    def test_kv_geoadd_options_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_geoadd", "key": "b1", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                # NX adds Messina, leaves Palermo where it is.
+                {"op": "kv_geoadd", "key": "b1", "nx": True,
+                 "members": {
+                     "Palermo": [13.5, 38.2],
+                     "Messina": [15.55, 38.19],
+                 }},
+                # XX with CH counts the moved member.
+                {"op": "kv_geoadd", "key": "b1", "xx": True,
+                 "ch": True, "members": {
+                     "Palermo": [13.5, 38.2],
+                 }},
+                # NX and XX together fail only that op; the batch
+                # keeps going.
+                {"op": "kv_geoadd", "key": "b1", "nx": True,
+                 "xx": True, "members": {"a": [13.3, 38.1]}},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertIn("nx and xx cannot be used together",
+                      summary["results"][3]["error"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b2", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                }},
+                {"op": "kv_geoadd", "key": "b2", "nx": True,
+                 "ch": True, "members": {
+                     "Palermo": [13.5, 38.2],
+                     "Catania": [15.087269, 37.502669],
+                 }},
+                {"op": "kv_geopos", "key": "b2",
+                 "members": ["Palermo", "Catania"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        # NX+CH: Palermo skipped, Catania added — 1 changed.
+        self.assertEqual(summary["results"][1]["result"], 1)
+        self.assertAlmostEqual(
+            summary["results"][2]["result"][0]["longitude"],
+            13.361389338970184, places=9)
 
     def test_kv_geoadd_rejects_bad_arguments(self):
         for bad in ({"key": "g"},
@@ -13479,6 +13639,106 @@ class McpTests(unittest.TestCase):
             safe,
         )
 
+    def test_prompts_get_write_safety_covers_geoadd_options(self):
+        # NX never moves a member, XX never adds one or creates
+        # the key, and CH changes only what the reply counts — so
+        # the audit's verdict follows the option, not just the
+        # members.
+        self._call("tools/call", 1, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "cities", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }},
+        })
+        plan = [
+            # NX with a new member only: adds, never moves.
+            {"op": "kv_geoadd", "key": "cities", "nx": True,
+             "members": {"Messina": [15.55, 38.19]}},
+            # NX with only members already in the set: a no-op.
+            {"op": "kv_geoadd", "key": "cities", "nx": True,
+             "members": {"Palermo": [13.5, 38.2]}},
+            # NX with a mix: adds the new one, leaves the old one.
+            {"op": "kv_geoadd", "key": "cities", "nx": True,
+             "members": {"Palermo": [13.5, 38.2],
+                         "Messina": [15.55, 38.19]}},
+            # XX with an existing member: updates it.
+            {"op": "kv_geoadd", "key": "cities", "xx": True,
+             "members": {"Palermo": [13.5, 38.2]}},
+            # XX with only new members: a no-op.
+            {"op": "kv_geoadd", "key": "cities", "xx": True,
+             "members": {"Messina": [15.55, 38.19]}},
+            # XX on a missing key: creates nothing.
+            {"op": "kv_geoadd", "key": "brand-new", "xx": True,
+             "members": {"a": [13.3, 38.1]}},
+            # NX on a missing key: creates it, like a plain add.
+            {"op": "kv_geoadd", "key": "brand-new", "nx": True,
+             "members": {"a": [13.3, 38.1]}},
+            # CH alone changes nothing about the write.
+            {"op": "kv_geoadd", "key": "cities", "ch": True,
+             "members": {"Palermo": [13.5, 38.2]}},
+            # NX and XX together, and a non-boolean flag, are not
+            # audited: the tool rejects them too.
+            {"op": "kv_geoadd", "key": "cities", "nx": True,
+             "xx": True, "members": {"a": [13.3, 38.1]}},
+            {"op": "kv_geoadd", "key": "cities", "nx": "yes",
+             "members": {"a": [13.3, 38.1]}},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 10 op(s), 8 audited, 2 not audited.", text)
+        self.assertIn(
+            "op 8: kv_geoadd nx and xx cannot be used together",
+            text)
+        self.assertIn(
+            "op 9: kv_geoadd nx must be true or false: 'yes'",
+            text)
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_geoadd 'cities' — updates 1 existing member(s) "
+            "to new coordinates (xx adds no new members) in a geo "
+            "set of 2 elements that no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 6: kv_geoadd 'brand-new' — creates a new geo sorted "
+            "set with no expiry",
+            caution,
+        )
+        self.assertIn(
+            "op 7: kv_geoadd 'cities' — moves 1 existing member(s) "
+            "to new coordinates and adds 0 new member(s) in a geo "
+            "set of 2 elements that no expiry",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_geoadd 'cities' — adds 1 new member(s) (nx "
+            "leaves the 0 existing member(s) alone) to a geo set of "
+            "2 elements that no expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 1: kv_geoadd 'cities' — no-op, nx only adds new "
+            "members and all 1 are already in the set",
+            safe,
+        )
+        self.assertIn(
+            "op 2: kv_geoadd 'cities' — adds 1 new member(s) (nx "
+            "leaves the 1 existing member(s) alone) to a geo set of "
+            "2 elements that no expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 4: kv_geoadd 'cities' — no-op, xx only updates "
+            "members already in the set and none of the 1 are",
+            safe,
+        )
+        self.assertIn(
+            "op 5: kv_geoadd 'brand-new' — no-op, xx only updates "
+            "members already in the set and the key does not exist",
+            safe,
+        )
+
     def test_prompts_get_write_safety_covers_georadius(self):
         self._call("tools/call", 1, {
             "name": "kv_geoadd",
@@ -16791,6 +17051,84 @@ class LiveCinderMigrationTests(unittest.TestCase):
             13.361389338970184, places=9)
         self.assertEqual(summary["results"][3]["result"],
                          ["sqdtr74hyu0"])
+
+    def test_live_geoadd_nx_xx_ch(self):
+        """kv_geoadd NX / XX / CH against a real cinder 0.62.0:
+        NX adds only members not already in the set and leaves an
+        existing member where it is, XX updates only members
+        already in the set and creates nothing on a missing key, CH
+        counts added and changed members (a re-add at the same
+        coordinates still counts 0), and NX with XX is rejected
+        client-side as invalid params. The options shipped in
+        cinder 0.62.0."""
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }}),
+            2)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt", "nx": True,
+                                     "members": {
+                                         "Palermo": [13.5, 38.2],
+                                         "Messina": [15.55, 38.19],
+                                     }}),
+            1)
+        positions = self._tool("kv_geopos", {"key": "geo:opt",
+                                            "members": ["Palermo"]})
+        self.assertAlmostEqual(
+            positions[0]["longitude"], 13.361389338970184, places=9)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt", "xx": True,
+                                     "members": {
+                                         "Palermo": [13.5, 38.2],
+                                         "Agrigento": [13.5765, 37.3111],
+                                     }}),
+            0)
+        positions = self._tool("kv_geopos", {"key": "geo:opt",
+                                            "members": ["Palermo",
+                                                        "Agrigento"]})
+        self.assertAlmostEqual(
+            positions[0]["longitude"], 13.5, places=4)
+        self.assertIsNone(positions[1])
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt", "ch": True,
+                                     "members": {
+                                         "Palermo": [13.6, 38.3],
+                                         "Enna": [14.28, 37.57],
+                                     }}),
+            2)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt", "ch": True,
+                                     "members": {
+                                         "Palermo": [13.6, 38.3],
+                                     }}),
+            0)
+        # XX on a missing key creates nothing; NX creates it.
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt-missing",
+                                     "xx": True, "members": {
+                                         "Palermo": [13.361389,
+                                                     38.115556],
+                                     }}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "geo:opt-missing"}), 0)
+        self.assertEqual(
+            self._tool("kv_geoadd", {"key": "geo:opt-missing",
+                                     "nx": True, "members": {
+                                         "Palermo": [13.361389,
+                                                     38.115556],
+                                     }}),
+            1)
+        # NX and XX together fail client-side; nothing is written.
+        reply = self._call("tools/call", 99, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "geo:opt", "nx": True, "xx": True,
+                          "members": {"a": [13.3, 38.1]}},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
 
     def test_live_geosearch_georadius(self):
         """kv_geosearch / kv_georadius / kv_georadiusbymember
