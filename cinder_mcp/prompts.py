@@ -62,7 +62,9 @@ import time
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
-from .tools import MAX_GEOSEARCH_MEMBERS, _xadd_args, _xreadgroup_args
+from .tools import (MAX_GEOSEARCH_MEMBERS, MAX_XPENDING_ENTRIES,
+                    _xack_args, _xadd_args, _xgroup_create_args,
+                    _xreadgroup_args)
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
 # The prompts process one batch at a time and keep only bounded
@@ -150,7 +152,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_georadius", "kv_georadiusbymember", "kv_geosearchstore",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
-    "kv_xadd", "kv_xreadgroup",
+    "kv_xadd", "kv_xreadgroup", "kv_xgroup_create", "kv_xack",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -309,6 +311,9 @@ PROMPTS = [
             "would fail on a container or trim entries off a stream, "
             "XREADGROUPs that would fail on a missing key or group "
             "or deliver new entries into a group's pending list, "
+            "XGROUP CREATEs that would fail on a missing key or a "
+            "group that already exists, XACKs that would fail on a "
+            "missing key or group, "
             "and EXPIREs with "
             "a bad timeout, and give a go/no-go per risky op. Read "
             "ops in the plan are not audited — XRANGE, XREVRANGE, "
@@ -1810,6 +1815,175 @@ def _audit_xreadgroup(client, op):
     return "safe", "kv_xreadgroup — %s" % "; ".join(safe)
 
 
+def _audit_xgroup_create(client, op):
+    """Audit one kv_xgroup_create op: the stream is probed live,
+    and the group is probed with XPENDING — it answers for a group
+    that exists and fails NOGROUP for one that does not. A group
+    that already exists fails BUSYGROUP, and creating one on a
+    missing key fails unless mkstream is set. Returns (verdict,
+    line)."""
+    key, group, id_value, mkstream = _xgroup_create_args(op)
+    if client.command("EXISTS", key) == 0:
+        if mkstream:
+            return "caution", (
+                "kv_xgroup_create — creates consumer group %r on a "
+                "new empty stream %r, with no expiry"
+                % (group, key)
+            )
+        return "risky", (
+            "kv_xgroup_create — %r would fail: no such key; pass "
+            "mkstream to create the stream" % key
+        )
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        # The key expired while auditing; the create would fail.
+        if mkstream:
+            return "caution", (
+                "kv_xgroup_create — creates consumer group %r on a "
+                "new empty stream %r, with no expiry"
+                % (group, key)
+            )
+        return "risky", (
+            "kv_xgroup_create — %r would fail: no such key; pass "
+            "mkstream to create the stream" % key
+        )
+    try:
+        kind, _size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        # The key expired between the TTL read and the probe.
+        if mkstream:
+            return "caution", (
+                "kv_xgroup_create — creates consumer group %r on a "
+                "new empty stream %r, with no expiry"
+                % (group, key)
+            )
+        return "risky", (
+            "kv_xgroup_create — %r would fail: no such key; pass "
+            "mkstream to create the stream" % key
+        )
+    if kind != "stream":
+        return "risky", (
+            "kv_xgroup_create — %r would fail with WRONGTYPE: the "
+            "key is a %s of %s" % (key, kind, size)
+        )
+    try:
+        client.command("XPENDING", key, group)
+    except RespError as exc:
+        if "NOGROUP" in str(exc):
+            if ttl == -1:
+                return "caution", (
+                    "kv_xgroup_create — creates consumer group %r on "
+                    "stream %r starting at %r, on a stream that never "
+                    "expires" % (group, key, id_value)
+                )
+            return "safe", (
+                "kv_xgroup_create — creates consumer group %r on "
+                "stream %r starting at %r" % (group, key, id_value)
+            )
+        raise
+    return "risky", (
+        "kv_xgroup_create — %r would fail with BUSYGROUP: consumer "
+        "group %r already exists" % (key, group)
+    )
+
+
+def _audit_xack(client, op):
+    """Audit one kv_xack op: the stream and the group are probed
+    live, and the pending list is read with the extended XPENDING
+    form so the ids that are actually pending are known — acking
+    drops them from the pending list, while the entries stay in
+    the stream, so nothing is lost. A bare-millisecond id is
+    normalised to its first sequence before comparing, as cinder
+    reads it. Returns (verdict, line)."""
+    key, group, ids = _xack_args(op)
+    if client.command("EXISTS", key) == 0:
+        return "risky", (
+            "kv_xack — %r would fail: no such key or consumer group "
+            "%r" % (key, group)
+        )
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        # The key expired while auditing; the ack would fail.
+        return "risky", (
+            "kv_xack — %r would fail: no such key or consumer group "
+            "%r" % (key, group)
+        )
+    try:
+        kind, _size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        # The key expired between the TTL read and the probe.
+        return "risky", (
+            "kv_xack — %r would fail: no such key or consumer group "
+            "%r" % (key, group)
+        )
+    if kind != "stream":
+        return "risky", (
+            "kv_xack — %r would fail with WRONGTYPE: the key is a "
+            "%s of %s" % (key, kind, size)
+        )
+    try:
+        total = client.command("XPENDING", key, group)[0]
+    except RespError as exc:
+        if "NOGROUP" in str(exc):
+            return "risky", (
+                "kv_xack — %r would fail: no such consumer group %r"
+                % (key, group)
+            )
+        raise
+    if total == 0:
+        return "safe", (
+            "kv_xack — no-op, nothing is pending in consumer group "
+            "%r on stream %r" % (group, key)
+        )
+    checked = min(total, MAX_XPENDING_ENTRIES)
+    pending = client.command("XPENDING", key, group, "-", "+", checked)
+    pending_ids = {entry[0] for entry in pending}
+    acked = [i for i in ids if _xack_normalised_id(i) in pending_ids]
+    missed = [i for i in ids if _xack_normalised_id(i) not in pending_ids]
+    if total > MAX_XPENDING_ENTRIES and missed:
+        # Only the first 1000 pending entries were checked, so an
+        # id outside them may still be pending.
+        return "caution", (
+            "kv_xack — drops %d pending %s from consumer group %r "
+            "on stream %r, but only the first %d of %d pending "
+            "entries were checked, so the other %d %s may still be "
+            "pending"
+            % (len(acked), "entry" if len(acked) == 1 else "entries",
+               group, key, MAX_XPENDING_ENTRIES, total, len(missed),
+               "id" if len(missed) == 1 else "ids")
+        )
+    if not acked:
+        return "safe", (
+            "kv_xack — no-op, none of the %d %s are pending in "
+            "consumer group %r on stream %r"
+            % (len(ids), "id" if len(ids) == 1 else "ids", group, key)
+        )
+    if not missed:
+        return "safe", (
+            "kv_xack — drops %d pending %s from consumer group %r "
+            "on stream %r; the entries stay in the stream"
+            % (len(acked), "entry" if len(acked) == 1 else "entries",
+               group, key)
+        )
+    return "safe", (
+        "kv_xack — drops %d pending %s from consumer group %r on "
+        "stream %r and %d %s change nothing, since they are not "
+        "pending; the entries stay in the stream"
+        % (len(acked), "entry" if len(acked) == 1 else "entries",
+           group, key, len(missed),
+           "id" if len(missed) == 1 else "ids")
+    )
+
+
+def _xack_normalised_id(id_value):
+    """One kv_xack id as the pending list spells it: a bare
+    millisecond is the first sequence of that millisecond, so
+    "2000" is "2000-0"; "ms-seq" is already spelled that way."""
+    if "-" not in id_value:
+        return "%s-0" % id_value
+    return id_value
+
+
 def _audit_lmove(client, op):
     """Audit one kv_lmove op: the source and the destination are
     both probed live, because the move reads the source, writes the
@@ -3145,7 +3319,9 @@ def _audit_write_op(client, op):
     destination's registers, an XADD with a MAXLEN that would trim
     entries off a never-expiring stream, or a MAXLEN 0 that would
     delete a stream outright, an XREADGROUP on a missing key or a
-    missing group, or an EXPIRE,
+    missing group, an XGROUP CREATE on a missing key or a group
+    that already exists, or an XACK on a missing key or group, or
+    an EXPIRE,
     SETEX or GETEX with a bad timeout. "caution" changes
     something but the damage is bounded — an overwrite or delete
     of a key that expires soon anyway, a SET, MSET, SETNX, APPEND,
@@ -3155,7 +3331,10 @@ def _audit_write_op(client, op):
     clears its expiry, an XADD that creates a stream with no
     expiry, appends to a stream that never expires, or trims
     entries off a stream that expires soon, an XREADGROUP that
-    delivers new entries into a group's pending list, a HSETNX
+    delivers new entries into a group's pending list, an XGROUP
+    CREATE that creates a group on a stream that never expires or
+    a new stream with no expiry, an XACK whose pending list is
+    wider than the audit can read, a HSETNX
     that creates a hash with no expiry or adds a field to a hash
     that never expires, a GETEX that gives a never-expiring key
     an expiry or removes one, a ZPOP that takes some but not all
@@ -3234,6 +3413,15 @@ def _audit_write_op(client, op):
         # consumer per call, not one key — so it is audited on its
         # own.
         return _audit_xreadgroup(client, op)
+    if name == "kv_xgroup_create":
+        # XGROUP CREATE makes a group on one stream, and may
+        # create the stream itself with MKSTREAM, so it is audited
+        # on its own.
+        return _audit_xgroup_create(client, op)
+    if name == "kv_xack":
+        # XACK drops entries from one group's pending list, so it
+        # is audited on its own.
+        return _audit_xack(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

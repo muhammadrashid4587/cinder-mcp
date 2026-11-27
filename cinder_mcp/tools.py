@@ -673,7 +673,7 @@ TOOLS = [
     },
     {
         "name": "kv_xreadgroup",
-        "description": "Read a stream as a consumer of a consumer group: XREADGROUP GROUP group consumer [COUNT count] STREAMS key [key ...] id [id ...]. Takes `group` and `consumer` as strings and `streams` as an object mapping stream keys to IDs (\">\" for the entries after the group's cursor — the new entries, delivered to this consumer and recorded in the group's pending list — or an explicit ID like \"0\" or \"ms-seq\" to re-read this consumer's pending entries after that ID, without changing delivery state). Returns one {\"key\": ..., \"entries\": [{\"id\": ..., \"fields\": {...}}]} object per stream that has anything to deliver, in stream order — streams with nothing new are left out, and a read with nothing new at all answers an empty list. Pass `count` for at most that many entries per stream (1 to 1000); without a count at most 1000 entries per stream are returned, and a wider stream fails instead of returning a truncated list. A read for a missing key or a group that does not exist fails with NOGROUP. Cinder 0.68.0 has no BLOCK for XREADGROUP yet, so the tool does not offer it, and there is no kv_xgroup_create tool yet — create the group out of band (XGROUP CREATE key group 0 or $) before reading. At most 100 streams per call.",
+        "description": "Read a stream as a consumer of a consumer group: XREADGROUP GROUP group consumer [COUNT count] STREAMS key [key ...] id [id ...]. Takes `group` and `consumer` as strings and `streams` as an object mapping stream keys to IDs (\">\" for the entries after the group's cursor — the new entries, delivered to this consumer and recorded in the group's pending list — or an explicit ID like \"0\" or \"ms-seq\" to re-read this consumer's pending entries after that ID, without changing delivery state). Returns one {\"key\": ..., \"entries\": [{\"id\": ..., \"fields\": {...}}]} object per stream that has anything to deliver, in stream order — streams with nothing new are left out, and a read with nothing new at all answers an empty list. Pass `count` for at most that many entries per stream (1 to 1000); without a count at most 1000 entries per stream are returned, and a wider stream fails instead of returning a truncated list. A read for a missing key or a group that does not exist fails with NOGROUP. Create the group first with kv_xgroup_create. The tool does not offer BLOCK. At most 100 streams per call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -699,6 +699,33 @@ TOOLS = [
                 "consumer": {"type": "string"},
             },
             "required": ["key", "group"],
+        },
+    },
+    {
+        "name": "kv_xgroup_create",
+        "description": "Create a consumer group on a stream: XGROUP CREATE key group id [MKSTREAM]. Takes `key` and `group` as strings and `id` as the ID the group starts at (\"$\" by default — only entries added after the group is created, \"0\" for every entry from the beginning, or an explicit ID like \"ms-seq\"), and returns \"OK\". Pass `mkstream: true` to create the stream empty when it does not exist; without it, creating a group on a missing key fails. Creating a group that already exists fails with BUSYGROUP, and a key that is not a stream fails with WRONGTYPE.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "group": {"type": "string"},
+                "id": {"type": "string"},
+                "mkstream": {"type": "boolean"},
+            },
+            "required": ["key", "group"],
+        },
+    },
+    {
+        "name": "kv_xack",
+        "description": "Acknowledge entries of a consumer group: XACK key group id [id ...]. Takes `key` and `group` as strings and `ids` as a list of entry IDs (\"ms-seq\", at least one, at most 1000) and returns how many were dropped from the group's pending list — an ID that is not pending counts 0, so acking the same entry twice answers 1 then 0. The entries stay in the stream; only their pending record is dropped. A missing key or a group that does not exist fails with NOGROUP.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "group": {"type": "string"},
+                "ids": {"type": "array"},
+            },
+            "required": ["key", "group", "ids"],
         },
     },
     {
@@ -1519,7 +1546,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1653,7 +1680,7 @@ BATCHABLE_TOOLS = {
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
-    "kv_xreadgroup", "kv_xpending",
+    "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1751,7 +1778,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
-    "kv_xreadgroup", "kv_xpending",
+    "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -2558,6 +2585,21 @@ def _op_argv(name, args):
         if consumer is not None:
             cmd.append(consumer)
         return cmd
+    if name == "kv_xgroup_create":
+        # XGROUP CREATE key group id [MKSTREAM] — the id is "$" by
+        # default (only entries added after the group is created),
+        # "0" from the beginning, or an explicit ID; MKSTREAM
+        # creates the stream empty when it does not exist.
+        key, group, id_value, mkstream = _xgroup_create_args(args)
+        cmd = ["XGROUP", "CREATE", key, group, id_value]
+        if mkstream:
+            cmd.append("MKSTREAM")
+        return cmd
+    if name == "kv_xack":
+        # XACK key group id [id ...] — the count of entries
+        # dropped from the group's pending list.
+        key, group, ids = _xack_args(args)
+        return ["XACK", key, group] + ids
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -3926,6 +3968,75 @@ def _call_xpending(client, args):
     key, group, start, end, count, consumer = _xpending_args(args)
     reply = client.command(*_op_argv("kv_xpending", args))
     return _xpending_result(reply, start is not None)
+
+
+# The most entry IDs one kv_xack call acknowledges; a wider call
+# fails instead of sending a huge ack.
+MAX_XACK_IDS = 1000
+
+
+def _xgroup_create_args(args):
+    """Validate a kv_xgroup_create call: (key, group, id,
+    mkstream). `key` and `group` must be strings. `id` is the ID
+    the group starts at — "$" (only entries added after the group
+    is created) by default, "0" from the beginning, or an explicit
+    ID validated like kv_xrange's bounds. `mkstream` must be a
+    boolean when given."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xgroup_create key must be a string")
+    group = _require(args, "group")
+    if not isinstance(group, str):
+        raise ValueError("kv_xgroup_create group must be a string")
+    id_value = args.get("id", "$")
+    if not isinstance(id_value, str):
+        raise ValueError("kv_xgroup_create id must be a string")
+    if id_value != "$":
+        id_value = _stream_bound(id_value, "kv_xgroup_create")
+    mkstream = args.get("mkstream", False)
+    if not isinstance(mkstream, bool):
+        raise ValueError("kv_xgroup_create mkstream must be true or false")
+    return key, group, id_value, mkstream
+
+
+def _call_xgroup_create(client, args):
+    """kv_xgroup_create: make a consumer group on a stream,
+    answering "OK"."""
+    reply = client.command(*_op_argv("kv_xgroup_create", args))
+    return reply
+
+
+def _xack_args(args):
+    """Validate a kv_xack call: (key, group, ids). `key` and
+    `group` must be strings. `ids` must be a non-empty list of
+    entry IDs, at most MAX_XACK_IDS, each validated like
+    kv_xpending's bounds — "ms-seq", or a bare millisecond, which
+    cinder reads as the first sequence of that millisecond."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xack key must be a string")
+    group = _require(args, "group")
+    if not isinstance(group, str):
+        raise ValueError("kv_xack group must be a string")
+    ids = args.get("ids")
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("kv_xack ids must be a non-empty list")
+    if len(ids) > MAX_XACK_IDS:
+        raise ValueError(
+            "kv_xack acks at most %d entries; narrow the list"
+            % MAX_XACK_IDS
+        )
+    checked = []
+    for id_value in ids:
+        checked.append(_stream_bound(id_value, "kv_xack"))
+    return key, group, checked
+
+
+def _call_xack(client, args):
+    """kv_xack: drop entries from a group's pending list,
+    answering how many were dropped."""
+    reply = client.command(*_op_argv("kv_xack", args))
+    return reply
 
 
 # The most members one kv_zrange call returns; a wider range fails
@@ -5660,6 +5771,10 @@ def _call_single(client, name, args):
         return _call_xreadgroup(client, args)
     if name == "kv_xpending":
         return _call_xpending(client, args)
+    if name == "kv_xgroup_create":
+        return _call_xgroup_create(client, args)
+    if name == "kv_xack":
+        return _call_xack(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":
