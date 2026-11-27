@@ -61,6 +61,17 @@ class ZSet:
         return sorted(self.members, key=lambda m: (self.members[m], m))
 
 
+class HLL:
+    """A HyperLogLog in the fake store: the set of elements added
+    so far. The fake counts exactly — real cinder estimates within
+    about one percent — so the unit tests use small cardinalities
+    where the exact count is the estimate, and the live tests
+    check the approximate range."""
+
+    def __init__(self):
+        self.elements = set()
+
+
 class FakeCinder(threading.Thread):
     """A minimal RESP server on an ephemeral port, speaking cinder's subset."""
 
@@ -695,6 +706,10 @@ class FakeCinder(threading.Thread):
             return self._bulk(value)
         elif name == "GET" and len(args) == 1:
             value = self._get(args[0])
+            if isinstance(value, HLL):
+                # A HyperLogLog is a string value in real cinder:
+                # a 4-byte HLL1 header and 2^14 one-byte registers.
+                return self._bulk("HLL1" + "\x00" * 16384)
             if value is not None and not isinstance(value, str):
                 return ("-WRONGTYPE Operation against a key holding the "
                         "wrong kind of value\r\n")
@@ -1390,6 +1405,47 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     out += self._bulk(repr(first[member]))
             return out
+        elif name == "PFADD" and len(args) >= 2:
+            # PFADD key element [element ...]: 1 when at least one
+            # register moved, 0 when every element was already
+            # counted. A missing key is created; a plain string is
+            # not a valid HyperLogLog, and a container is the wrong
+            # type, as in real cinder. The key's expiry is
+            # preserved: the stored tuple is only replaced when
+            # the key is created.
+            value = self._get(args[0])
+            if value is None:
+                value = HLL()
+                self.store[args[0]] = (value, None)
+            if isinstance(value, str):
+                return ("-WRONGTYPE Key is not a valid HyperLogLog "
+                        "string value.\r\n")
+            if not isinstance(value, HLL):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            before = len(value.elements)
+            value.elements.update(args[1:])
+            return ":1\r\n" if len(value.elements) > before else ":0\r\n"
+        elif name == "PFCOUNT" and len(args) >= 1:
+            # PFCOUNT key [key ...]: the estimate for the union of
+            # the keys, merged register-wise — here, the exact size
+            # of the union of the element sets. A missing key
+            # counts as empty; a plain string is not a valid
+            # HyperLogLog, and a container is the wrong type, as
+            # in real cinder.
+            merged = set()
+            for key in args:
+                value = self._get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    return ("-WRONGTYPE Key is not a valid "
+                            "HyperLogLog string value.\r\n")
+                if not isinstance(value, HLL):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                merged |= value.elements
+            return ":%d\r\n" % len(merged)
         elif name == "ZRANK" and len(args) == 2:
             value = self._get(args[0])
             if value is None:
@@ -2228,6 +2284,7 @@ class McpTests(unittest.TestCase):
                     "kv_zpopmin", "kv_zpopmax",
                     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
                     "kv_zdiff",
+                    "kv_pfadd", "kv_pfcount",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -4769,6 +4826,220 @@ class McpTests(unittest.TestCase):
         self.assertIn("at most 1000 members",
                       summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 1001)
+
+    def _pfadd_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_pfadd", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _pfcount_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_pfcount", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def test_kv_pfadd_returns_changed_flag_and_preserves_ttl(self):
+        # New key: 1; the same elements again: 0; one new
+        # element among repeats: 1.
+        self.assertEqual(
+            self._pfadd_result({"key": "h",
+                                "elements": ["a", "b", "c"]}), 1)
+        self.assertEqual(
+            self._pfadd_result({"key": "h",
+                                "elements": ["a", "b"]}), 0)
+        self.assertEqual(
+            self._pfadd_result({"key": "h",
+                                "elements": ["b", "d"]}), 1)
+        self.assertEqual(self._pfcount_result({"keys": ["h"]}), 4)
+        # An element repeated in one call counts once.
+        self.assertEqual(
+            self._pfadd_result({"key": "h2",
+                                "elements": ["x", "x", "x"]}), 1)
+        self.assertEqual(self._pfcount_result({"keys": ["h2"]}), 1)
+        # An empty-string element is still an element.
+        self.assertEqual(
+            self._pfadd_result({"key": "h3", "elements": [""]}), 1)
+        self.assertEqual(self._pfcount_result({"keys": ["h3"]}), 1)
+        # PFADD preserves the TTL.
+        self._call("tools/call", 2, {
+            "name": "kv_expire",
+            "arguments": {"key": "h", "seconds": 300},
+        })
+        self.assertEqual(
+            self._pfadd_result({"key": "h", "elements": ["e"]}), 1)
+        ttl = self._call("tools/call", 3, {
+            "name": "kv_ttl", "arguments": {"key": "h"},
+        })
+        self.assertGreater(
+            int(ttl["result"]["content"][0]["text"]), 0)
+        # The stored value is a HyperLogLog string, not a plain
+        # one: GET returns the HLL1 header and 2^14 registers.
+        got = self._call("tools/call", 4, {
+            "name": "kv_get", "arguments": {"key": "h"},
+        })
+        value = got["result"]["content"][0]["text"]
+        self.assertTrue(value.startswith("HLL1"))
+        self.assertEqual(len(value), 16388)
+
+    def test_kv_pfadd_rejects_bad_arguments(self):
+        for bad in ({"key": "h"}, {"key": "h", "elements": []},
+                    {"key": "h", "elements": "a"},
+                    {"key": "h", "elements": [1]},
+                    {"key": 1, "elements": ["a"]},
+                    {"elements": ["a"]}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_pfadd",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_pfadd_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        for key in ("plain", "z"):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_pfadd",
+                "arguments": {"key": key, "elements": ["x"]},
+            })
+            self.assertIn("error", reply, key)
+
+    def test_kv_pfcount_returns_union_estimate(self):
+        self.assertEqual(
+            self._pfadd_result({"key": "c1",
+                                "elements": ["a", "b", "c"]}), 1)
+        self.assertEqual(
+            self._pfadd_result({"key": "c2",
+                                "elements": ["b", "c", "d", "e"]}), 1)
+        # One key: its own count; two keys: the union, each
+        # element counted once; order does not matter.
+        self.assertEqual(self._pfcount_result({"keys": ["c1"]}), 3)
+        self.assertEqual(
+            self._pfcount_result({"keys": ["c1", "c2"]}), 5)
+        self.assertEqual(
+            self._pfcount_result({"keys": ["c2", "c1"]}), 5)
+        # The same key twice counts once.
+        self.assertEqual(
+            self._pfcount_result({"keys": ["c1", "c1"]}), 3)
+        # A missing key counts as an empty set: counting only
+        # missing keys is 0, and a missing key adds nothing to a
+        # union.
+        self.assertEqual(
+            self._pfcount_result({"keys": ["ghost"]}), 0)
+        self.assertEqual(
+            self._pfcount_result({"keys": ["ghost", "alsogone"]}), 0)
+        self.assertEqual(
+            self._pfcount_result({"keys": ["c1", "ghost"]}), 3)
+
+    def test_kv_pfcount_rejects_bad_arguments(self):
+        self._pfadd_result({"key": "h", "elements": ["a"]})
+        for bad in ({"keys": []}, {"keys": "h"}, {"keys": [1]},
+                    {"keys": ["h", 2]}, {"keys": ["h"] * 1001}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_pfcount",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_pfcount", "arguments": {},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_kv_pfcount_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        self._pfadd_result({"key": "h", "elements": ["a"]})
+        for keys in (["h", "plain"], ["plain"], ["h", "z"]):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_pfcount",
+                "arguments": {"keys": keys},
+            })
+            self.assertIn("error", reply, keys)
+
+    def test_kv_pfadd_pfcount_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_pfadd", "key": "b1",
+                 "elements": ["a", "b", "c"]},
+                {"op": "kv_pfcount", "keys": ["b1"]},
+                {"op": "kv_pfadd", "key": "b1",
+                 "elements": ["a", "b"]},
+                {"op": "kv_pfcount", "keys": ["b1", "ghost"]},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertEqual(summary["results"][1]["result"], 3)
+        self.assertEqual(summary["results"][2]["result"], 0)
+        self.assertEqual(summary["results"][3]["result"], 3)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pfadd", "key": "b2",
+                 "elements": ["x", "y"]},
+                {"op": "kv_pfcount", "keys": ["b2"]},
+                {"op": "kv_pfadd", "key": "b2",
+                 "elements": ["z"]},
+                {"op": "kv_pfcount", "keys": ["b2", "b1"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 6)
+        # Bad pfadd/pfcount arguments fail an atomic batch up
+        # front, before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pfadd", "key": "b3",
+                 "elements": ["a"]},
+                {"op": "kv_pfcount", "keys": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "b3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # An EXEC-time WRONGTYPE is recorded as that op's error,
+        # in place, and the rest still run.
+        self._call("tools/call", 5, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        wrongtype = self._call("tools/call", 6, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_pfadd", "key": "plain",
+                 "elements": ["a"]},
+                {"op": "kv_pfcount", "keys": ["b2"]},
+            ]},
+        })
+        summary = json.loads(wrongtype["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("WRONGTYPE", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 3)
 
     def test_tools_call_string_mget_mset_getdel_setnx_setex_getset(self):
         # MSET sets several keys at once; MGET reads them back in
@@ -9509,9 +9780,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_dbsize"},
             {"op": "kv_zunion", "keys": ["a", "b"]},
             {"op": "kv_zinter", "keys": ["a", "b"]},
+            {"op": "kv_pfcount", "keys": ["a", "b"]},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 17 op(s), 1 audited, 16 not audited.", text)
+        self.assertIn("Plan: 18 op(s), 1 audited, 17 not audited.", text)
         self.assertIn("op 0: kv_get is a read, not a write", text)
         self.assertIn("op 2: not a write op: kv_keys_scan", text)
         self.assertIn("op 3: not a write op: nope", text)
@@ -9528,6 +9800,7 @@ class McpTests(unittest.TestCase):
         self.assertIn("op 14: kv_dbsize is a read, not a write", text)
         self.assertIn("op 15: kv_zunion is a read, not a write", text)
         self.assertIn("op 16: kv_zinter is a read, not a write", text)
+        self.assertIn("op 17: kv_pfcount is a read, not a write", text)
 
     def test_prompts_get_write_safety_bit_tools(self):
         self._call("tools/call", 1, {
@@ -12937,6 +13210,168 @@ class LiveCinderMigrationTests(unittest.TestCase):
             client.command("ZDIFF", 2, "zd:a", "zd:b",
                            "STORE", "zd:dest")
         self.assertIn("syntax error", str(caught.exception))
+
+    def test_live_pfadd_pfcount(self):
+        """kv_pfadd / kv_pfcount against a real cinder: PFADD
+        returns 1 when the estimate changes and 0 when every
+        element was already counted, PFCOUNT returns the exact
+        count for small sets and an estimate within about one
+        percent for large ones, several keys merge register-wise
+        into their union, a missing key counts as empty, PFADD
+        preserves the TTL, the stored value is a string with an
+        HLL1 header, WRONGTYPE on a plain string and on a sorted
+        set, bad arguments fail as invalid params, and an atomic
+        batch queues both commands. The commands shipped in
+        cinder 0.55.0; the binary under test had already picked up
+        cinder 0.56.0's PFMERGE by the time this test ran (see the
+        note at the end of the README roadmap), which changes
+        nothing about PFADD/PFCOUNT — and PFMERGE, which merges
+        registers into a destination key, is the natural next
+        tool."""
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pf:a",
+                                    "elements": ["a", "b", "c"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pf:a",
+                                    "elements": ["a", "b"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pf:a",
+                                    "elements": ["b", "d"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_pfcount", {"keys": ["pf:a"]}), 4)
+        # A missing key counts as empty, and a missing key adds
+        # nothing to a union.
+        self.assertEqual(
+            self._tool("kv_pfcount", {"keys": ["pf:ghost"]}), 0)
+        self.assertEqual(
+            self._tool("kv_pfcount",
+                       {"keys": ["pf:a", "pf:ghost"]}), 4)
+        # An empty-string element is still an element.
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pf:empty",
+                                    "elements": [""]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_pfcount", {"keys": ["pf:empty"]}), 1)
+        # The stored value is a HyperLogLog string: an HLL1
+        # header and 2^14 one-byte registers.
+        value = self._tool("kv_get", {"key": "pf:a"})
+        self.assertTrue(value.startswith("HLL1"))
+        self.assertEqual(len(value), 16388)
+        # PFADD preserves the TTL.
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pf:ttl",
+                                    "elements": ["q"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "pf:ttl",
+                                     "seconds": 300}),
+            1)
+        self.assertEqual(
+            self._tool("kv_pfadd", {"key": "pf:ttl",
+                                    "elements": ["r", "s"]}),
+            1)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "pf:ttl"}), 0)
+        self.assertEqual(
+            self._tool("kv_pfcount", {"keys": ["pf:ttl"]}), 3)
+        # 1000 distinct elements estimate close to 1000 — the
+        # probe measured 1012 on this build — and two disjoint
+        # 1000-element sets union to about 2000; an overlapping
+        # union counts the shared elements once. Elements go in
+        # in chunks: one PFADD carrying 1000 elements is a
+        # 1001-arg command, so the chunks stay small.
+        for start in range(0, 1000, 200):
+            self.assertEqual(
+                self._tool("kv_pfadd", {
+                    "key": "pf:big",
+                    "elements": ["e%d" % i for i in range(
+                        start, start + 200)]}),
+                1)
+        estimate = self._tool("kv_pfcount", {"keys": ["pf:big"]})
+        self.assertGreaterEqual(estimate, 900)
+        self.assertLessEqual(estimate, 1100)
+        for start in range(0, 1000, 200):
+            self.assertEqual(
+                self._tool("kv_pfadd", {
+                    "key": "pf:big2",
+                    "elements": ["f%d" % i for i in range(
+                        start, start + 200)]}),
+                1)
+        union = self._tool("kv_pfcount",
+                           {"keys": ["pf:big", "pf:big2"]})
+        self.assertGreaterEqual(union, 1800)
+        self.assertLessEqual(union, 2200)
+        # The union is order-independent.
+        self.assertEqual(
+            self._tool("kv_pfcount",
+                       {"keys": ["pf:big2", "pf:big"]}),
+            union)
+        for start in range(0, 500, 200):
+            self.assertEqual(
+                self._tool("kv_pfadd", {
+                    "key": "pf:big3",
+                    "elements": ["e%d" % i for i in range(
+                        start, min(start + 200, 500))]}),
+                1)
+        for start in range(0, 500, 200):
+            self.assertEqual(
+                self._tool("kv_pfadd", {
+                    "key": "pf:big3",
+                    "elements": ["g%d" % i for i in range(
+                        start, min(start + 200, 500))]}),
+                1)
+        overlap = self._tool("kv_pfcount",
+                             {"keys": ["pf:big", "pf:big3"]})
+        self.assertGreaterEqual(overlap, 1350)
+        self.assertLessEqual(overlap, 1650)
+        # WRONGTYPE on a plain string and on a sorted set, for
+        # both commands, and bad arguments fail as invalid
+        # params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "pf:str", "value": "hello"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_zadd", {"key": "pf:z",
+                                   "members": {"m": 1}}),
+            1)
+        for name, arguments in (
+                ("kv_pfadd", {"key": "pf:str",
+                              "elements": ["x"]}),
+                ("kv_pfadd", {"key": "pf:z",
+                              "elements": ["x"]}),
+                ("kv_pfcount", {"keys": ["pf:a", "pf:str"]}),
+                ("kv_pfcount", {"keys": ["pf:z"]})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000,
+                             arguments)
+        for name, arguments in (
+                ("kv_pfadd", {"key": "pf:a"}),
+                ("kv_pfadd", {"key": "pf:a", "elements": []}),
+                ("kv_pfadd", {"key": "pf:a", "elements": "x"}),
+                ("kv_pfcount", {"keys": []}),
+                ("kv_pfcount", {"keys": "pf:a"}),
+                ("kv_pfcount", {"keys": ["pf:a"] * 1001})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602,
+                             arguments)
+        # Both commands queue in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_pfadd", "key": "pf:batch",
+             "elements": ["x", "y"]},
+            {"op": "kv_pfcount", "keys": ["pf:batch"]},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertEqual(summary["results"][1]["result"], 2)
 
     def test_live_dbsize(self):
         """kv_dbsize against a real cinder 0.49.0: the key count of

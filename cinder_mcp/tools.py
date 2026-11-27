@@ -817,6 +817,29 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_pfadd",
+        "description": "Add elements to a HyperLogLog: PFADD key element [element ...]. Takes `key` and `elements` as a list of strings, at least one. Returns 1 when the estimate changed (at least one register moved), 0 when every element was already counted. Creates the key when it does not exist and preserves its TTL; fails with WRONGTYPE on a key holding a container or a plain string that is not a HyperLogLog. Cinder stores the HyperLogLog as a string value with an HLL1 header, so PFADD never changes the key's type.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "elements": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["key", "elements"],
+        },
+    },
+    {
+        "name": "kv_pfcount",
+        "description": "Estimate the number of distinct elements in one or more HyperLogLogs: PFCOUNT key [key ...]. Takes `keys` as a list of key names, at most 1000. Returns the estimate as an integer; several keys are merged register-wise, so the estimate is for the union of the keys. A missing key counts as an empty set, so PFCOUNT of only missing keys is 0. Fails with WRONGTYPE on a key holding a container or a plain string that is not a HyperLogLog. The estimate is approximate: small cardinalities come back exact, large ones within about one percent — the same approximation real HyperLogLog gives.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "keys": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["keys"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1040,7 +1063,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1176,6 +1199,7 @@ BATCHABLE_TOOLS = {
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
+    "kv_pfadd", "kv_pfcount",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1263,6 +1287,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
+    "kv_pfadd", "kv_pfcount",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1906,6 +1931,11 @@ def _op_argv(name, args):
         if withscores:
             cmd.append("WITHSCORES")
         return cmd
+    if name == "kv_pfadd":
+        key, elements = _pfadd_args(args)
+        return ["PFADD", key] + list(elements)
+    if name == "kv_pfcount":
+        return ["PFCOUNT"] + _pfcount_keys_args(args)
     if name == "kv_sscan":
         key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
         return ["SSCAN", key, cursor or "0", "MATCH", pattern,
@@ -2915,6 +2945,49 @@ def _call_zdiff(client, args):
         client.command(*_op_argv("kv_zdiff", args)) or [],
         _zdiff_args(args)[1],
     )
+
+
+# The most keys one kv_pfcount call reads; a wider call fails
+# instead of sending a half-formed PFCOUNT with a huge argv.
+MAX_PFCOUNT_KEYS = 1000
+
+
+def _pfadd_args(args):
+    """Validate a kv_pfadd call: (key, elements). `key` must be a
+    string and `elements` a non-empty list of strings; anything
+    else fails the call instead of sending a half-formed PFADD.
+    There is no cap on the elements, as with kv_sadd: the reply
+    is one integer either way, so a long element list costs
+    cinder one pass and the caller one number."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_pfadd key must be a string")
+    elements = args.get("elements")
+    if not isinstance(elements, list) or not elements:
+        raise ValueError("kv_pfadd elements must be a non-empty list")
+    for element in elements:
+        if not isinstance(element, str):
+            raise ValueError("kv_pfadd elements must be strings")
+    return key, list(elements)
+
+
+def _pfcount_keys_args(args):
+    """Validate a kv_pfcount call: the key names, as an argv list.
+    `keys` must be a non-empty list of strings, at most
+    MAX_PFCOUNT_KEYS; anything else fails the call instead of
+    sending a half-formed PFCOUNT."""
+    keys = args.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError("kv_pfcount keys must be a non-empty list")
+    if len(keys) > MAX_PFCOUNT_KEYS:
+        raise ValueError(
+            "kv_pfcount reads at most %d keys; narrow the list"
+            % MAX_PFCOUNT_KEYS
+        )
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError("kv_pfcount keys must be strings")
+    return list(keys)
 
 
 def _call_zincrby(client, args):
