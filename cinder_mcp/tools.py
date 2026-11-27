@@ -1507,7 +1507,7 @@ def _call_batch_atomic(client, ops):
             # op's error, in place, like an EXEC-time failure —
             # the rest still run.
             members = _zrange_result(reply or [],
-                                     _zinter_args(op)[1])
+                                     _zinter_args(op)[3])
             if len(members) > MAX_ZRANGE_MEMBERS:
                 results.append(
                     {"op": op_name, "ok": False,

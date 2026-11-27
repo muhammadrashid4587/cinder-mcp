@@ -4541,6 +4541,57 @@ class McpTests(unittest.TestCase):
                       summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 1001)
 
+    def test_kv_zinter_atomic_with_weights_and_no_withscores(self):
+        # Regression: the atomic-batch branch shaped the ZINTER
+        # reply with _zinter_args(op)[1] — weights, not
+        # withscores — so a weighted intersection with withscores
+        # false came back as member/score objects instead of plain
+        # member names. z holds m:000..m:004 at 0..4; z2 holds
+        # m:000..m:002 at 10/20/30, so with weights [2, 3] the
+        # summed scores are 30/62/94, lowest first.
+        self._seed_zset("z", 5)
+        weighted = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"m:000": 10.0, "m:001": 20.0,
+                             "m:002": 30.0}},
+                {"op": "kv_zinter", "keys": ["z", "z2"],
+                 "weights": [2, 3], "withscores": False},
+            ]},
+        })
+        summary = json.loads(weighted["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][1]["result"],
+                         ["m:000", "m:001", "m:002"])
+        # The same call with withscores omitted (it defaults to
+        # false) is plain names too.
+        defaulted = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zinter", "keys": ["z", "z2"],
+                 "weights": [2, 3]},
+            ]},
+        })
+        summary = json.loads(defaulted["result"]["content"][0]["text"])
+        self.assertEqual(summary["results"][0]["result"],
+                         ["m:000", "m:001", "m:002"])
+        # And withscores true with weights still returns the
+        # weighted member/score objects.
+        scored = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zinter", "keys": ["z", "z2"],
+                 "weights": [2, 3], "withscores": True},
+            ]},
+        })
+        summary = json.loads(scored["result"]["content"][0]["text"])
+        self.assertEqual(summary["results"][0]["result"],
+                         [{"member": "m:000", "score": 30.0},
+                          {"member": "m:001", "score": 62.0},
+                          {"member": "m:002", "score": 94.0}])
+
     def _zdiff_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_zdiff", "arguments": arguments,
