@@ -1742,11 +1742,17 @@ def _audit_xreadgroup(client, op):
     ">" read delivers new entries to the consumer and records them
     in the group's pending list until XACK; an explicit-ID read
     only re-reads this consumer's pending entries and changes no
-    delivery state. Returns (verdict, line)."""
-    group, consumer, keys, ids, _count = _xreadgroup_args(op)
+    delivery state. BLOCK does not change the verdict: a blocked
+    ">" read still delivers when entries arrive, and a blocked
+    explicit-ID read still changes no delivery state — it only
+    waits out the timeout, since new entries are never pending
+    for that consumer. Returns (verdict, line)."""
+    group, consumer, keys, ids, _count, block = _xreadgroup_args(op)
     risky = []
     caution = []
     safe = []
+    wait = ("; waits up to %dms for new entries" % block
+            if block is not None else "")
     for key, id_value in zip(keys, ids):
         if client.command("EXISTS", key) == 0:
             risky.append(
@@ -1792,20 +1798,20 @@ def _audit_xreadgroup(client, op):
                 caution.append(
                     "delivers new entries to consumer %r in group %r "
                     "on stream %r, recording them in the pending list "
-                    "until XACK, on a stream that never expires"
-                    % (consumer, group, key)
+                    "until XACK%s, on a stream that never expires"
+                    % (consumer, group, key, wait)
                 )
             else:
                 caution.append(
                     "delivers new entries to consumer %r in group %r "
                     "on stream %r, recording them in the pending list "
-                    "until XACK" % (consumer, group, key)
+                    "until XACK%s" % (consumer, group, key, wait)
                 )
         else:
             safe.append(
                 "re-reads the pending entries of consumer %r in group "
-                "%r on stream %r without changing delivery state"
-                % (consumer, group, key)
+                "%r on stream %r without changing delivery state%s"
+                % (consumer, group, key, wait)
             )
     if risky:
         return "risky", "kv_xreadgroup — %s" % "; ".join(

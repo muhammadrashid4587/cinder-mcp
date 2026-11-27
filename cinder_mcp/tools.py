@@ -673,7 +673,7 @@ TOOLS = [
     },
     {
         "name": "kv_xreadgroup",
-        "description": "Read a stream as a consumer of a consumer group: XREADGROUP GROUP group consumer [COUNT count] STREAMS key [key ...] id [id ...]. Takes `group` and `consumer` as strings and `streams` as an object mapping stream keys to IDs (\">\" for the entries after the group's cursor — the new entries, delivered to this consumer and recorded in the group's pending list — or an explicit ID like \"0\" or \"ms-seq\" to re-read this consumer's pending entries after that ID, without changing delivery state). Returns one {\"key\": ..., \"entries\": [{\"id\": ..., \"fields\": {...}}]} object per stream that has anything to deliver, in stream order — streams with nothing new are left out, and a read with nothing new at all answers an empty list. Pass `count` for at most that many entries per stream (1 to 1000); without a count at most 1000 entries per stream are returned, and a wider stream fails instead of returning a truncated list. A read for a missing key or a group that does not exist fails with NOGROUP. Create the group first with kv_xgroup_create. The tool does not offer BLOCK. At most 100 streams per call.",
+        "description": "Read a stream as a consumer of a consumer group: XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]. Takes `group` and `consumer` as strings and `streams` as an object mapping stream keys to IDs (\">\" for the entries after the group's cursor — the new entries, delivered to this consumer and recorded in the group's pending list — or an explicit ID like \"0\" or \"ms-seq\" to re-read this consumer's pending entries after that ID, without changing delivery state). Returns one {\"key\": ..., \"entries\": [{\"id\": ..., \"fields\": {...}}]} object per stream that has anything to deliver, in stream order — streams with nothing new are left out, and a read with nothing new at all answers an empty list. Pass `count` for at most that many entries per stream (1 to 1000); without a count at most 1000 entries per stream are returned, and a wider stream fails instead of returning a truncated list. Pass `block` to wait up to that many milliseconds for new entries instead of answering at once (1 to 4000: BLOCK 0 would wait forever, and the socket to cinder times out after 5 seconds, so a longer block would die as a connection error instead of a clean timeout); a block that times out answers an empty list. A blocked read with an explicit ID never wakes on new entries — only entries already pending for this consumer answer it — so it waits out the whole block and answers an empty list when nothing is pending. A read for a missing key or a group that does not exist fails with NOGROUP. Create the group first with kv_xgroup_create. At most 100 streams per call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -681,6 +681,7 @@ TOOLS = [
                 "consumer": {"type": "string"},
                 "streams": {"type": "object"},
                 "count": {"type": "integer"},
+                "block": {"type": "integer"},
             },
             "required": ["group", "consumer", "streams"],
         },
@@ -1546,7 +1547,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2048,7 +2049,9 @@ def _call_batch_atomic(client, ops):
         elif op_name == "kv_xreadgroup":
             # XREADGROUP came back shaped like XREAD inside the
             # transaction; shape it like the standalone tool does,
-            # into per-stream key/entries objects. A stream wider
+            # into per-stream key/entries objects. A BLOCK never
+            # reaches EXEC: cinder refuses to queue it, so the
+            # whole call fails up front instead. A stream wider
             # than the cap is recorded as this op's error, in
             # place, like an EXEC-time failure — the rest still
             # run.
@@ -2565,15 +2568,19 @@ def _op_argv(name, args):
             cmd += ["BLOCK", block]
         return cmd + ["STREAMS"] + keys + ids
     if name == "kv_xreadgroup":
-        # XREADGROUP GROUP group consumer [COUNT count] STREAMS key
-        # ... id ... — COUNT is always sent, so the reply stays
-        # bounded even when the caller did not ask for a count: one
-        # past the cap, and the extra entry proves the stream is too
-        # wide. There is no BLOCK: cinder refuses it on XREADGROUP,
-        # so the tool does not offer it.
-        group, consumer, keys, ids, count = _xreadgroup_args(args)
+        # XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms]
+        # STREAMS key ... id ... — COUNT is always sent, so the
+        # reply stays bounded even when the caller did not ask for
+        # a count: one past the cap, and the extra entry proves the
+        # stream is too wide. BLOCK is sent as given: cinder
+        # refuses it inside MULTI at queue time, so an atomic
+        # batch carrying one fails the whole call before anything
+        # runs.
+        group, consumer, keys, ids, count, block = _xreadgroup_args(args)
         cmd = ["XREADGROUP", "GROUP", group, consumer, "COUNT",
                count if count is not None else MAX_XRANGE_ENTRIES + 1]
+        if block is not None:
+            cmd += ["BLOCK", block]
         return cmd + ["STREAMS"] + keys + ids
     if name == "kv_xpending":
         # XPENDING key group, or XPENDING key group start end count
@@ -3833,14 +3840,20 @@ def _xreadgroup_id(value, tool="kv_xreadgroup"):
 
 def _xreadgroup_args(args):
     """Validate a kv_xreadgroup call: (group, consumer, keys, ids,
-    count). `group` and `consumer` must be strings. `streams` must
-    be a non-empty object mapping stream keys to IDs, at most
-    MAX_XREAD_STREAMS, sent in sorted key order so the argv is
-    deterministic. `count` is the entries per stream,
+    count, block). `group` and `consumer` must be strings.
+    `streams` must be a non-empty object mapping stream keys to
+    IDs, at most MAX_XREAD_STREAMS, sent in sorted key order so
+    the argv is deterministic. `count` is the entries per stream,
     1..MAX_XRANGE_ENTRIES when given — 0 is not sent, since cinder
-    needs a positive COUNT for XREADGROUP (unlike XRANGE). There
-    is no `block`: cinder 0.68.0 refuses BLOCK on XREADGROUP, so
-    the tool does not offer it."""
+    needs a positive COUNT for XREADGROUP (unlike XRANGE).
+    `block` is the milliseconds to wait for new entries,
+    1..MAX_XREAD_BLOCK_MS when given — 0 would wait forever, and
+    the socket to cinder times out after 5 seconds, so a longer
+    block would die as a connection error instead of a clean
+    timeout. A blocked read with an explicit ID never wakes on
+    new entries: only entries already pending for this consumer
+    answer it, so it waits out the whole block when nothing is
+    pending."""
     group = _require(args, "group")
     if not isinstance(group, str):
         raise ValueError("kv_xreadgroup group must be a string")
@@ -3873,7 +3886,16 @@ def _xreadgroup_args(args):
                 "kv_xreadgroup count must be between 1 and %d, got %d"
                 % (MAX_XRANGE_ENTRIES, count)
             )
-    return group, consumer, keys, ids, count
+    block = args.get("block")
+    if block is not None:
+        if isinstance(block, bool) or not isinstance(block, int):
+            raise ValueError("kv_xreadgroup block must be an integer")
+        if block < 1 or block > MAX_XREAD_BLOCK_MS:
+            raise ValueError(
+                "kv_xreadgroup block must be between 1 and %d "
+                "milliseconds, got %d" % (MAX_XREAD_BLOCK_MS, block)
+            )
+    return group, consumer, keys, ids, count, block
 
 
 def _call_xreadgroup(client, args):

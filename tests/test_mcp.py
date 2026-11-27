@@ -562,10 +562,11 @@ class FakeCinder(threading.Thread):
                         )
                         self._reply(conn, out)
                 elif in_multi:
-                    if name == "XREAD" and _xread_has_block(cmd):
+                    if name in ("XREAD", "XREADGROUP") and _xread_has_block(cmd):
                         # Cinder refuses a BLOCK inside MULTI at
                         # queue time: there is no client to park at
-                        # EXEC time.
+                        # EXEC time. The scan works for XREADGROUP
+                        # too: its BLOCK also comes before STREAMS.
                         self._reply(
                             conn,
                             "-ERR BLOCK is not allowed in MULTI/EXEC\r\n")
@@ -3613,29 +3614,35 @@ class FakeCinder(threading.Thread):
                                    "consumers": []}
             return "+OK\r\n"
         elif name == "XREADGROUP":
-            # XREADGROUP GROUP group consumer [COUNT count] STREAMS
-            # key [key ...] id [id ...], as in real cinder: ">"
-            # delivers the entries after the group's cursor,
-            # records them in the pending list with delivery count
-            # 1 and advances the cursor; an explicit ID re-reads
-            # this consumer's pending entries after that ID without
-            # changing delivery state. "$" is not valid here, and
-            # BLOCK is not supported yet. A per-stream failure
-            # answers an error, and the streams already collected
-            # are discarded with it — though entries already
-            # delivered stay delivered, as in real cinder.
+            # XREADGROUP GROUP group consumer [COUNT count] [BLOCK
+            # milliseconds] STREAMS key [key ...] id [id ...], as in
+            # real cinder: ">" delivers the entries after the
+            # group's cursor, records them in the pending list with
+            # delivery count 1 and advances the cursor; an explicit
+            # ID re-reads this consumer's pending entries after
+            # that ID without changing delivery state. "$" is not
+            # valid here. With BLOCK and nothing to deliver, the
+            # fake answers the timeout outcome — a nil array — at
+            # once instead of parking for real; with data already
+            # present it answers at once, as cinder does. A
+            # per-stream failure answers an error, and the streams
+            # already collected are discarded with it — though
+            # entries already delivered stay delivered, as in real
+            # cinder.
             if len(args) < 6 or args[0].upper() != "GROUP":
                 return ("-ERR wrong number of arguments for 'xreadgroup' "
                         "command\r\n")
             group, consumer = args[1], args[2]
             count = -1
+            block = -1
             i = 3
+            seen_count = False
+            seen_block = False
             while i < len(args) and args[i].upper() != "STREAMS":
                 opt = args[i].upper()
                 if opt == "COUNT":
-                    if i + 1 >= len(args):
-                        return ("-ERR wrong number of arguments for "
-                                "'xreadgroup' command\r\n")
+                    if seen_count or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
                     try:
                         count = int(args[i + 1])
                     except ValueError:
@@ -3644,10 +3651,21 @@ class FakeCinder(threading.Thread):
                     if count < 1:
                         return ("-ERR COUNT must be a positive "
                                 "integer\r\n")
+                    seen_count = True
                     i += 2
                 elif opt == "BLOCK":
-                    return ("-ERR BLOCK is not supported by XREADGROUP "
-                            "yet\r\n")
+                    if seen_block or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        block = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR BLOCK must be a non-negative "
+                                "integer\r\n")
+                    if block < 0:
+                        return ("-ERR BLOCK must be a non-negative "
+                                "integer\r\n")
+                    seen_block = True
+                    i += 2
                 else:
                     return "-ERR syntax error\r\n"
             if i >= len(args):
@@ -3704,6 +3722,8 @@ class FakeCinder(threading.Thread):
                     grp["consumers"].append(consumer)
                 if entries:
                     out.append((key, entries))
+            if not out and block >= 0:
+                return "$-1\r\n"
             reply = "*%d\r\n" % len(out)
             for key, entries in out:
                 reply += "*2\r\n"
@@ -9897,6 +9917,18 @@ class McpTests(unittest.TestCase):
                {"group": "grp", "consumer": "c1",
                 "streams": {"s": ">"}, "count": True},
                {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "block": 0},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "block": -1},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "block": 4001},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "block": 1.5},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "block": True},
+               {"group": "grp", "consumer": "c1",
+                "streams": {"s": ">"}, "block": "200"},
+               {"group": "grp", "consumer": "c1",
                 "streams": {"s%d" % i: ">" for i in range(101)}}]
         for arguments in bad:
             reply = self._call("tools/call", 1, {
@@ -9929,6 +9961,63 @@ class McpTests(unittest.TestCase):
         self.assertIn("error", reply)
         self.assertEqual(reply["error"]["code"], -32000)
         self.assertIn("WRONGTYPE", reply["error"]["message"])
+
+    def test_kv_xreadgroup_block_times_out_and_reads_at_once(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xb:s", "id": "1-0",
+                               "fields": {"f": "v"}}),
+            "1-0")
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xb:s", "grp", "$"),
+            "OK")
+        # A BLOCK with nothing new times out to an empty list —
+        # the fake answers the nil outcome at once instead of
+        # parking for real; the live test proves the wait.
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xb:s": ">"},
+                                     "block": 200}),
+            [])
+        # With data already present a BLOCK answers at once, and
+        # the delivery is recorded in the pending list.
+        self.assertEqual(
+            self._xadd_result({"key": "xb:s", "id": "2-0",
+                               "fields": {"f": "w"}}),
+            "2-0")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xb:s": ">"},
+                                     "block": 200}),
+            [{"key": "xb:s",
+              "entries": [{"id": "2-0", "fields": {"f": "w"}}]}])
+        self.assertEqual(
+            self._xpending_result({"key": "xb:s", "group": "grp"}),
+            {"total": 1, "min_id": "2-0", "max_id": "2-0",
+             "consumers": [{"consumer": "c1", "count": 1}]})
+        # A blocked read with an explicit ID re-reads the pending
+        # entries at once, without changing delivery state.
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xb:s": "0"},
+                                     "block": 200}),
+            [{"key": "xb:s",
+              "entries": [{"id": "2-0", "fields": {"f": "w"}}]}])
+        self.assertEqual(
+            [(e["id"], e["deliveries"]) for e in self._xpending_result(
+                {"key": "xb:s", "group": "grp",
+                 "start": "-", "end": "+", "count": 10})],
+            [("2-0", 1)])
+        # And with nothing pending for this consumer, a blocked
+        # explicit-ID read answers an empty list.
+        self.assertEqual(
+            self._xack_result({"key": "xb:s", "group": "grp",
+                               "ids": ["2-0"]}),
+            1)
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xb:s": "0"},
+                                     "block": 200}),
+            [])
 
     def test_kv_xpending_forms_and_errors(self):
         self.assertEqual(
@@ -10099,6 +10188,40 @@ class McpTests(unittest.TestCase):
             "consumers": [{"consumer": "c1", "count": 1}]})
         self.assertFalse(summary["results"][2]["ok"])
         self.assertIn("NOGROUP", summary["results"][2]["error"])
+        # A BLOCK inside an atomic batch fails the whole call
+        # before anything runs: cinder refuses to queue it.
+        blocked = self._call("tools/call", 5, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xb3", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xb3": ">"},
+                 "block": 100},
+            ]},
+        })
+        self.assertIn("error", blocked)
+        self.assertIn("BLOCK is not allowed in MULTI/EXEC",
+                      blocked["error"]["message"])
+        untouched = self._call("tools/call", 6, {
+            "name": "kv_exists", "arguments": {"key": "xb3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+        # A plain batch carries a BLOCK read like any other op.
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xb1", "grp2", "$"),
+            "OK")
+        plain = self._call("tools/call", 7, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xreadgroup", "group": "grp2",
+                 "consumer": "c1", "streams": {"xb1": ">"},
+                 "block": 100},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["results"][0]["result"], [])
 
     def test_kv_xgroup_create_and_xack(self):
         # Three entries, then a group from the beginning made with
@@ -22805,15 +22928,18 @@ class LiveCinderMigrationTests(unittest.TestCase):
 
     def test_live_consumer_group_tools(self):
         """kv_xreadgroup / kv_xpending against a real cinder
-        (consumer groups in cinder 0.68.0, XPENDING in 0.69.0):
-        ">" delivery with PEL recording, an empty second read, the
-        pending summary and extended forms with real idle times,
-        a pending re-read that changes no delivery state, COUNT,
-        XACK, NOGROUP and WRONGTYPE errors, "$" rejected as
-        invalid params, no BLOCK option in the tool schema, the
-        tools queueing in one MULTI/EXEC transaction, and the
-        write-safety audit classifying XREADGROUP as a write and
-        XPENDING as a read."""
+        (consumer groups in cinder 0.68.0, XPENDING in 0.69.0,
+        BLOCK for XREADGROUP in 0.70.0): ">" delivery with PEL
+        recording, an empty second read, the pending summary and
+        extended forms with real idle times, a pending re-read
+        that changes no delivery state, COUNT, XACK, NOGROUP and
+        WRONGTYPE errors, "$" rejected as invalid params, BLOCK
+        timing out to an empty list, answering at once when data
+        is already there, waking on an XADD, and never waking on
+        a new entry for an explicit-ID read, the tools queueing
+        in one MULTI/EXEC transaction, and the write-safety audit
+        classifying XREADGROUP as a write and XPENDING as a
+        read."""
         raw = RespClient("127.0.0.1", self.PORT)
         for entry_id, fields in (
                 ("1000-0", {"name": "alice"}),
@@ -22937,12 +23063,105 @@ class LiveCinderMigrationTests(unittest.TestCase):
             reply = self._call("tools/call", 99, {
                 "name": name, "arguments": arguments})
             self.assertIn("error", reply, arguments)
-        # The tool offers no BLOCK: cinder refuses BLOCK on
-        # XREADGROUP, so it is not in the schema at all.
+        # BLOCK is in the schema: a blocked read with nothing new
+        # waits out the timeout and answers an empty list, one
+        # with data already there answers at once, one parked on
+        # ">" wakes when an XADD lands, and one parked on an
+        # explicit ID never wakes on a new entry — the entry is
+        # not pending for that consumer — so it waits out the
+        # whole block and answers an empty list.
         listed = self._call("tools/list", 2)["result"]["tools"]
         schema = [t for t in listed
                   if t["name"] == "kv_xreadgroup"][0]["inputSchema"]
-        self.assertNotIn("block", schema["properties"])
+        self.assertIn("block", schema["properties"])
+        self.assertEqual(
+            self._tool("kv_xadd", {"key": "stream:blk", "id": "1-0",
+                                   "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            raw.command("XGROUP", "CREATE", "stream:blk", "grp", "0"),
+            "OK")
+        # Data already there answers at once, even with a block.
+        start = time.time()
+        self.assertEqual(
+            self._tool("kv_xreadgroup",
+                       {"group": "grp", "consumer": "c1",
+                        "streams": {"stream:blk": ">"},
+                        "block": 200}),
+            [{"key": "stream:blk",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}}]}])
+        self.assertLess(time.time() - start, 1.0)
+        # Nothing new: the block waits out the timeout.
+        start = time.time()
+        self.assertEqual(
+            self._tool("kv_xreadgroup",
+                       {"group": "grp", "consumer": "c1",
+                        "streams": {"stream:blk": ">"},
+                        "block": 200}),
+            [])
+        self.assertGreaterEqual(time.time() - start, 0.15)
+        # Parked on ">": an XADD wakes the read well before the
+        # 3000ms block runs out, and the entry is delivered and
+        # recorded in the pending list.
+        results = []
+
+        def _blocked_read(out):
+            out.append(self._call("tools/call", 1, {
+                "name": "kv_xreadgroup",
+                "arguments": {"group": "grp", "consumer": "c1",
+                              "streams": {"stream:blk": ">"},
+                              "block": 3000}}))
+
+        reader = threading.Thread(target=_blocked_read, args=(results,))
+        start = time.time()
+        reader.start()
+        time.sleep(0.1)
+        new_id = raw.command("XADD", "stream:blk", "*", "v", "b")
+        reader.join(timeout=5)
+        self.assertFalse(reader.is_alive())
+        self.assertLess(time.time() - start, 2.0)
+        self.assertEqual(len(results), 1)
+        self.assertNotIn("error", results[0])
+        woken = json.loads(
+            results[0]["result"]["content"][0]["text"])
+        self.assertEqual(woken, [
+            {"key": "stream:blk",
+             "entries": [{"id": new_id, "fields": {"v": "b"}}]},
+        ])
+        self.assertEqual(
+            self._tool("kv_xpending",
+                       {"key": "stream:blk", "group": "grp"}),
+            {"total": 2, "min_id": "1-0", "max_id": new_id,
+             "consumers": [{"consumer": "c1", "count": 2}]})
+        # Parked on an explicit ID: a new entry does not wake the
+        # read — it is not pending for this consumer — so the
+        # block waits out the whole timeout and answers empty,
+        # even though the entry landed mid-wait.
+        self.assertEqual(
+            raw.command("XACK", "stream:blk", "grp", "1-0", new_id),
+            2)
+        results = []
+
+        def _blocked_reread(out):
+            out.append(self._call("tools/call", 1, {
+                "name": "kv_xreadgroup",
+                "arguments": {"group": "grp", "consumer": "c1",
+                              "streams": {"stream:blk": "0"},
+                              "block": 300}}))
+
+        reader = threading.Thread(target=_blocked_reread, args=(results,))
+        start = time.time()
+        reader.start()
+        time.sleep(0.1)
+        raw.command("XADD", "stream:blk", "*", "v", "c")
+        reader.join(timeout=5)
+        self.assertFalse(reader.is_alive())
+        self.assertGreaterEqual(time.time() - start, 0.25)
+        self.assertEqual(len(results), 1)
+        self.assertNotIn("error", results[0])
+        self.assertEqual(
+            json.loads(results[0]["result"]["content"][0]["text"]),
+            [])
         # The tools queue in one MULTI/EXEC transaction.
         summary = self._tool("kv_batch", {"atomic": True, "ops": [
             {"op": "kv_xadd", "key": "stream:grptx", "id": "5-0",
@@ -23000,6 +23219,34 @@ class LiveCinderMigrationTests(unittest.TestCase):
             text.split("Safe (")[1].split("\n\n")[0],
         )
         self.assertIn("op 2: kv_xpending is a read, not a write", text)
+        # BLOCK does not change the audit verdict, but the wait is
+        # named in the line.
+        text = self._call("prompts/get", 99, {
+            "name": "write-safety",
+            "arguments": {"plan": json.dumps([
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"stream:grp": ">"},
+                 "block": 200},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"stream:grp": "0"},
+                 "block": 200},
+            ])},
+        })["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Plan: 2 op(s), 2 audited, 0 not audited.", text)
+        self.assertIn(
+            "op 0: kv_xreadgroup — delivers new entries to consumer "
+            "'c1' in group 'grp' on stream 'stream:grp', recording "
+            "them in the pending list until XACK; waits up to 200ms "
+            "for new entries, on a stream that never expires",
+            text.split("Caution (")[1].split("\n\n")[0],
+        )
+        self.assertIn(
+            "op 1: kv_xreadgroup — re-reads the pending entries of "
+            "consumer 'c1' in group 'grp' on stream 'stream:grp' "
+            "without changing delivery state; waits up to 200ms "
+            "for new entries",
+            text.split("Safe (")[1].split("\n\n")[0],
+        )
 
 
 if __name__ == "__main__":
