@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1675,6 +1675,124 @@ class FakeCinder(threading.Thread):
                 if withscores:
                     out += self._bulk(repr(first[member]))
             return out
+        elif name in ("ZUNIONSTORE", "ZINTERSTORE",
+                      "ZDIFFSTORE") and len(args) >= 3:
+            # ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE destination
+            # numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE
+            # SUM|MIN|MAX]: store the union / intersection /
+            # difference at the destination and answer the number
+            # of members stored, as in real cinder. ZDIFFSTORE
+            # takes no options — anything past the input keys is
+            # a syntax error — and the scores come from the first
+            # set; the union and intersection take WEIGHTS (one
+            # per input key, default 1) and AGGREGATE (SUM, MIN
+            # or MAX, default SUM) in any order, as in real
+            # cinder. The type of every input key is checked
+            # before any set is read, so a non-sorted-set key is
+            # WRONGTYPE and a failed store leaves the destination
+            # and its TTL untouched. A missing key counts as an
+            # empty set. The destination is overwritten whatever
+            # it held and its TTL is cleared; an empty result
+            # deletes it instead of leaving an empty set, and it
+            # may be one of the inputs, since the result is
+            # computed before it is touched. When the destination
+            # already holds exactly the result nothing is written,
+            # so its TTL is kept, like a no-op ZADD.
+            destination = args[0]
+            try:
+                numkeys = int(args[1])
+            except ValueError:
+                return ("-ERR at least 1 input key is needed for "
+                        "'%s' command\r\n" % name.lower())
+            if numkeys < 1 or len(args) < 2 + numkeys:
+                return ("-ERR wrong number of arguments for '%s' "
+                        "command\r\n" % name.lower())
+            keys = args[2:2 + numkeys]
+            weights = [1.0] * numkeys
+            aggregate = "SUM"
+            if name == "ZDIFFSTORE":
+                if len(args) > 2 + numkeys:
+                    return "-ERR syntax error\r\n"
+            else:
+                i = 2 + numkeys
+                while i < len(args):
+                    keyword = args[i].upper()
+                    if keyword == "WEIGHTS":
+                        if i + numkeys >= len(args):
+                            return "-ERR syntax error\r\n"
+                        try:
+                            weights = [float(w) for w in
+                                       args[i + 1:i + 1 + numkeys]]
+                        except ValueError:
+                            return ("-ERR value is not a valid float"
+                                    "\r\n")
+                        i += 1 + numkeys
+                    elif keyword == "AGGREGATE":
+                        if i + 1 >= len(args):
+                            return "-ERR syntax error\r\n"
+                        if args[i + 1].upper() not in (
+                                "SUM", "MIN", "MAX"):
+                            return "-ERR syntax error\r\n"
+                        aggregate = args[i + 1].upper()
+                        i += 2
+                    else:
+                        return "-ERR syntax error\r\n"
+            sets = []
+            for key in keys:
+                value = self._get(key)
+                if value is None:
+                    sets.append({})
+                elif not isinstance(value, ZSet):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                else:
+                    sets.append(value.members)
+            result = {}
+            if name == "ZUNIONSTORE":
+                for index, members in enumerate(sets):
+                    for member, score in members.items():
+                        value = weights[index] * score
+                        if member in result:
+                            if aggregate == "MIN":
+                                result[member] = min(
+                                    result[member], value)
+                            elif aggregate == "MAX":
+                                result[member] = max(
+                                    result[member], value)
+                            else:
+                                result[member] += value
+                        else:
+                            result[member] = value
+            elif name == "ZINTERSTORE":
+                common = set(sets[0])
+                for members in sets[1:]:
+                    common &= set(members)
+                for member in common:
+                    weighted = [sets[j][member] * weights[j]
+                                for j in range(numkeys)]
+                    if aggregate == "MIN":
+                        result[member] = min(weighted)
+                    elif aggregate == "MAX":
+                        result[member] = max(weighted)
+                    else:
+                        result[member] = sum(weighted)
+            else:
+                others = set()
+                for members in sets[1:]:
+                    others |= set(members)
+                for member, score in sets[0].items():
+                    if member not in others:
+                        result[member] = score
+            current = self._get(destination)
+            if isinstance(current, ZSet) \
+                    and current.members == result:
+                return ":%d\r\n" % len(result)
+            self.store.pop(destination, None)
+            if result:
+                stored = ZSet()
+                stored.members = dict(result)
+                self.store[destination] = (stored, None)
+            return ":%d\r\n" % len(result)
         elif name == "GEOADD" and len(args) >= 4:
             # GEOADD key [NX | XX | CH] longitude latitude member
             # [...]: the members are stored in a sorted set with
@@ -2958,7 +3076,8 @@ class McpTests(unittest.TestCase):
                     "kv_zincrby",
                     "kv_zpopmin", "kv_zpopmax",
                     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter",
-                    "kv_zdiff",
+                    "kv_zdiff", "kv_zunionstore", "kv_zinterstore",
+                    "kv_zdiffstore",
                     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
                     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
                     "kv_geosearch", "kv_geosearchstore", "kv_georadius",
@@ -5505,6 +5624,694 @@ class McpTests(unittest.TestCase):
         self.assertIn("at most 1000 members",
                       summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 1001)
+
+    def _zstore_result(self, name, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": name, "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, (name, arguments))
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _zrange_scored(self, key):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_zrange",
+            "arguments": {"key": key, "start": 0, "stop": -1,
+                          "withscores": True},
+        })
+        self.assertNotIn("error", reply, key)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _zttl(self, key):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_ttl", "arguments": {"key": key},
+        })
+        self.assertNotIn("error", reply, key)
+        return int(reply["result"]["content"][0]["text"])
+
+    def _zexists(self, key):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_exists", "arguments": {"key": key},
+        })
+        self.assertNotIn("error", reply, key)
+        return int(reply["result"]["content"][0]["text"])
+
+    def test_kv_zunionstore_stores_union_with_weights_and_aggregate(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "u1",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "u2",
+                          "members": {"b": 10, "d": 20}},
+        })
+        # A member in both sets is stored once, with the sum of
+        # its scores; the stored set reads back in score order.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "uout", "keys": ["u1", "u2"]}),
+            4)
+        self.assertEqual(
+            self._zrange_scored("uout"),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0},
+             {"member": "b", "score": 12.0},
+             {"member": "d", "score": 20.0}])
+        # WEIGHTS multiply each set's scores before combining;
+        # AGGREGATE picks how they combine.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "uw", "keys": ["u1", "u2"],
+                 "weights": [2, 3]}),
+            4)
+        self.assertEqual(
+            self._zrange_scored("uw"),
+            [{"member": "a", "score": 2.0},
+             {"member": "c", "score": 6.0},
+             {"member": "b", "score": 34.0},
+             {"member": "d", "score": 60.0}])
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "umin", "keys": ["u1", "u2"],
+                 "weights": [2, 3], "aggregate": "min"}),
+            4)
+        self.assertEqual(
+            self._zrange_scored("umin"),
+            [{"member": "a", "score": 2.0},
+             {"member": "b", "score": 4.0},
+             {"member": "c", "score": 6.0},
+             {"member": "d", "score": 60.0}])
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "umax", "keys": ["u1", "u2"],
+                 "weights": [2, 3], "aggregate": "MAX"}),
+            4)
+        self.assertEqual(
+            self._zrange_scored("umax"),
+            [{"member": "a", "score": 2.0},
+             {"member": "c", "score": 6.0},
+             {"member": "b", "score": 30.0},
+             {"member": "d", "score": 60.0}])
+        # A missing key counts as an empty set, and a union of
+        # only missing keys stores 0 and creates nothing.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "upart",
+                 "keys": ["u1", "ghost"]}),
+            3)
+        self.assertEqual(
+            self._zrange_scored("upart"),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "unone",
+                 "keys": ["ghost", "alsogone"]}),
+            0)
+        self.assertEqual(self._zexists("unone"), 0)
+        # An empty result deletes the destination instead of
+        # leaving an empty set.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "uold", "value": "v"},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "uold",
+                 "keys": ["ghost", "alsogone"]}),
+            0)
+        self.assertEqual(self._zexists("uold"), 0)
+        # The destination is overwritten whatever it held, and
+        # its TTL is cleared with it.
+        self._call("tools/call", 4, {
+            "name": "kv_set",
+            "arguments": {"key": "udest", "value": "v"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_expire",
+            "arguments": {"key": "udest", "seconds": 3600},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "udest", "keys": ["u1"]}),
+            3)
+        self.assertEqual(self._zttl("udest"), -1)
+        self.assertEqual(
+            self._zrange_scored("udest"),
+            [{"member": "a", "score": 1.0},
+             {"member": "b", "score": 2.0},
+             {"member": "c", "score": 3.0}])
+        # The destination may itself be an input key: the union
+        # is computed before it is touched.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "u1", "keys": ["u1", "u2"]}),
+            4)
+        self.assertEqual(
+            self._zrange_scored("u1"),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0},
+             {"member": "b", "score": 12.0},
+             {"member": "d", "score": 20.0}])
+        # Storing exactly what the destination already holds
+        # writes nothing, so its TTL is kept.
+        self._call("tools/call", 6, {
+            "name": "kv_zadd",
+            "arguments": {"key": "unoop",
+                          "members": {"a": 1, "b": 2}},
+        })
+        self._call("tools/call", 7, {
+            "name": "kv_expire",
+            "arguments": {"key": "unoop", "seconds": 3600},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zunionstore",
+                {"destination": "unoop", "keys": ["unoop"]}),
+            2)
+        self.assertGreater(self._zttl("unoop"), 0)
+
+    def test_kv_zunionstore_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"destination": "d"},
+                    {"keys": ["z"]},
+                    {"destination": 1, "keys": ["z"]},
+                    {"destination": "d", "keys": []},
+                    {"destination": "d", "keys": "z"},
+                    {"destination": "d", "keys": [1]},
+                    {"destination": "d", "keys": ["z", 2]},
+                    {"destination": "d", "keys": ["z"] * 1001},
+                    {"destination": "d", "keys": ["z", "z"],
+                     "weights": [1]},
+                    {"destination": "d", "keys": ["z", "z"],
+                     "weights": [1, 2, 3]},
+                    {"destination": "d", "keys": ["z"],
+                     "weights": "x"},
+                    {"destination": "d", "keys": ["z", "z"],
+                     "weights": [1, "x"]},
+                    {"destination": "d", "keys": ["z", "z"],
+                     "weights": [1, True]},
+                    {"destination": "d", "keys": ["z"],
+                     "weights": [float("nan")]},
+                    {"destination": "d", "keys": ["z"],
+                     "aggregate": "avg"},
+                    {"destination": "d", "keys": ["z"],
+                     "aggregate": 3}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zunionstore",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_zunionstore_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zunionstore",
+            "arguments": {"destination": "dst",
+                          "keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+        # A failed store leaves the destination and its TTL
+        # untouched.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "keep", "value": "v"},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_expire",
+            "arguments": {"key": "keep", "seconds": 3600},
+        })
+        reply = self._call("tools/call", 5, {
+            "name": "kv_zunionstore",
+            "arguments": {"destination": "keep",
+                          "keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertGreater(self._zttl("keep"), 0)
+        kept = self._call("tools/call", 6, {
+            "name": "kv_get", "arguments": {"key": "keep"},
+        })
+        self.assertEqual(kept["result"]["content"][0]["text"], "v")
+
+    def test_kv_zunionstore_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zunionstore", "destination": "dst",
+                 "keys": ["z", "ghost"]},
+                {"op": "kv_zcard", "key": "dst"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 5)
+        self.assertEqual(summary["results"][1]["result"], 5)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zunionstore", "destination": "dst2",
+                 "keys": ["z2", "z"], "weights": [2, 1]},
+                {"op": "kv_zcard", "key": "dst2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 3)
+        self.assertEqual(summary["results"][1]["result"], 8)
+        self.assertEqual(summary["results"][2]["result"], 8)
+        # Bad store arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zunionstore", "destination": "dst3",
+                 "keys": []},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        self.assertEqual(self._zexists("z3"), 0)
+        # An EXEC-time WRONGTYPE is recorded as that op's error,
+        # in place, and the rest still run.
+        self._call("tools/call", 4, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        exec_fail = self._call("tools/call", 5, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zunionstore", "destination": "dst4",
+                 "keys": ["z", "plain"]},
+                {"op": "kv_zcard", "key": "z"},
+            ]},
+        })
+        summary = json.loads(
+            exec_fail["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("WRONGTYPE", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 5)
+
+    def test_kv_zinterstore_stores_intersection_with_aggregated_scores(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "i1",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "i2",
+                          "members": {"b": 10, "d": 20}},
+        })
+        # Only b is in both sets, once, with the sum of its scores.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "iout", "keys": ["i1", "i2"]}),
+            1)
+        self.assertEqual(
+            self._zrange_scored("iout"),
+            [{"member": "b", "score": 12.0}])
+        # WEIGHTS and AGGREGATE combine the scores before storing.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "iw", "keys": ["i1", "i2"],
+                 "weights": [2, 3], "aggregate": "min"}),
+            1)
+        self.assertEqual(
+            self._zrange_scored("iw"),
+            [{"member": "b", "score": 4.0}])
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "iw2", "keys": ["i1", "i2"],
+                 "weights": [2, 3], "aggregate": "MAX"}),
+            1)
+        self.assertEqual(
+            self._zrange_scored("iw2"),
+            [{"member": "b", "score": 30.0}])
+        # A missing key counts as an empty set, so an intersection
+        # with one stores nothing — and an empty result deletes
+        # the destination instead of leaving an empty set.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "iold", "value": "v"},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "iold", "keys": ["i1", "ghost"]}),
+            0)
+        self.assertEqual(self._zexists("iold"), 0)
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "inone",
+                 "keys": ["ghost", "alsogone"]}),
+            0)
+        self.assertEqual(self._zexists("inone"), 0)
+        # The destination is overwritten whatever it held, and
+        # its TTL is cleared with it.
+        self._call("tools/call", 4, {
+            "name": "kv_set",
+            "arguments": {"key": "idest", "value": "v"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_expire",
+            "arguments": {"key": "idest", "seconds": 3600},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "idest", "keys": ["i1", "i1"]}),
+            3)
+        self.assertEqual(self._zttl("idest"), -1)
+        # The destination may itself be an input key, and storing
+        # exactly what it already holds keeps its TTL.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "i1", "keys": ["i1", "i2"]}),
+            1)
+        self.assertEqual(
+            self._zrange_scored("i1"),
+            [{"member": "b", "score": 12.0}])
+        self._call("tools/call", 6, {
+            "name": "kv_zadd",
+            "arguments": {"key": "inoop",
+                          "members": {"a": 1, "b": 2}},
+        })
+        self._call("tools/call", 7, {
+            "name": "kv_expire",
+            "arguments": {"key": "inoop", "seconds": 3600},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zinterstore",
+                {"destination": "inoop", "keys": ["inoop"]}),
+            2)
+        self.assertGreater(self._zttl("inoop"), 0)
+
+    def test_kv_zinterstore_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"destination": "d"},
+                    {"keys": ["z"]},
+                    {"destination": 1, "keys": ["z"]},
+                    {"destination": "d", "keys": []},
+                    {"destination": "d", "keys": "z"},
+                    {"destination": "d", "keys": [1]},
+                    {"destination": "d", "keys": ["z"] * 1001},
+                    {"destination": "d", "keys": ["z", "z"],
+                     "weights": [1]},
+                    {"destination": "d", "keys": ["z"],
+                     "weights": [float("nan")]},
+                    {"destination": "d", "keys": ["z"],
+                     "aggregate": "avg"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zinterstore",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_zinterstore_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zinterstore",
+            "arguments": {"destination": "dst",
+                          "keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+        # A failed store leaves the destination and its TTL
+        # untouched.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "keep", "value": "v"},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_expire",
+            "arguments": {"key": "keep", "seconds": 3600},
+        })
+        reply = self._call("tools/call", 5, {
+            "name": "kv_zinterstore",
+            "arguments": {"destination": "keep",
+                          "keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertGreater(self._zttl("keep"), 0)
+
+    def test_kv_zinterstore_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zinterstore", "destination": "dst",
+                 "keys": ["z", "z"], "weights": [1, 2]},
+                {"op": "kv_zcard", "key": "dst"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 5)
+        self.assertEqual(summary["results"][1]["result"], 5)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zinterstore", "destination": "dst2",
+                 "keys": ["z2", "z2"]},
+                {"op": "kv_zcard", "key": "dst2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][1]["result"], 3)
+        self.assertEqual(summary["results"][2]["result"], 3)
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zinterstore", "destination": "dst3",
+                 "keys": ["z3"], "weights": [1, 2]},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        self.assertEqual(self._zexists("z3"), 0)
+
+    def test_kv_zdiffstore_stores_difference_with_first_set_scores(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "d1",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "d2",
+                          "members": {"b": 10, "d": 20}},
+        })
+        # a and c are in no other set, once each, with the first
+        # set's scores.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "dout", "keys": ["d1", "d2"]}),
+            2)
+        self.assertEqual(
+            self._zrange_scored("dout"),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        # A missing key counts as an empty set: diffing against
+        # only missing keys stores the whole first set, and a
+        # missing first key stores nothing.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "dpart",
+                 "keys": ["d1", "ghost"]}),
+            3)
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "dnone",
+                 "keys": ["ghost", "d1"]}),
+            0)
+        self.assertEqual(self._zexists("dnone"), 0)
+        # An empty result deletes the destination instead of
+        # leaving an empty set.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "dold", "value": "v"},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "dold", "keys": ["d1", "d1"]}),
+            0)
+        self.assertEqual(self._zexists("dold"), 0)
+        # The destination is overwritten whatever it held, and
+        # its TTL is cleared with it.
+        self._call("tools/call", 4, {
+            "name": "kv_set",
+            "arguments": {"key": "ddest", "value": "v"},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_expire",
+            "arguments": {"key": "ddest", "seconds": 3600},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "ddest", "keys": ["d1"]}),
+            3)
+        self.assertEqual(self._zttl("ddest"), -1)
+        # The destination may itself be an input key, and storing
+        # exactly what it already holds keeps its TTL.
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "d1", "keys": ["d1", "d2"]}),
+            2)
+        self.assertEqual(
+            self._zrange_scored("d1"),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        self._call("tools/call", 6, {
+            "name": "kv_zadd",
+            "arguments": {"key": "dnoop",
+                          "members": {"a": 1, "b": 2}},
+        })
+        self._call("tools/call", 7, {
+            "name": "kv_expire",
+            "arguments": {"key": "dnoop", "seconds": 3600},
+        })
+        self.assertEqual(
+            self._zstore_result(
+                "kv_zdiffstore",
+                {"destination": "dnoop", "keys": ["dnoop"]}),
+            2)
+        self.assertGreater(self._zttl("dnoop"), 0)
+
+    def test_kv_zdiffstore_rejects_bad_arguments(self):
+        self._seed_zset("z", 2)
+        for bad in ({"destination": "d"},
+                    {"keys": ["z"]},
+                    {"destination": 1, "keys": ["z"]},
+                    {"destination": "d", "keys": []},
+                    {"destination": "d", "keys": "z"},
+                    {"destination": "d", "keys": [1]},
+                    {"destination": "d", "keys": ["z"] * 1001},
+                    {"destination": "d", "keys": ["z"],
+                     "weights": [1]},
+                    {"destination": "d", "keys": ["z"],
+                     "aggregate": "sum"}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_zdiffstore",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_zdiffstore_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self._seed_zset("z", 2)
+        reply = self._call("tools/call", 2, {
+            "name": "kv_zdiffstore",
+            "arguments": {"destination": "dst",
+                          "keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+        # A failed store leaves the destination and its TTL
+        # untouched.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "keep", "value": "v"},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_expire",
+            "arguments": {"key": "keep", "seconds": 3600},
+        })
+        reply = self._call("tools/call", 5, {
+            "name": "kv_zdiffstore",
+            "arguments": {"destination": "keep",
+                          "keys": ["z", "plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertGreater(self._zttl("keep"), 0)
+
+    def test_kv_zdiffstore_in_plain_and_atomic_batch(self):
+        self._seed_zset("z", 5)
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_zdiffstore", "destination": "dst",
+                 "keys": ["z", "ghost"]},
+                {"op": "kv_zcard", "key": "dst"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], 5)
+        self.assertEqual(summary["results"][1]["result"], 5)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z2",
+                 "members": {"a": 1.0, "b": 2.0, "c": 3.0}},
+                {"op": "kv_zdiffstore", "destination": "dst2",
+                 "keys": ["z2", "z"]},
+                {"op": "kv_zcard", "key": "dst2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][1]["result"], 3)
+        self.assertEqual(summary["results"][2]["result"], 3)
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_zadd", "key": "z3", "members": {"a": 1.0}},
+                {"op": "kv_zdiffstore", "destination": "dst3",
+                 "keys": ["z3"], "weights": [1]},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        self.assertEqual(self._zexists("z3"), 0)
 
     def _pfadd_result(self, arguments):
         reply = self._call("tools/call", 1, {
@@ -14294,6 +15101,254 @@ class McpTests(unittest.TestCase):
             safe,
         )
 
+    def test_prompts_get_write_safety_covers_zstore(self):
+        self._call("tools/call", 1, {
+            "name": "kv_zadd",
+            "arguments": {"key": "za",
+                          "members": {"a": 1, "b": 2, "c": 3}},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_zadd",
+            "arguments": {"key": "zb",
+                          "members": {"b": 10, "d": 20}},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_zadd",
+            "arguments": {"key": "dest", "members": {"x": 9}},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_zadd",
+            "arguments": {"key": "soon-dest", "members": {"x": 9}},
+        })
+        self._call("tools/call", 5, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-dest", "seconds": 3600},
+        })
+        self._call("tools/call", 6, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        self.fake.store["empty-dest"] = (ZSet(), None)
+        self._call("tools/call", 7, {
+            "name": "kv_zadd",
+            "arguments": {"key": "same",
+                          "members": {"a": 1, "c": 3}},
+        })
+        self._call("tools/call", 8, {
+            "name": "kv_zadd",
+            "arguments": {"key": "soon-same",
+                          "members": {"a": 1, "c": 3}},
+        })
+        self._call("tools/call", 9, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-same", "seconds": 3600},
+        })
+        self._call("tools/call", 10, {
+            "name": "kv_zadd",
+            "arguments": {"key": "sub", "members": {"a": 1}},
+        })
+        self._call("tools/call", 11, {
+            "name": "kv_zadd",
+            "arguments": {"key": "soon-sub", "members": {"a": 1}},
+        })
+        self._call("tools/call", 12, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-sub", "seconds": 3600},
+        })
+        plan = [
+            # A new destination: caution, no expiry.
+            {"op": "kv_zunionstore", "destination": "brand-new",
+             "keys": ["za", "zb"]},
+            {"op": "kv_zinterstore", "destination": "brand-new2",
+             "keys": ["za", "zb"], "weights": [2, 3],
+             "aggregate": "min"},
+            # The same, with WEIGHTS on the union: the audit
+            # combines the weighted union itself, since ZUNION
+            # takes no WEIGHTS.
+            {"op": "kv_zunionstore", "destination": "brand-new3",
+             "keys": ["za", "zb"], "weights": [2, 3],
+             "aggregate": "min"},
+            # Overwriting a destination that never expires and
+            # dropping a member: risky.
+            {"op": "kv_zunionstore", "destination": "dest",
+             "keys": ["za", "zb"]},
+            # Overwriting one that expires: caution, TTL cleared.
+            {"op": "kv_zunionstore", "destination": "soon-dest",
+             "keys": ["za", "zb"]},
+            # A string / list destination is overwritten whatever
+            # it held, not a WRONGTYPE.
+            {"op": "kv_zunionstore", "destination": "name",
+             "keys": ["za", "zb"]},
+            {"op": "kv_zunionstore", "destination": "todo",
+             "keys": ["za", "zb"]},
+            # An empty destination: safe, only additions.
+            {"op": "kv_zunionstore", "destination": "empty-dest",
+             "keys": ["za", "zb"]},
+            # Storing exactly what the destination already holds
+            # is a no-op, with or without an expiry.
+            {"op": "kv_zdiffstore", "destination": "same",
+             "keys": ["za", "zb"]},
+            {"op": "kv_zdiffstore", "destination": "soon-same",
+             "keys": ["za", "zb"]},
+            # A destination holding a subset of the result only
+            # gains members.
+            {"op": "kv_zdiffstore", "destination": "sub",
+             "keys": ["za", "zb"]},
+            {"op": "kv_zdiffstore", "destination": "soon-sub",
+             "keys": ["za", "zb"]},
+            # The destination may be an input key: storing the
+            # intersection back into za drops a and c.
+            {"op": "kv_zinterstore", "destination": "za",
+             "keys": ["za", "zb"]},
+            # Storing the union back into za only moves b's score.
+            {"op": "kv_zunionstore", "destination": "za",
+             "keys": ["za", "zb"]},
+            # An empty result stores nothing: an existing
+            # destination is deleted, a missing one stays missing.
+            {"op": "kv_zdiffstore", "destination": "dest",
+             "keys": ["za", "za"]},
+            {"op": "kv_zdiffstore", "destination": "brand-new",
+             "keys": ["za", "za"]},
+            # A non-sorted-set input fails the whole store.
+            {"op": "kv_zunionstore", "destination": "brand-new",
+             "keys": ["za", "name"]},
+            # Bad arguments are skipped, not audited.
+            {"op": "kv_zunionstore", "keys": ["za", "zb"]},
+            {"op": "kv_zunionstore", "destination": "a",
+             "keys": ["za", "zb"], "weights": [1]},
+            {"op": "kv_zinterstore", "destination": "a",
+             "keys": ["za"], "aggregate": "avg"},
+            {"op": "kv_zdiffstore", "destination": "a",
+             "keys": ["za", "zb"], "weights": [1, 1]},
+            {"op": "kv_zunionstore", "destination": "a", "keys": []},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 22 op(s), 17 audited, 5 not audited.", text)
+        self.assertIn(
+            "op 17: kv_zunionstore destination must be a string: None",
+            text)
+        self.assertIn(
+            "op 18: kv_zunionstore weights must have one weight per "
+            "key",
+            text)
+        self.assertIn(
+            "op 19: kv_zinterstore aggregate must be sum, min or max",
+            text)
+        self.assertIn(
+            "op 20: kv_zdiffstore takes no weights or aggregate: "
+            "cinder's ZDIFFSTORE has no options",
+            text)
+        self.assertIn(
+            "op 21: kv_zunionstore keys must be a non-empty list: []",
+            text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_zunionstore 'dest' — would discard 1 member(s) "
+            "from the destination, a sorted set of 1 elements that "
+            "never expires, replacing it with 4 member(s)",
+            risky,
+        )
+        self.assertIn(
+            "op 5: kv_zunionstore 'name' — would discard the "
+            "destination, a string of 5 bytes that never expires, "
+            "replacing it with a sorted set of 4 member(s)",
+            risky,
+        )
+        self.assertIn(
+            "op 6: kv_zunionstore 'todo' — would discard the "
+            "destination, a list of 2 elements that never expires, "
+            "replacing it with a sorted set of 4 member(s)",
+            risky,
+        )
+        self.assertIn(
+            "op 12: kv_zinterstore 'za' — would discard 2 member(s) "
+            "from the destination, a sorted set of 3 elements that "
+            "never expires, replacing it with 1 member(s) (the "
+            "destination is also an input key, so the result was "
+            "computed from the pre-store sets)",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_zdiffstore 'dest' — stores nothing and "
+            "deletes the destination, a zset of 1 elements that "
+            "never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 16: kv_zunionstore 'brand-new' — would fail with "
+            "WRONGTYPE: input 'name' is a string of 5 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_zunionstore 'brand-new' — creates a new "
+            "sorted set with no expiry holding 4 member(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 1: kv_zinterstore 'brand-new2' — creates a new "
+            "sorted set with no expiry holding 1 member(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 2: kv_zunionstore 'brand-new3' — creates a new "
+            "sorted set with no expiry holding 4 member(s)",
+            caution,
+        )
+        self.assertIn(
+            "op 4: kv_zunionstore 'soon-dest' — replaces the "
+            "destination, a sorted set of 1 elements that expires "
+            "in ",
+            caution,
+        )
+        self.assertIn(
+            "with 4 member(s), dropping 1 member(s); its expiry is "
+            "cleared too",
+            caution,
+        )
+        self.assertIn(
+            "op 11: kv_zdiffstore 'soon-sub' — only adds 1 "
+            "member(s) to the destination, but its expiry "
+            "(currently ",
+            caution,
+        )
+        self.assertIn(
+            "op 13: kv_zunionstore 'za' — changes the scores of 1 "
+            "member(s) in the destination, a sorted set of 3 "
+            "elements that never expires, storing 4 member(s) (the "
+            "destination is also an input key, so the result was "
+            "computed from the pre-store sets)",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 7: kv_zunionstore 'empty-dest' — only adds 4 "
+            "member(s) to the destination",
+            safe,
+        )
+        self.assertIn(
+            "op 8: kv_zdiffstore 'same' — no-op: the destination "
+            "already holds the same 2 member(s) with the same "
+            "scores",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_zdiffstore 'soon-same' — no-op: the "
+            "destination already holds the same 2 member(s) with "
+            "the same scores",
+            safe,
+        )
+        self.assertIn(
+            "op 10: kv_zdiffstore 'sub' — only adds 1 member(s) "
+            "to the destination",
+            safe,
+        )
+        self.assertIn(
+            "op 15: kv_zdiffstore 'brand-new' — no-op: the result "
+            "is empty and the destination is missing too",
+            safe,
+        )
+
     def _renewal_text(self, arguments=None, batch_size=None):
         return self._prompt_text("ttl-renewal", arguments, batch_size)
 
@@ -16236,8 +17291,9 @@ class LiveCinderMigrationTests(unittest.TestCase):
         self.assertEqual(
             len(self._tool("kv_zunion", {"keys": ["zu:edge"]})), 1000)
         # Cinder has no WEIGHTS, AGGREGATE, or STORE for ZUNION:
-        # ask it directly and confirm the syntax errors, so the
-        # tool's choice not to offer them stays grounded.
+        # ask it directly and confirm the syntax errors. (The
+        # STORE variants live in kv_zunionstore, covered by its
+        # own live test below.)
         from cinder_mcp.resp import RespError
         client = RespClient("127.0.0.1", self.PORT)
         for extra in (("WEIGHTS", 2), ("AGGREGATE", "MIN"),
@@ -16256,9 +17312,9 @@ class LiveCinderMigrationTests(unittest.TestCase):
         as an empty set, an empty intersection for only-missing
         keys, inf scores round-tripping, WRONGTYPE on a string
         key, the 1000-member cap, and cinder's ZINTERSTORE, which
-        stores the intersection instead of returning it and which
-        the tool does not offer, while the STORE keyword is still
-        a syntax error on ZINTER itself."""
+        stores the intersection instead of returning it — now
+        exposed as kv_zinterstore — while the STORE keyword is
+        still a syntax error on ZINTER itself."""
         self.assertEqual(
             self._tool("kv_zadd", {
                 "key": "zi:a",
@@ -16391,10 +17447,10 @@ class LiveCinderMigrationTests(unittest.TestCase):
             len(self._tool("kv_zinter", {"keys": ["zi:edge",
                                                   "zi:edge"]})), 1000)
         # Cinder does ship ZINTERSTORE (0.53.0): ask it directly
-        # and confirm what it does, so the tool's choice not to
-        # offer it stays grounded — it stores the intersection
+        # and confirm what it does — it stores the intersection
         # instead of returning it, and the STORE keyword is still
-        # a syntax error on ZINTER itself.
+        # a syntax error on ZINTER itself. kv_zinterstore is
+        # covered by its own live test below.
         from cinder_mcp.resp import RespError
         client = RespClient("127.0.0.1", self.PORT)
         self.assertEqual(
@@ -16419,7 +17475,7 @@ class LiveCinderMigrationTests(unittest.TestCase):
         tie order by member name, inf scores round-tripping,
         WRONGTYPE on a string key, the 1000-member cap, and
         cinder's ZDIFFSTORE, which stores the difference instead
-        of returning it and which the tool does not offer, while
+        of returning it — now exposed as kv_zdiffstore — while
         the STORE keyword is still a syntax error on ZDIFF
         itself."""
         self.assertEqual(
@@ -16542,10 +17598,10 @@ class LiveCinderMigrationTests(unittest.TestCase):
             len(self._tool("kv_zdiff", {"keys": ["zd:edge",
                                                  "zd:ghost"]})), 1000)
         # Cinder does ship ZDIFFSTORE (0.54.0): ask it directly
-        # and confirm what it does, so the tool's choice not to
-        # offer it stays grounded — it stores the difference
+        # and confirm what it does — it stores the difference
         # instead of returning it, and the STORE keyword is still
-        # a syntax error on ZDIFF itself.
+        # a syntax error on ZDIFF itself. kv_zdiffstore is covered
+        # by its own live test below.
         from cinder_mcp.resp import RespError
         client = RespClient("127.0.0.1", self.PORT)
         self.assertEqual(
@@ -16560,6 +17616,414 @@ class LiveCinderMigrationTests(unittest.TestCase):
             client.command("ZDIFF", 2, "zd:a", "zd:b",
                            "STORE", "zd:dest")
         self.assertIn("syntax error", str(caught.exception))
+
+    def test_live_zunionstore(self):
+        """kv_zunionstore against a real cinder: the union of
+        several sorted sets stored at a destination key, a member
+        in several sets stored once with the sum of its scores,
+        WEIGHTS multiplying each set's scores and AGGREGATE
+        SUM|MIN|MAX combining them, a missing key counting as an
+        empty set, an empty result deleting the destination, the
+        destination overwritten whatever it held with its TTL
+        cleared, the destination allowed to be an input key,
+        storing exactly what the destination already holds keeping
+        its TTL, WRONGTYPE on a string input leaving the
+        destination untouched, and bad arguments failing as
+        invalid params."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zs:a",
+                "members": {"a": 1, "b": 2, "c": 3}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zs:b",
+                "members": {"b": 10, "d": 20}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:out",
+                "keys": ["zs:a", "zs:b"]}),
+            4)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zs:out", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0},
+             {"member": "b", "score": 12.0},
+             {"member": "d", "score": 20.0}])
+        # WEIGHTS and AGGREGATE combine the scores before storing.
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:min",
+                "keys": ["zs:a", "zs:b"],
+                "weights": [2, 3], "aggregate": "min"}),
+            4)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zs:min", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "a", "score": 2.0},
+             {"member": "b", "score": 4.0},
+             {"member": "c", "score": 6.0},
+             {"member": "d", "score": 60.0}])
+        # A missing key counts as an empty set, and a union of
+        # only missing keys stores 0 and creates nothing.
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:part",
+                "keys": ["zs:a", "zs:ghost"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:none",
+                "keys": ["zs:ghost", "zs:alsogone"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zs:none"}), 0)
+        # An empty result deletes the destination, and a store
+        # overwrites whatever the destination held, clearing its
+        # TTL with it.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zs:old", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:old",
+                "keys": ["zs:ghost", "zs:alsogone"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zs:old"}), 0)
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zs:str", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zs:str",
+                                     "seconds": 3600}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:str", "keys": ["zs:a"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_ttl", {"key": "zs:str"}), -1)
+        # The destination may itself be an input key.
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:a", "keys": ["zs:a", "zs:b"]}),
+            4)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zs:a", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0},
+             {"member": "b", "score": 12.0},
+             {"member": "d", "score": 20.0}])
+        # Storing exactly what the destination already holds
+        # writes nothing, so its TTL is kept.
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zs:noop", "members": {"a": 1, "b": 2}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zs:noop",
+                                     "seconds": 3600}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zunionstore", {
+                "destination": "zs:noop", "keys": ["zs:noop"]}),
+            2)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "zs:noop"}), 0)
+        # WRONGTYPE on a string input, and a failed store leaves
+        # the destination and its TTL untouched; bad arguments
+        # fail as invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zs:plain", "value": "v"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zunionstore",
+            "arguments": {"destination": "zs:dst",
+                          "keys": ["zs:a", "zs:plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zs:keep", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zs:keep",
+                                     "seconds": 3600}),
+            1)
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zunionstore",
+            "arguments": {"destination": "zs:keep",
+                          "keys": ["zs:a", "zs:plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "zs:keep"}), 0)
+        self.assertEqual(
+            self._tool("kv_get", {"key": "zs:keep"}), "v")
+        for arguments in ({"destination": "zs:d"},
+                          {"keys": ["zs:a"]},
+                          {"destination": "zs:d", "keys": [],
+                           },
+                          {"destination": "zs:d", "keys": ["zs:a"],
+                           "weights": [1, 2]},
+                          {"destination": "zs:d", "keys": ["zs:a"],
+                           "aggregate": "avg"}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zunionstore", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602,
+                             arguments)
+
+    def test_live_zinterstore(self):
+        """kv_zinterstore against a real cinder: the intersection
+        of several sorted sets stored at a destination key, a
+        member stored once only when it is in every set, with
+        WEIGHTS multiplying each set's scores and AGGREGATE
+        SUM|MIN|MAX combining them, a missing key counting as an
+        empty set so an intersection with one stores nothing, an
+        empty result deleting the destination, the destination
+        overwritten whatever it held with its TTL cleared, the
+        destination allowed to be an input key, storing exactly
+        what the destination already holds keeping its TTL, and
+        WRONGTYPE on a string input."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zis:a",
+                "members": {"a": 1, "b": 2, "c": 3}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zis:b",
+                "members": {"b": 10, "d": 20}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:out",
+                "keys": ["zis:a", "zis:b"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zis:out", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "b", "score": 12.0}])
+        # WEIGHTS and AGGREGATE combine the scores before storing.
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:min",
+                "keys": ["zis:a", "zis:b"],
+                "weights": [2, 3], "aggregate": "min"}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zis:min", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "b", "score": 4.0}])
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:max",
+                "keys": ["zis:a", "zis:b"],
+                "weights": [2, 3], "aggregate": "MAX"}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zis:max", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "b", "score": 30.0}])
+        # A missing key counts as an empty set, so an intersection
+        # with one stores nothing — and an empty result deletes
+        # the destination.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zis:old", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:old",
+                "keys": ["zis:a", "zis:ghost"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zis:old"}), 0)
+        # The destination is overwritten whatever it held, and
+        # its TTL is cleared with it.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zis:str", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zis:str",
+                                     "seconds": 3600}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:str",
+                "keys": ["zis:a", "zis:a"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_ttl", {"key": "zis:str"}), -1)
+        # The destination may itself be an input key, and storing
+        # exactly what it already holds keeps its TTL.
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:a",
+                "keys": ["zis:a", "zis:b"]}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zis:a", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "b", "score": 12.0}])
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zis:noop", "members": {"a": 1, "b": 2}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zis:noop",
+                                     "seconds": 3600}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zinterstore", {
+                "destination": "zis:noop", "keys": ["zis:noop"]}),
+            2)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "zis:noop"}), 0)
+        # WRONGTYPE on a string input.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zis:plain", "value": "v"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zinterstore",
+            "arguments": {"destination": "zis:dst",
+                          "keys": ["zis:a", "zis:plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+
+    def test_live_zdiffstore(self):
+        """kv_zdiffstore against a real cinder: the difference of
+        several sorted sets stored at a destination key, the
+        members of the first set that are in none of the other
+        sets stored once each with the first set's scores, a
+        missing key counting as an empty set, an empty result
+        deleting the destination, the destination overwritten
+        whatever it held with its TTL cleared, the destination
+        allowed to be an input key, storing exactly what the
+        destination already holds keeping its TTL, WEIGHTS and
+        AGGREGATE rejected as invalid params, and WRONGTYPE on a
+        string input."""
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zds:a",
+                "members": {"a": 1, "b": 2, "c": 3}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zds:b",
+                "members": {"b": 10, "d": 20}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:out",
+                "keys": ["zds:a", "zds:b"]}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zds:out", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        # A missing key counts as an empty set: diffing against
+        # only missing keys stores the whole first set, and a
+        # missing first key stores nothing.
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:part",
+                "keys": ["zds:a", "zds:ghost"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:none",
+                "keys": ["zds:ghost", "zds:a"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zds:none"}), 0)
+        # An empty result deletes the destination, and a store
+        # overwrites whatever the destination held, clearing its
+        # TTL with it.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zds:old", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:old",
+                "keys": ["zds:a", "zds:a"]}),
+            0)
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "zds:old"}), 0)
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zds:str", "value": "v"}),
+            "OK")
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zds:str",
+                                     "seconds": 3600}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:str", "keys": ["zds:a"]}),
+            3)
+        self.assertEqual(
+            self._tool("kv_ttl", {"key": "zds:str"}), -1)
+        # The destination may itself be an input key, and storing
+        # exactly what it already holds keeps its TTL.
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:a", "keys": ["zds:a", "zds:b"]}),
+            2)
+        self.assertEqual(
+            self._tool("kv_zrange", {
+                "key": "zds:a", "start": 0, "stop": -1,
+                "withscores": True}),
+            [{"member": "a", "score": 1.0},
+             {"member": "c", "score": 3.0}])
+        self.assertEqual(
+            self._tool("kv_zadd", {
+                "key": "zds:noop", "members": {"a": 1, "b": 2}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "zds:noop",
+                                     "seconds": 3600}),
+            1)
+        self.assertEqual(
+            self._tool("kv_zdiffstore", {
+                "destination": "zds:noop", "keys": ["zds:noop"]}),
+            2)
+        self.assertGreater(
+            self._tool("kv_ttl", {"key": "zds:noop"}), 0)
+        # WEIGHTS and AGGREGATE are rejected before anything is
+        # sent, and WRONGTYPE on a string input.
+        for arguments in ({"destination": "zds:d",
+                           "keys": ["zds:a"], "weights": [1]},
+                          {"destination": "zds:d",
+                           "keys": ["zds:a"], "aggregate": "sum"}):
+            reply = self._call("tools/call", 99, {
+                "name": "kv_zdiffstore", "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602,
+                             arguments)
+        self.assertEqual(
+            self._tool("kv_set", {"key": "zds:plain", "value": "v"}),
+            "OK")
+        reply = self._call("tools/call", 99, {
+            "name": "kv_zdiffstore",
+            "arguments": {"destination": "zds:dst",
+                          "keys": ["zds:a", "zds:plain"]},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
 
     def test_live_pfadd_pfcount(self):
         """kv_pfadd / kv_pfcount against a real cinder: PFADD

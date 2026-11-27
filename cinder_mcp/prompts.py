@@ -138,6 +138,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
+    "kv_zunionstore", "kv_zinterstore", "kv_zdiffstore",
     "kv_pfadd", "kv_pfmerge",
     "kv_geoadd",
     "kv_georadius", "kv_georadiusbymember", "kv_geosearchstore",
@@ -1949,6 +1950,325 @@ def _audit_pfmerge(client, op):
     )
 
 
+def _zstore_audit_args(op, name):
+    """The (destination, keys, weights, aggregate) for a
+    kv_zunionstore / kv_zinterstore / kv_zdiffstore op in a write
+    plan, validated like the tool's own arguments: the
+    destination a string and the keys a non-empty list of
+    strings, at most 1000; weights, when given, a list of numbers,
+    one per key, with no NaN; aggregate, when given, "sum", "min"
+    or "max" in any case, returned lowercased. kv_zdiffstore takes
+    neither option, so passing either raises ValueError here
+    instead of being silently ignored. Anything else raises
+    ValueError, so the caller reports the op as not audited
+    instead of guessing."""
+    destination = op.get("destination")
+    if not isinstance(destination, str):
+        raise ValueError(
+            "%s destination must be a string: %r"
+            % (name, destination)
+        )
+    keys = op.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError(
+            "%s keys must be a non-empty list: %r" % (name, keys)
+        )
+    if len(keys) > 1000:
+        raise ValueError(
+            "%s reads at most 1000 keys; narrow the list" % name
+        )
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError(
+                "%s keys must be strings: %r" % (name, keys)
+            )
+    weights = op.get("weights")
+    if weights is not None:
+        if not isinstance(weights, list):
+            raise ValueError(
+                "%s weights must be a list: %r" % (name, weights)
+            )
+        if len(weights) != len(keys):
+            raise ValueError(
+                "%s weights must have one weight per key" % name
+            )
+        for weight in weights:
+            if isinstance(weight, bool) or not isinstance(
+                    weight, (int, float)):
+                raise ValueError(
+                    "%s weights must be numbers: %r"
+                    % (name, weights)
+                )
+            if isinstance(weight, float) and weight != weight:
+                raise ValueError(
+                    "%s weights must not be NaN" % name
+                )
+    aggregate = op.get("aggregate")
+    if aggregate is not None:
+        if not isinstance(aggregate, str):
+            raise ValueError(
+                "%s aggregate must be a string: %r"
+                % (name, aggregate)
+            )
+        if aggregate.lower() not in ("sum", "min", "max"):
+            raise ValueError(
+                "%s aggregate must be sum, min or max" % name
+            )
+        aggregate = aggregate.lower()
+    if name == "kv_zdiffstore" and (weights is not None
+                                    or aggregate is not None):
+        raise ValueError(
+            "%s takes no weights or aggregate: cinder's ZDIFFSTORE "
+            "has no options" % name
+        )
+    return destination, keys, weights, aggregate
+
+
+def _zstore_members(client, key):
+    """The {member: score} of one sorted set, read live with
+    ZRANGE WITHSCORES, for comparing a store's destination
+    against the result it would hold."""
+    flat = client.command("ZRANGE", key, 0, -1, "WITHSCORES") or []
+    return {member: float(score)
+            for member, score in zip(flat[0::2], flat[1::2])}
+
+
+def _zstore_expected(client, name, keys, weights, aggregate):
+    """The {member: score} a store would write, probed live with
+    the matching read command (ZUNION / ZINTER / ZDIFF
+    WITHSCORES, with the store's weights and aggregate where the
+    read command takes them). ZUNION takes no WEIGHTS or
+    AGGREGATE, so a weighted union is combined here in Python
+    from each input's ZRANGE WITHSCORES instead, in the same
+    order cinder combines them — keys in order, members in score
+    order within a key — so the sums match exactly. Raises
+    RespError when the probe fails, so the caller reports the op
+    as would-fail rather than guessing."""
+    if name == "kv_zunionstore" and (weights is not None
+                                     or aggregate is not None):
+        totals = {}
+        for index, key in enumerate(keys):
+            weight = weights[index] if weights is not None else 1.0
+            for member, score in _zstore_members(client, key).items():
+                value = weight * score
+                if member in totals:
+                    if aggregate == "min":
+                        totals[member] = min(totals[member], value)
+                    elif aggregate == "max":
+                        totals[member] = max(totals[member], value)
+                    else:
+                        totals[member] += value
+                else:
+                    totals[member] = value
+        return totals
+    command = {"kv_zunionstore": "ZUNION",
+               "kv_zinterstore": "ZINTER",
+               "kv_zdiffstore": "ZDIFF"}[name]
+    argv = [command, len(keys)] + list(keys)
+    if weights is not None:
+        argv.append("WEIGHTS")
+        argv += [repr(weight) for weight in weights]
+    if aggregate is not None:
+        argv += ["AGGREGATE", aggregate.upper()]
+    argv.append("WITHSCORES")
+    flat = client.command(*argv) or []
+    return {member: float(score)
+            for member, score in zip(flat[0::2], flat[1::2])}
+
+
+def _audit_zstore_empty(client, name, destination):
+    """The verdicts when a store would store nothing — the result
+    is empty, so the destination is deleted when it exists and
+    nothing is written otherwise."""
+    if client.command("EXISTS", destination) == 0:
+        return "safe", (
+            "%s %r — no-op: the result is empty and the "
+            "destination is missing too" % (name, destination)
+        )
+    dest_ttl = client.command("TTL", destination)
+    if dest_ttl == -2:
+        return "safe", (
+            "%s %r — no-op: the result is empty and the "
+            "destination expired while auditing"
+            % (name, destination)
+        )
+    try:
+        kind, _sv, size, _sample = _inspect_key(
+            client, destination)
+    except ValueError:
+        return "safe", (
+            "%s %r — no-op: the result is empty and the "
+            "destination expired while auditing"
+            % (name, destination)
+        )
+    if dest_ttl == -1:
+        return "risky", (
+            "%s %r — stores nothing and deletes the destination, "
+            "a %s of %s that never expires"
+            % (name, destination, kind, size)
+        )
+    return "caution", (
+        "%s %r — stores nothing and deletes the destination, a "
+        "%s of %s that %s"
+        % (name, destination, kind, size,
+           "expires in %s" % _format_ttl(dest_ttl))
+    )
+
+
+def _audit_zstore(client, op):
+    """Audit one kv_zunionstore / kv_zinterstore / kv_zdiffstore
+    op: the inputs and the destination are probed live, because
+    the store reads the inputs, overwrites the destination
+    wholesale and clears its TTL — or creates it when it does
+    not exist, or deletes it when the result is empty. Cinder
+    checks every input key's type before any set is read, and a
+    failed store leaves the destination and its TTL untouched, so
+    the audit follows that order; a missing input counts as an
+    empty set. The expected result is probed with the matching
+    read command, so a store that would write exactly what the
+    destination already holds is a safe no-op — cinder writes
+    nothing then and keeps the TTL — and a store that only adds
+    members to it loses nothing but the TTL. The destination may
+    itself be an input key, in which case the result was computed
+    from the pre-store sets and the members it leaves out are
+    dropped. Returns (verdict, line)."""
+    name = op.get("op")
+    destination, keys, weights, aggregate = _zstore_audit_args(
+        op, name)
+    for key in keys:
+        if client.command("EXISTS", key) == 0:
+            continue
+        try:
+            kind, _sv, size, _sample = _inspect_key(client, key)
+        except ValueError:
+            # The input expired while auditing; it counts as
+            # missing now.
+            continue
+        if kind != "zset":
+            return "risky", (
+                "%s %r — would fail with WRONGTYPE: input %r is "
+                "a %s of %s"
+                % (name, destination, key, kind, size)
+            )
+    try:
+        expected = _zstore_expected(
+            client, name, keys, weights, aggregate)
+    except RespError as exc:
+        return "risky", (
+            "%s %r — would fail: %s" % (name, destination, exc))
+    if not expected:
+        return _audit_zstore_empty(client, name, destination)
+    if client.command("EXISTS", destination) == 0:
+        return "caution", (
+            "%s %r — creates a new sorted set with no expiry "
+            "holding %d member(s)"
+            % (name, destination, len(expected))
+        )
+    dest_ttl = client.command("TTL", destination)
+    if dest_ttl == -2:
+        return "caution", (
+            "%s %r — creates a new sorted set with no expiry "
+            "holding %d member(s)"
+            % (name, destination, len(expected))
+        )
+    try:
+        dkind, _dsv, dsize, _ds = _inspect_key(client, destination)
+    except ValueError:
+        return "caution", (
+            "%s %r — creates a new sorted set with no expiry "
+            "holding %d member(s)"
+            % (name, destination, len(expected))
+        )
+    if dkind == "zset":
+        current = _zstore_members(client, destination)
+        if current == expected:
+            # Cinder writes nothing when the destination already
+            # holds exactly the result, so its TTL is kept.
+            return "safe", (
+                "%s %r — no-op: the destination already holds the "
+                "same %d member(s) with the same scores"
+                % (name, destination, len(expected))
+            )
+        if set(current) <= set(expected) and all(
+                current[member] == expected[member]
+                for member in current):
+            # Only additions: nothing is lost, only the TTL is
+            # cleared by the rewrite.
+            added = len(expected) - len(current)
+            if dest_ttl == -1:
+                return "safe", (
+                    "%s %r — only adds %d member(s) to the "
+                    "destination" % (name, destination, added)
+                )
+            return "caution", (
+                "%s %r — only adds %d member(s) to the "
+                "destination, but its expiry (currently %s) is "
+                "cleared"
+                % (name, destination, added,
+                   _format_ttl(dest_ttl))
+            )
+        lost = [member for member in current
+                if member not in expected]
+        changed = [member for member in current
+                   if member in expected
+                   and current[member] != expected[member]]
+        self_text = ""
+        if destination in keys:
+            self_text = (" (the destination is also an input key, "
+                         "so the result was computed from the "
+                         "pre-store sets)")
+        if lost:
+            if dest_ttl == -1:
+                return "risky", (
+                    "%s %r — would discard %d member(s) from the "
+                    "destination, a sorted set of %s that never "
+                    "expires, replacing it with %d member(s)%s"
+                    % (name, destination, len(lost), dsize,
+                       len(expected), self_text)
+                )
+            return "caution", (
+                "%s %r — replaces the destination, a sorted set "
+                "of %s that %s, with %d member(s), dropping %d "
+                "member(s)%s; its expiry is cleared too"
+                % (name, destination, dsize,
+                   "expires in %s" % _format_ttl(dest_ttl),
+                   len(expected), len(lost), self_text)
+            )
+        # No member is lost: only scores change (and members are
+        # added), so the damage is bounded either way.
+        if dest_ttl == -1:
+            return "caution", (
+                "%s %r — changes the scores of %d member(s) in "
+                "the destination, a sorted set of %s that never "
+                "expires, storing %d member(s)%s"
+                % (name, destination, len(changed), dsize,
+                   len(expected), self_text)
+            )
+        return "caution", (
+            "%s %r — changes the scores of %d member(s) in the "
+            "destination, a sorted set of %s that %s, storing %d "
+            "member(s)%s; its expiry is cleared too"
+            % (name, destination, len(changed), dsize,
+               "expires in %s" % _format_ttl(dest_ttl),
+               len(expected), self_text)
+        )
+    if dest_ttl == -1:
+        return "risky", (
+            "%s %r — would discard the destination, a %s of %s "
+            "that never expires, replacing it with a sorted set "
+            "of %d member(s)"
+            % (name, destination, dkind, dsize, len(expected))
+        )
+    return "caution", (
+        "%s %r — replaces the destination, a %s of %s that %s, "
+        "with a sorted set of %d member(s); its expiry is "
+        "cleared too"
+        % (name, destination, dkind, dsize,
+           "expires in %s" % _format_ttl(dest_ttl),
+           len(expected))
+    )
+
+
 def _geo_audit_coordinate(value, axis, tool):
     """One GEORADIUS centre coordinate in a write plan: a finite
     number in the GEOADD range, not a boolean."""
@@ -2672,7 +2992,10 @@ def _audit_write_op(client, op):
     audited by _audit_lmove instead. kv_bitop writes a destination
     from several sources, so it is audited by _audit_bitop
     instead. kv_pfmerge writes a destination from several sources,
-    so it is audited by _audit_pfmerge instead."""
+    so it is audited by _audit_pfmerge instead. kv_zunionstore,
+    kv_zinterstore and kv_zdiffstore write a destination from
+    several sources, so they are audited by _audit_zstore instead.
+    """
     name = op.get("op")
     if name not in WRITE_SAFETY_WRITE_OPS:
         raise ValueError("not a write op: %s" % name)
@@ -2700,6 +3023,10 @@ def _audit_write_op(client, op):
         # GEOSEARCHSTORE always stores its hits at a destination,
         # so it is audited on its own too.
         return _audit_geosearchstore(client, op)
+    if name in ("kv_zunionstore", "kv_zinterstore", "kv_zdiffstore"):
+        # A sorted-set store writes a destination from several
+        # sources, so it is audited on its own.
+        return _audit_zstore(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

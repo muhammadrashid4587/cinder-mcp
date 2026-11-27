@@ -781,7 +781,7 @@ TOOLS = [
     },
     {
         "name": "kv_zunion",
-        "description": "The union of several sorted sets: ZUNION numkeys key [key ...] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. A member in several sets appears once, with the sum of its scores, lowest score first, member name breaking ties. A missing key counts as an empty set. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The union holds at most 1000 members; a wider union fails instead of returning a truncated list. Cinder has no WEIGHTS, AGGREGATE, or STORE variants, so the tool does not offer them.",
+        "description": "The union of several sorted sets: ZUNION numkeys key [key ...] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. A member in several sets appears once, with the sum of its scores, lowest score first, member name breaking ties. A missing key counts as an empty set. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The union holds at most 1000 members; a wider union fails instead of returning a truncated list. Cinder has no WEIGHTS or AGGREGATE variants for ZUNION itself; `kv_zunionstore` stores the union at a destination key instead of returning it, and does take WEIGHTS and AGGREGATE.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -793,7 +793,7 @@ TOOLS = [
     },
     {
         "name": "kv_zinter",
-        "description": "The intersection of several sorted sets: ZINTER numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. A member must be in every set to appear, once, lowest score first, member name breaking ties. Pass `weights` as a list of numbers, one per key, to multiply each set's scores before aggregating (defaults to 1 per key); pass `aggregate` as \"sum\", \"min\" or \"max\" to combine a member's weighted scores (defaults to \"sum\"). A missing key counts as an empty set, so an intersection with one is empty. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The intersection holds at most 1000 members; a wider intersection fails instead of returning a truncated list. Cinder's `ZINTERSTORE` stores the intersection instead of returning it; like `kv_zunion` with `ZUNIONSTORE`, this tool does not offer it — it returns the intersection.",
+        "description": "The intersection of several sorted sets: ZINTER numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. A member must be in every set to appear, once, lowest score first, member name breaking ties. Pass `weights` as a list of numbers, one per key, to multiply each set's scores before aggregating (defaults to 1 per key); pass `aggregate` as \"sum\", \"min\" or \"max\" to combine a member's weighted scores (defaults to \"sum\"). A missing key counts as an empty set, so an intersection with one is empty. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The intersection holds at most 1000 members; a wider intersection fails instead of returning a truncated list. Use `kv_zinterstore` to store the intersection at a destination key instead of returning it.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -807,7 +807,7 @@ TOOLS = [
     },
     {
         "name": "kv_zdiff",
-        "description": "The difference of several sorted sets: ZDIFF numkeys key [key ...] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. The members of the first set that are in none of the other sets, once each, in the first set's score order, member name breaking ties, with the first set's scores. A missing key counts as an empty set, so a difference against only missing keys is the whole first set, and a missing first key diffs to nothing. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The difference holds at most 1000 members; a wider difference fails instead of returning a truncated list. Cinder's `ZDIFFSTORE` stores the difference instead of returning it; like `kv_zunion` with `ZUNIONSTORE`, this tool does not offer it — it returns the difference.",
+        "description": "The difference of several sorted sets: ZDIFF numkeys key [key ...] [WITHSCORES]. Takes `keys` as a list of key names, at most 1000. The members of the first set that are in none of the other sets, once each, in the first set's score order, member name breaking ties, with the first set's scores. A missing key counts as an empty set, so a difference against only missing keys is the whole first set, and a missing first key diffs to nothing. Pass `withscores: true` for a list of {\"member\": ..., \"score\": ...} objects instead of plain member names. The difference holds at most 1000 members; a wider difference fails instead of returning a truncated list. Use `kv_zdiffstore` to store the difference at a destination key instead of returning it.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -815,6 +815,46 @@ TOOLS = [
                 "withscores": {"type": "boolean"},
             },
             "required": ["keys"],
+        },
+    },
+    {
+        "name": "kv_zunionstore",
+        "description": "Store the union of several sorted sets at a destination key: ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]. Takes `destination` and `keys` as a list of key names, at most 1000, and returns the number of members stored. A member in several sets is stored once, with the sum of its scores by default; pass `weights` as a list of numbers, one per key, to multiply each set's scores before combining them (defaults to 1 per key), and `aggregate` as \"sum\", \"min\" or \"max\" to combine a member's weighted scores (defaults to \"sum\"). A missing key counts as an empty set. The destination is overwritten whatever it held — any type — and its TTL is cleared; an empty result deletes the destination instead of leaving an empty set, and the destination may itself be one of the input keys, since the union is computed before it is touched. When the destination already holds exactly the result, nothing is written and its TTL is kept. Fails with WRONGTYPE on an input key holding anything but a sorted set, and a failed store leaves the destination and its TTL untouched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "destination": {"type": "string"},
+                "keys": {"type": "array", "items": {"type": "string"}},
+                "weights": {"type": "array", "items": {"type": "number"}},
+                "aggregate": {"type": "string"},
+            },
+            "required": ["destination", "keys"],
+        },
+    },
+    {
+        "name": "kv_zinterstore",
+        "description": "Store the intersection of several sorted sets at a destination key: ZINTERSTORE destination numkeys key [key ...] [WEIGHTS weight ...] [AGGREGATE SUM|MIN|MAX]. Takes `destination` and `keys` as a list of key names, at most 1000, and returns the number of members stored. A member must be in every set to be stored, once, with its weighted scores combined by the aggregate; pass `weights` as a list of numbers, one per key, to multiply each set's scores before aggregating (defaults to 1 per key), and `aggregate` as \"sum\", \"min\" or \"max\" (defaults to \"sum\"). A missing key counts as an empty set, so an intersection with one stores nothing. The destination is overwritten whatever it held — any type — and its TTL is cleared; an empty result deletes the destination instead of leaving an empty set, and the destination may itself be one of the input keys, since the intersection is computed before it is touched. When the destination already holds exactly the result, nothing is written and its TTL is kept. Fails with WRONGTYPE on an input key holding anything but a sorted set, and a failed store leaves the destination and its TTL untouched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "destination": {"type": "string"},
+                "keys": {"type": "array", "items": {"type": "string"}},
+                "weights": {"type": "array", "items": {"type": "number"}},
+                "aggregate": {"type": "string"},
+            },
+            "required": ["destination", "keys"],
+        },
+    },
+    {
+        "name": "kv_zdiffstore",
+        "description": "Store the difference of several sorted sets at a destination key: ZDIFFSTORE destination numkeys key [key ...]. Takes `destination` and `keys` as a list of key names, at most 1000, and returns the number of members stored. The members of the first set that are in none of the other sets are stored, once each, with the first set's scores. A missing key counts as an empty set, so a difference against only missing keys stores the whole first set, and a missing first key stores nothing. There are no WEIGHTS or AGGREGATE options — the scores come from the first set, as in Redis — so the tool does not offer them. The destination is overwritten whatever it held — any type — and its TTL is cleared; an empty result deletes the destination instead of leaving an empty set, and the destination may itself be one of the input keys, since the difference is computed before it is touched. When the destination already holds exactly the result, nothing is written and its TTL is kept. Fails with WRONGTYPE on an input key holding anything but a sorted set, and a failed store leaves the destination and its TTL untouched.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "destination": {"type": "string"},
+                "keys": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["destination", "keys"],
         },
     },
     {
@@ -1262,7 +1302,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1398,6 +1438,7 @@ BATCHABLE_TOOLS = {
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
+    "kv_zunionstore", "kv_zinterstore", "kv_zdiffstore",
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
     "kv_geosearch", "kv_geosearchstore", "kv_georadius",
@@ -1490,6 +1531,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zincrby",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
+    "kv_zunionstore", "kv_zinterstore", "kv_zdiffstore",
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
     "kv_geosearch", "kv_geosearchstore", "kv_georadius",
@@ -2187,6 +2229,30 @@ def _op_argv(name, args):
         if withscores:
             cmd.append("WITHSCORES")
         return cmd
+    if name == "kv_zunionstore":
+        destination, keys, weights, aggregate = _zstore_args(
+            args, name, True)
+        cmd = ["ZUNIONSTORE", destination, len(keys)] + list(keys)
+        if weights is not None:
+            cmd.append("WEIGHTS")
+            cmd += [repr(weight) for weight in weights]
+        if aggregate is not None:
+            cmd += ["AGGREGATE", aggregate.upper()]
+        return cmd
+    if name == "kv_zinterstore":
+        destination, keys, weights, aggregate = _zstore_args(
+            args, name, True)
+        cmd = ["ZINTERSTORE", destination, len(keys)] + list(keys)
+        if weights is not None:
+            cmd.append("WEIGHTS")
+            cmd += [repr(weight) for weight in weights]
+        if aggregate is not None:
+            cmd += ["AGGREGATE", aggregate.upper()]
+        return cmd
+    if name == "kv_zdiffstore":
+        destination, keys, _weights, _aggregate = _zstore_args(
+            args, name, False)
+        return ["ZDIFFSTORE", destination, len(keys)] + list(keys)
     if name == "kv_pfadd":
         key, elements = _pfadd_args(args)
         return ["PFADD", key] + list(elements)
@@ -3411,6 +3477,107 @@ def _call_zdiff(client, args):
     )
 
 
+# The most keys one kv_zunionstore / kv_zinterstore / kv_zdiffstore
+# call reads; a wider call fails instead of sending a half-formed
+# STORE command with a huge argv.
+MAX_ZSTORE_KEYS = 1000
+
+
+def _zstore_args(args, name, with_options):
+    """Validate a kv_zunionstore / kv_zinterstore / kv_zdiffstore
+    call: (destination, keys, weights, aggregate). `destination`
+    must be a string and `keys` a non-empty list of string key
+    names, at most MAX_ZSTORE_KEYS; `weights`, when given, must be
+    a list of numbers, one per key (NaN is rejected — cinder
+    rejects it too); `aggregate`, when given, must be "sum", "min"
+    or "max" (any case). Anything else fails the call instead of
+    sending a half-formed STORE command. Weights and aggregate
+    default to None, meaning the tool sends neither option and
+    cinder weights every set by 1 and sums. kv_zdiffstore takes
+    neither option — cinder's ZDIFFSTORE has none, the scores come
+    from the first set — so passing either fails the call instead
+    of being silently ignored."""
+    destination = _require(args, "destination")
+    if not isinstance(destination, str):
+        raise ValueError("%s destination must be a string" % name)
+    keys = args.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError("%s keys must be a non-empty list" % name)
+    if len(keys) > MAX_ZSTORE_KEYS:
+        raise ValueError(
+            "%s reads at most %d keys; narrow the list"
+            % (name, MAX_ZSTORE_KEYS)
+        )
+    for key in keys:
+        if not isinstance(key, str):
+            raise ValueError("%s keys must be strings" % name)
+    weights = args.get("weights")
+    if weights is not None:
+        if not isinstance(weights, list):
+            raise ValueError("%s weights must be a list" % name)
+        if len(weights) != len(keys):
+            raise ValueError(
+                "%s weights must have one weight per key" % name
+            )
+        for weight in weights:
+            if isinstance(weight, bool) or not isinstance(
+                    weight, (int, float)):
+                raise ValueError(
+                    "%s weights must be numbers" % name)
+            if isinstance(weight, float) and weight != weight:
+                raise ValueError(
+                    "%s weights must not be NaN" % name)
+    aggregate = args.get("aggregate")
+    if aggregate is not None:
+        if not isinstance(aggregate, str):
+            raise ValueError("%s aggregate must be a string" % name)
+        if aggregate.lower() not in ZINTER_AGGREGATES:
+            raise ValueError(
+                "%s aggregate must be sum, min or max" % name)
+    if not with_options and (weights is not None
+                             or aggregate is not None):
+        raise ValueError(
+            "%s takes no weights or aggregate: cinder's ZDIFFSTORE "
+            "has no options" % name
+        )
+    return destination, list(keys), weights, aggregate
+
+
+def _call_zunionstore(client, args):
+    """kv_zunionstore: store the union of several sorted sets at
+    the destination and return the number of members stored
+    (cinder answers an integer, not a member list). The destination
+    is overwritten whatever it held and its TTL is cleared, an
+    empty result deletes it instead, and it may itself be one of
+    the inputs, since the union is computed before it is touched.
+    The call writes, so the audit treats it as a write op."""
+    return client.command(*_op_argv("kv_zunionstore", args))
+
+
+def _call_zinterstore(client, args):
+    """kv_zinterstore: store the intersection of several sorted
+    sets at the destination and return the number of members
+    stored (cinder answers an integer, not a member list). The
+    destination is overwritten whatever it held and its TTL is
+    cleared, an empty result deletes it instead, and it may
+    itself be one of the inputs, since the intersection is
+    computed before it is touched. The call writes, so the audit
+    treats it as a write op."""
+    return client.command(*_op_argv("kv_zinterstore", args))
+
+
+def _call_zdiffstore(client, args):
+    """kv_zdiffstore: store the difference of several sorted sets
+    at the destination and return the number of members stored
+    (cinder answers an integer, not a member list). The
+    destination is overwritten whatever it held and its TTL is
+    cleared, an empty result deletes it instead, and it may
+    itself be one of the inputs, since the difference is computed
+    before it is touched. The call writes, so the audit treats it
+    as a write op."""
+    return client.command(*_op_argv("kv_zdiffstore", args))
+
+
 # The most keys one kv_pfcount call reads; a wider call fails
 # instead of sending a half-formed PFCOUNT with a huge argv.
 MAX_PFCOUNT_KEYS = 1000
@@ -4480,6 +4647,12 @@ def _call_single(client, name, args):
         return _call_zinter(client, args)
     if name == "kv_zdiff":
         return _call_zdiff(client, args)
+    if name == "kv_zunionstore":
+        return _call_zunionstore(client, args)
+    if name == "kv_zinterstore":
+        return _call_zinterstore(client, args)
+    if name == "kv_zdiffstore":
+        return _call_zdiffstore(client, args)
     if name == "kv_zincrby":
         return _call_zincrby(client, args)
     if name == "kv_zrange":
