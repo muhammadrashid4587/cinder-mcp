@@ -64,7 +64,8 @@ from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
 from .tools import (MAX_GEOSEARCH_MEMBERS, MAX_XPENDING_ENTRIES,
                     _xack_args, _xadd_args, _xclaim_args,
-                    _xgroup_create_args, _xreadgroup_args)
+                    _xgroup_create_args, _xgroup_setid_args,
+                    _xreadgroup_args)
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
 # The prompts process one batch at a time and keep only bounded
@@ -153,7 +154,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
     "kv_xadd", "kv_xreadgroup", "kv_xgroup_create", "kv_xack",
-    "kv_xclaim",
+    "kv_xclaim", "kv_xgroup_setid",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -2126,6 +2127,100 @@ def _audit_xclaim(client, op):
     return "safe", line
 
 
+def _stream_id_parts(id_text):
+    """One validated stream ID as an (ms, seq) pair for comparing
+    IDs: "ms-seq" is exact, a bare millisecond is the first
+    sequence of that millisecond, "-" is the first ID and "+" the
+    last. "$" is not an ID — the caller resolves it to the
+    stream's top ID first."""
+    if id_text == "-":
+        return 0, 0
+    if id_text == "+":
+        return 2 ** 64 - 1, 2 ** 64 - 1
+    if "-" not in id_text:
+        return int(id_text), 0
+    ms_text, seq_text = id_text.split("-", 1)
+    return int(ms_text), int(seq_text)
+
+
+def _audit_xgroup_setid(client, op):
+    """Audit one kv_xgroup_setid op: the stream and the group are
+    probed live, and the stream's top ID is read with XREVRANGE
+    so the move is judged against it — cinder exposes no way to
+    read the group's current cursor, so the audit says what the
+    next ">" read does from the new ID instead of whether the
+    cursor moved. Moving back re-delivers the entries after the
+    new ID, bumping their delivery counts and re-stamping their
+    delivery times; moving to or past the top delivers nothing
+    already in the stream. Either way the pending list is
+    untouched by the move itself, and the entries stay in the
+    stream either way. Returns (verdict, line)."""
+    key, group, id_value = _xgroup_setid_args(op)
+    if client.command("EXISTS", key) == 0:
+        return "risky", (
+            "kv_xgroup_setid — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        # The key expired while auditing; the setid would fail.
+        return "risky", (
+            "kv_xgroup_setid — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    try:
+        kind, _size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        # The key expired between the TTL read and the probe.
+        return "risky", (
+            "kv_xgroup_setid — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    if kind != "stream":
+        return "risky", (
+            "kv_xgroup_setid — %r would fail with WRONGTYPE: the "
+            "key is a %s of %s" % (key, kind, size)
+        )
+    try:
+        client.command("XPENDING", key, group)
+    except RespError as exc:
+        if "NOGROUP" in str(exc):
+            return "risky", (
+                "kv_xgroup_setid — %r would fail: no such consumer "
+                "group %r" % (key, group)
+            )
+        raise
+    top_entries = client.command("XREVRANGE", key, "+", "-", "COUNT", 1)
+    top = (_stream_id_parts(top_entries[0][0])
+           if top_entries else (0, 0))
+    target = top if id_value == "$" else _stream_id_parts(id_value)
+    if target < top:
+        return "caution", (
+            "kv_xgroup_setid — moves consumer group %r on stream "
+            "%r back to %r; the next '>' read delivers the entries "
+            "after %r again, recording them in the pending list "
+            "until XACK — the move itself leaves the pending list "
+            "untouched%s"
+            % (group, key, id_value, id_value,
+               ", on a stream that never expires" if ttl == -1 else "")
+        )
+    if target > top:
+        return "safe", (
+            "kv_xgroup_setid — moves consumer group %r on stream "
+            "%r past the top ID to %r; the next '>' read delivers "
+            "only entries added after %r, and the entries already "
+            "in the stream are never delivered as new entries — "
+            "the pending list is untouched"
+            % (group, key, id_value, id_value)
+        )
+    return "safe", (
+        "kv_xgroup_setid — moves consumer group %r on stream %r "
+        "to %r, the top ID; the next '>' read delivers only "
+        "entries added after it, and the pending list is untouched"
+        % (group, key, id_value)
+    )
+
+
 def _audit_lmove(client, op):
     """Audit one kv_lmove op: the source and the destination are
     both probed live, because the move reads the source, writes the
@@ -3570,6 +3665,10 @@ def _audit_write_op(client, op):
         # XCLAIM moves pending entries of one group's pending list
         # to another consumer, so it is audited on its own.
         return _audit_xclaim(client, op)
+    if name == "kv_xgroup_setid":
+        # XGROUP SETID moves one group's last-delivered ID, so it
+        # is audited on its own.
+        return _audit_xgroup_setid(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

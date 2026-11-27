@@ -3570,11 +3570,46 @@ class FakeCinder(threading.Thread):
                         reply += self._bulk(item)
             return reply
         elif name == "XGROUP":
-            # XGROUP CREATE key group id [MKSTREAM], as in real
-            # cinder: "$" is the top ID at creation, "0" from the
-            # beginning, or an explicit ID; MKSTREAM creates the
-            # stream empty when it is missing. Only CREATE exists.
-            if len(args) < 1 or args[0].upper() != "CREATE":
+            # XGROUP CREATE key group id [MKSTREAM] and XGROUP
+            # SETID key group id, as in real cinder: "$" is the top
+            # ID, "0" from the beginning, or an explicit ID;
+            # MKSTREAM creates the stream empty when it is missing.
+            # SETID moves an existing group's cursor — the pending
+            # list is untouched — and answers OK; ENTRIESREAD is
+            # not supported, so a fifth argument is a wrong-number
+            # error. Other subcommands are an error.
+            if len(args) < 1:
+                return ("-ERR Unknown subcommand or wrong number of "
+                        "arguments for 'xgroup'\r\n")
+            if args[0].upper() == "SETID":
+                if len(args) != 4:
+                    return ("-ERR wrong number of arguments for "
+                            "'xgroup' command\r\n")
+                key, group, id_text = args[1], args[2], args[3]
+                value = self._get(key)
+                if id_text == "$":
+                    if value is not None and not isinstance(value, Stream):
+                        # "$" resolves through the stream's top ID,
+                        # so a non-stream key fails here, as in
+                        # real cinder.
+                        return ("-WRONGTYPE Operation against a key "
+                                "holding the wrong kind of value\r\n")
+                    cursor = ((value.top_ms, value.top_seq)
+                              if value is not None else (0, 0))
+                else:
+                    cursor = _stream_parse_bound(id_text, False)
+                    if cursor is None:
+                        return ("-ERR Invalid stream ID specified as "
+                                "stream command argument\r\n")
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                if value is None or group not in value.groups:
+                    return ("-ERR NOGROUP No such key '%s' or consumer "
+                            "group '%s'\r\n" % (key, group))
+                value.groups[group]["cursor"] = cursor
+                return "+OK\r\n"
+            if args[0].upper() != "CREATE":
                 return ("-ERR Unknown subcommand or wrong number of "
                         "arguments for 'xgroup'\r\n")
             if len(args) < 4 or len(args) > 5:
@@ -4109,6 +4144,7 @@ class McpTests(unittest.TestCase):
                     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen",
                     "kv_xread", "kv_xreadgroup", "kv_xpending",
                     "kv_xgroup_create", "kv_xack", "kv_xclaim",
+                    "kv_xgroup_setid",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -9173,6 +9209,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return reply["result"]["content"][0]["text"]
 
+    def _xgroup_setid_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xgroup_setid", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return reply["result"]["content"][0]["text"]
+
     def _xack_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_xack", "arguments": arguments,
@@ -9189,8 +9232,8 @@ class McpTests(unittest.TestCase):
 
     def _raw(self):
         # A raw RESP client against the fake, for the commands no
-        # MCP tool covers yet — XGROUP CREATE to make a group, XACK
-        # to drop entries from a pending list.
+        # MCP tool covers yet — XGROUP CREATE to make a group, XGROUP
+        # SETID to move one, XACK to drop entries from a pending list.
         return RespClient("127.0.0.1", self.fake.port)
 
     def test_kv_xadd_returns_ids_and_xrange_reads_entries(self):
@@ -10912,6 +10955,207 @@ class McpTests(unittest.TestCase):
         self.assertFalse(summary["results"][5]["ok"])
         self.assertIn("NOGROUP", summary["results"][5]["error"])
 
+    def test_kv_xgroup_setid_moves_the_group_cursor(self):
+        # Three entries, then a group from the beginning made with
+        # the tool itself: a ">" read delivers all three, and a
+        # SETID back to the first entry re-delivers the other two
+        # — while the pending list stays exactly as it was.
+        for entry_id, fields in (("1000-0", {"name": "alice"}),
+                                 ("1000-1", {"name": "bob"}),
+                                 ("2000-0", {"name": "carol"})):
+            self.assertEqual(
+                self._xadd_result({"key": "xgs:s", "id": entry_id,
+                                   "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgs:s", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xgs:s": ">"}}),
+            [{"key": "xgs:s",
+              "entries": [{"id": "1000-0", "fields": {"name": "alice"}},
+                          {"id": "1000-1", "fields": {"name": "bob"}},
+                          {"id": "2000-0", "fields": {"name": "carol"}}]}])
+        self.assertEqual(
+            self._xpending_result({"key": "xgs:s", "group": "grp"}),
+            {"total": 3, "min_id": "1000-0", "max_id": "2000-0",
+             "consumers": [{"consumer": "c1", "count": 3}]})
+        # Moving the cursor back to 1000-0 re-delivers the entries
+        # after it, and the pending list is untouched: still three
+        # entries, same min and max, same consumer.
+        self.assertEqual(
+            self._xgroup_setid_result(
+                {"key": "xgs:s", "group": "grp", "id": "1000-0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xgs:s": ">"}}),
+            [{"key": "xgs:s",
+              "entries": [{"id": "1000-1", "fields": {"name": "bob"}},
+                          {"id": "2000-0", "fields": {"name": "carol"}}]}])
+        self.assertEqual(
+            self._xpending_result({"key": "xgs:s", "group": "grp"}),
+            {"total": 3, "min_id": "1000-0", "max_id": "2000-0",
+             "consumers": [{"consumer": "c1", "count": 3}]})
+        # The entries stay in the stream: only the cursor moved.
+        self.assertEqual(
+            self._xrange_result({"key": "xgs:s"}),
+            [{"id": "1000-0", "fields": {"name": "alice"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "2000-0", "fields": {"name": "carol"}}])
+        # Moving to the ID the group already holds is a no-op that
+        # still answers OK.
+        self.assertEqual(
+            self._xgroup_setid_result(
+                {"key": "xgs:s", "group": "grp", "id": "2000-0"}),
+            "OK")
+        # The default id is "$": the cursor moves to the top, and
+        # the next ">" read delivers nothing new.
+        self.assertEqual(
+            self._xgroup_setid_result(
+                {"key": "xgs:s", "group": "grp"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xgs:s": ">"}}),
+            [])
+        # A bare millisecond is the first sequence of that
+        # millisecond.
+        self.assertEqual(
+            self._xgroup_setid_result(
+                {"key": "xgs:s", "group": "grp", "id": "1000"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xgs:s": ">"}}),
+            [{"key": "xgs:s",
+              "entries": [{"id": "1000-1", "fields": {"name": "bob"}},
+                          {"id": "2000-0", "fields": {"name": "carol"}}]}])
+        # Moving past the top is allowed, and the next ">" read
+        # delivers nothing until an entry lands after the new ID.
+        self.assertEqual(
+            self._xgroup_setid_result(
+                {"key": "xgs:s", "group": "grp", "id": "9999-0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xgs:s": ">"}}),
+            [])
+        # A missing key or group fails with NOGROUP, and a
+        # non-stream key with WRONGTYPE, as server errors.
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "xgs:plain", "value": "v"},
+        })
+        for arguments, marker in (
+                ({"key": "xgs:ghost", "group": "grp", "id": "$"},
+                 "NOGROUP"),
+                ({"key": "xgs:s", "group": "nope", "id": "$"},
+                 "NOGROUP"),
+                ({"key": "xgs:plain", "group": "grp", "id": "$"},
+                 "WRONGTYPE")):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xgroup_setid", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn(marker, reply["error"]["message"], arguments)
+
+    def test_kv_xgroup_setid_rejects_bad_arguments(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xgr:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgr:s", "group": "grp", "id": "0"}),
+            "OK")
+        bad = [{}, {"key": "xgr:s"}, {"group": "grp"},
+               {"key": 1, "group": "grp"},
+               {"key": "xgr:s", "group": 1},
+               {"key": "xgr:s", "group": "grp", "id": 1},
+               {"key": "xgr:s", "group": "grp", "id": "abc"},
+               {"key": "xgr:s", "group": "grp", "id": "7-"},
+               {"key": "xgr:s", "group": "grp", "id": "1-2-3"},
+               {"key": "xgr:s", "group": "grp",
+                "id": "18446744073709551616"},
+               {"key": "xgr:s", "group": "grp",
+                "id": "18446744073709551615-18446744073709551616"}]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xgroup_setid", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_kv_xgroup_setid_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xgsb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "xgsb1", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xgroup_create", "key": "xgsb1",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgsb1": ">"}},
+                {"op": "kv_xgroup_setid", "key": "xgsb1",
+                 "group": "grp", "id": "1-0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgsb1": ">"}},
+                {"op": "kv_xpending", "key": "xgsb1", "group": "grp"},
+                {"op": "kv_xgroup_setid", "key": "xgsb1",
+                 "group": "nope", "id": "1-0"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 7)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][4]["result"], "OK")
+        self.assertEqual(summary["results"][5]["result"], [
+            {"key": "xgsb1",
+             "entries": [{"id": "2-0", "fields": {"v": "b"}}]},
+        ])
+        self.assertEqual(summary["results"][6]["result"], {
+            "total": 2, "min_id": "1-0", "max_id": "2-0",
+            "consumers": [{"consumer": "c1", "count": 2}]})
+        self.assertFalse(summary["results"][7]["ok"])
+        self.assertIn("NOGROUP", summary["results"][7]["error"])
+        # The atomic batch queues the setid and runs it at EXEC:
+        # the cursor moves back, the read re-delivers, and the
+        # NOGROUP setid is recorded in place.
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xgsb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xgroup_create", "key": "xgsb2",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgsb2": ">"}},
+                {"op": "kv_xgroup_setid", "key": "xgsb2",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgsb2": ">"}},
+                {"op": "kv_xgroup_setid", "key": "xgsb2",
+                 "group": "nope", "id": "0"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][3]["result"], "OK")
+        self.assertEqual(summary["results"][4]["result"], [
+            {"key": "xgsb2",
+             "entries": [{"id": "5-0", "fields": {"v": "x"}}]},
+        ])
+        self.assertFalse(summary["results"][5]["ok"])
+        self.assertIn("NOGROUP", summary["results"][5]["error"])
+
     def test_prompts_get_write_safety_covers_xgroup_create_and_xack(self):
         self.assertEqual(
             self._xadd_result({"key": "ws:g2", "id": "1-0",
@@ -11118,6 +11362,126 @@ class McpTests(unittest.TestCase):
             "op 6: kv_xclaim — no-op, none of the 1 id can be "
             "claimed by consumer 'c2' in group 'grp' on stream "
             "'ws:c'",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_xgroup_setid(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xadd_result({"key": "ws:s", "id": "2-0",
+                               "fields": {"v": "b"}}),
+            "2-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:s", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"ws:s": ">"}}),
+            [{"key": "ws:s",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}},
+                          {"id": "2-0", "fields": {"v": "b"}}]}])
+        self.assertEqual(
+            self._xadd_result({"key": "ws:se", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:se", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"ws:se": ">"}}),
+            [{"key": "ws:se",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}}]}])
+        reply = self._call("tools/call", 1, {
+            "name": "kv_expire",
+            "arguments": {"key": "ws:se", "seconds": 1000},
+        })
+        self.assertNotIn("error", reply)
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "ws:plain", "value": "v"},
+        })
+        plan = [
+            {"op": "kv_xgroup_setid", "key": "ws:ghost",
+             "group": "grp", "id": "$"},
+            {"op": "kv_xgroup_setid", "key": "ws:s",
+             "group": "nope", "id": "$"},
+            {"op": "kv_xgroup_setid", "key": "ws:plain",
+             "group": "grp", "id": "$"},
+            {"op": "kv_xgroup_setid", "key": "ws:s",
+             "group": "grp", "id": "0"},
+            {"op": "kv_xgroup_setid", "key": "ws:s",
+             "group": "grp", "id": "$"},
+            {"op": "kv_xgroup_setid", "key": "ws:s",
+             "group": "grp", "id": "9999-0"},
+            {"op": "kv_xgroup_setid", "key": "ws:se",
+             "group": "grp", "id": "0"},
+            {"op": "kv_xgroup_setid", "key": "ws:se",
+             "group": "grp", "id": "$"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 8 op(s), 8 audited, 0 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_xgroup_setid — 'ws:ghost' would fail: no "
+            "such key or consumer group 'grp'",
+            risky,
+        )
+        self.assertIn(
+            "op 1: kv_xgroup_setid — 'ws:s' would fail: no such "
+            "consumer group 'nope'",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_xgroup_setid — 'ws:plain' would fail with "
+            "WRONGTYPE: the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_xgroup_setid — moves consumer group 'grp' "
+            "on stream 'ws:s' back to '0'; the next '>' read "
+            "delivers the entries after '0' again, recording them "
+            "in the pending list until XACK — the move itself "
+            "leaves the pending list untouched, on a stream that "
+            "never expires",
+            caution,
+        )
+        self.assertIn(
+            "op 6: kv_xgroup_setid — moves consumer group 'grp' "
+            "on stream 'ws:se' back to '0'; the next '>' read "
+            "delivers the entries after '0' again, recording them "
+            "in the pending list until XACK — the move itself "
+            "leaves the pending list untouched",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 4: kv_xgroup_setid — moves consumer group 'grp' "
+            "on stream 'ws:s' to '$', the top ID; the next '>' "
+            "read delivers only entries added after it, and the "
+            "pending list is untouched",
+            safe,
+        )
+        self.assertIn(
+            "op 5: kv_xgroup_setid — moves consumer group 'grp' "
+            "on stream 'ws:s' past the top ID to '9999-0'; the "
+            "next '>' read delivers only entries added after "
+            "'9999-0', and the entries already in the stream are "
+            "never delivered as new entries — the pending list is "
+            "untouched",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_xgroup_setid — moves consumer group 'grp' "
+            "on stream 'ws:se' to '$', the top ID; the next '>' "
+            "read delivers only entries added after it, and the "
+            "pending list is untouched",
             safe,
         )
 

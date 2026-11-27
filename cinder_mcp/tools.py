@@ -750,6 +750,19 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_xgroup_setid",
+        "description": "Move a consumer group's last-delivered ID: XGROUP SETID key group id. Takes `key` and `group` as strings and `id` as the ID the group moves to (\"$\" by default — the top ID at call time, so the next \">\" read delivers only entries added after it, \"0\" for every entry from the beginning, or an explicit ID like \"ms-seq\"). Returns \"OK\". The next \">\" read delivers the entries after the new ID, and entries already pending stay pending for their consumers — the pending list is untouched. Cinder has no ENTRIESREAD option for SETID, so the tool does not offer it. A missing key or a group that does not exist fails with NOGROUP, and a key that is not a stream fails with WRONGTYPE.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "group": {"type": "string"},
+                "id": {"type": "string"},
+            },
+            "required": ["key", "group"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -1567,7 +1580,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_xgroup_setid, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1702,7 +1715,7 @@ BATCHABLE_TOOLS = {
     "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
-    "kv_xclaim",
+    "kv_xclaim", "kv_xgroup_setid",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1801,7 +1814,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
-    "kv_xclaim",
+    "kv_xclaim", "kv_xgroup_setid",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -2657,6 +2670,13 @@ def _op_argv(name, args):
         if justid:
             cmd.append("JUSTID")
         return cmd
+    if name == "kv_xgroup_setid":
+        # XGROUP SETID key group id — the id is "$" by default
+        # (the top ID at call time), "0" from the beginning, or
+        # an explicit ID; cinder has no ENTRIESREAD option, so
+        # none is sent.
+        key, group, id_value = _xgroup_setid_args(args)
+        return ["XGROUP", "SETID", key, group, id_value]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -4215,6 +4235,35 @@ def _call_xclaim(client, args):
      retrycount, force, justid) = _xclaim_args(args)
     reply = client.command(*_op_argv("kv_xclaim", args))
     return _xclaim_result(reply, justid)
+
+
+def _xgroup_setid_args(args):
+    """Validate a kv_xgroup_setid call: (key, group, id). `key`
+    and `group` must be strings. `id` is the ID the group moves
+    to — "$" (the top ID at call time) by default, "0" from the
+    beginning, or an explicit ID validated like kv_xrange's
+    bounds: a bare millisecond is the first sequence of that
+    millisecond, "-" the first ID, "+" the last. Cinder has no
+    ENTRIESREAD option for SETID, so none is accepted here."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xgroup_setid key must be a string")
+    group = _require(args, "group")
+    if not isinstance(group, str):
+        raise ValueError("kv_xgroup_setid group must be a string")
+    id_value = args.get("id", "$")
+    if not isinstance(id_value, str):
+        raise ValueError("kv_xgroup_setid id must be a string")
+    if id_value != "$":
+        id_value = _stream_bound(id_value, "kv_xgroup_setid")
+    return key, group, id_value
+
+
+def _call_xgroup_setid(client, args):
+    """kv_xgroup_setid: move a consumer group's last-delivered
+    ID, answering "OK"."""
+    reply = client.command(*_op_argv("kv_xgroup_setid", args))
+    return reply
 
 
 # The most members one kv_zrange call returns; a wider range fails
@@ -5955,6 +6004,8 @@ def _call_single(client, name, args):
         return _call_xack(client, args)
     if name == "kv_xclaim":
         return _call_xclaim(client, args)
+    if name == "kv_xgroup_setid":
+        return _call_xgroup_setid(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":
