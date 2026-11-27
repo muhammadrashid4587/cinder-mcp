@@ -995,6 +995,47 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_georadius_ro",
+        "description": "Search a geo set for the members inside a circle around a point, read-only: GEORADIUS_RO key longitude latitude radius <m | km | ft | mi> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC]. Takes `key`, `longitude`, `latitude`, `radius`, and `unit` (\"m\" by default, \"km\" / \"ft\" / \"mi\" in any case). The same `sort` / `count` / `any` / `withdist` / `withhash` / `withcoord` options as kv_georadius, returning the member names or the member objects — but no `store` / `storedist`: cinder refuses STORE and STOREDIST on the read-only variant, so the tool rejects them before anything is sent. The command never writes, never logs to the AOF, and never replicates, so it is safe to run on a replica. A missing key answers an empty list. Fails with WRONGTYPE on a key holding anything but a sorted set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "longitude": {"type": "number"},
+                "latitude": {"type": "number"},
+                "radius": {"type": "number"},
+                "unit": {"type": "string"},
+                "sort": {"type": "string"},
+                "count": {"type": "integer"},
+                "any": {"type": "boolean"},
+                "withdist": {"type": "boolean"},
+                "withhash": {"type": "boolean"},
+                "withcoord": {"type": "boolean"},
+            },
+            "required": ["key", "longitude", "latitude", "radius"],
+        },
+    },
+    {
+        "name": "kv_georadiusbymember_ro",
+        "description": "Search a geo set for the members inside a circle around one of its members, read-only: GEORADIUSBYMEMBER_RO key member radius <m | km | ft | mi> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC]. Takes `key`, `member`, `radius`, and `unit` (\"m\" by default, \"km\" / \"ft\" / \"mi\" in any case). The same `sort` / `count` / `any` / `withdist` / `withhash` / `withcoord` options as kv_georadiusbymember, returning the member names or the member objects — but no `store` / `storedist`: cinder refuses STORE and STOREDIST on the read-only variant, so the tool rejects them before anything is sent. The command never writes, never logs to the AOF, and never replicates, so it is safe to run on a replica. A missing key answers an empty list. Fails with WRONGTYPE on a key holding anything but a sorted set, and when the centre member does not exist or has no position.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member": {"type": "string"},
+                "radius": {"type": "number"},
+                "unit": {"type": "string"},
+                "sort": {"type": "string"},
+                "count": {"type": "integer"},
+                "any": {"type": "boolean"},
+                "withdist": {"type": "boolean"},
+                "withhash": {"type": "boolean"},
+                "withcoord": {"type": "boolean"},
+            },
+            "required": ["key", "member", "radius"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1218,7 +1259,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1357,7 +1398,8 @@ BATCHABLE_TOOLS = {
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
     "kv_geosearch", "kv_geosearchstore", "kv_georadius",
-    "kv_georadiusbymember",
+    "kv_georadiusbymember", "kv_georadius_ro",
+    "kv_georadiusbymember_ro",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1448,7 +1490,8 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
     "kv_geosearch", "kv_geosearchstore", "kv_georadius",
-    "kv_georadiusbymember",
+    "kv_georadiusbymember", "kv_georadius_ro",
+    "kv_georadiusbymember_ro",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1675,7 +1718,8 @@ def _call_batch_atomic(client, ops):
             # like the standalone tool does.
             value = _geopos_result(reply)
         elif op_name in ("kv_geosearch", "kv_geosearchstore",
-                         "kv_georadius", "kv_georadiusbymember"):
+                         "kv_georadius", "kv_georadiusbymember",
+                         "kv_georadius_ro", "kv_georadiusbymember_ro"):
             # A geo search came back as a member list — plain names
             # or nested arrays with the WITH* fields — or as a
             # stored count for a GEORADIUS with STORE / STOREDIST
@@ -1698,7 +1742,10 @@ def _call_batch_atomic(client, ops):
                     continue
             else:
                 _k, _c, _r, _u, options, store = _georadius_args(
-                    op, op_name, op_name == "kv_georadiusbymember")
+                    op, op_name,
+                    op_name in ("kv_georadiusbymember",
+                                "kv_georadiusbymember_ro"),
+                    read_only=op_name.endswith("_ro"))
                 if store is not None:
                     value = reply
                 else:
@@ -2216,6 +2263,25 @@ def _op_argv(name, args):
                                        withdist, withhash, withcoord)
         if store is not None:
             cmd += [store[0].upper(), store[1]]
+        return cmd
+    if name == "kv_georadius_ro":
+        # The read-only variant: same search, no STORE / STOREDIST
+        # — _georadius_args rejects them before anything is sent.
+        key, centre, radius, unit, options, _store = _georadius_args(
+            args, name, False, read_only=True)
+        sort_desc, count, count_any, withdist, withhash, withcoord = options
+        _kind, lon, lat = centre
+        cmd = ["GEORADIUS_RO", key, repr(lon), repr(lat), repr(radius), unit]
+        cmd += _geo_search_option_argv(sort_desc, count, count_any,
+                                       withdist, withhash, withcoord)
+        return cmd
+    if name == "kv_georadiusbymember_ro":
+        key, centre, radius, unit, options, _store = _georadius_args(
+            args, name, True, read_only=True)
+        sort_desc, count, count_any, withdist, withhash, withcoord = options
+        cmd = ["GEORADIUSBYMEMBER_RO", key, centre[1], repr(radius), unit]
+        cmd += _geo_search_option_argv(sort_desc, count, count_any,
+                                       withdist, withhash, withcoord)
         return cmd
     if name == "kv_sscan":
         key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
@@ -3103,11 +3169,17 @@ def _call_geosearchstore(client, args):
 
 
 def _call_georadius(client, args, name):
-    """kv_georadius / kv_georadiusbymember: the members inside the
-    circle, or the number stored when STORE / STOREDIST was given
-    (cinder answers an integer then, not a member list)."""
+    """kv_georadius / kv_georadiusbymember (and the _ro read-only
+    variants): the members inside the circle, or the number stored
+    when STORE / STOREDIST was given (cinder answers an integer
+    then, not a member list). The _ro variants never store —
+    _georadius_args rejects store / storedist for them — so they
+    always return the shaped member list."""
+    read_only = name.endswith("_ro")
     _key, _centre, _radius, _unit, options, store = _georadius_args(
-        args, name, name == "kv_georadiusbymember")
+        args, name,
+        name in ("kv_georadiusbymember", "kv_georadiusbymember_ro"),
+        read_only=read_only)
     reply = client.command(*_op_argv(name, args))
     if store is not None:
         return reply
@@ -3690,14 +3762,18 @@ def _geosearchstore_args(args):
     return destination, key, centre, shape, options, storedist
 
 
-def _georadius_args(args, tool, by_member):
+def _georadius_args(args, tool, by_member, read_only=False):
     """Validate a kv_georadius / kv_georadiusbymember call: (key,
     centre, radius, unit, options, store). The centre is
     ("lonlat", lon, lat) for GEORADIUS and ("member", name) for
     GEORADIUSBYMEMBER; store is ("store", key), ("storedist",
     key) or None. The two store forms are mutually exclusive, and
     neither combines with the WITH* options — cinder rejects that
-    combination, so the tool does too, before anything is sent."""
+    combination, so the tool does too, before anything is sent.
+    With read_only (the kv_georadius_ro / kv_georadiusbymember_ro
+    tools), a store or storedist argument is rejected outright —
+    cinder refuses STORE / STOREDIST on GEORADIUS_RO /
+    GEORADIUSBYMEMBER_RO — so store is always None then."""
     key = _require(args, "key")
     if not isinstance(key, str):
         raise ValueError("%s key must be a string" % tool)
@@ -3721,6 +3797,11 @@ def _georadius_args(args, tool, by_member):
     _sort_desc, _count, _any, withdist, withhash, withcoord = options
     store = args.get("store")
     storedist = args.get("storedist")
+    if read_only and (store is not None or storedist is not None):
+        raise ValueError(
+            "%s does not take store or storedist: STORE and "
+            "STOREDIST are not compatible with the read-only "
+            "variant" % tool)
     if store is not None and storedist is not None:
         raise ValueError(
             "%s takes either store or storedist, not both" % tool)
@@ -4396,6 +4477,7 @@ def _call_single(client, name, args):
         return _call_geosearch(client, args)
     if name == "kv_geosearchstore":
         return _call_geosearchstore(client, args)
-    if name in ("kv_georadius", "kv_georadiusbymember"):
+    if name in ("kv_georadius", "kv_georadiusbymember",
+                "kv_georadius_ro", "kv_georadiusbymember_ro"):
         return _call_georadius(client, args, name)
     return client.command(*_op_argv(name, args))

@@ -153,7 +153,8 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_zlexcount", "kv_zmscore", "kv_zunion",
                          "kv_zinter", "kv_zdiff", "kv_pfcount",
                          "kv_geodist", "kv_geopos", "kv_geohash",
-                         "kv_geosearch",
+                         "kv_geosearch", "kv_georadius_ro",
+                         "kv_georadiusbymember_ro",
                          "kv_lindex", "kv_sscan")
 
 # A largest-string recommendation only fires when the biggest string
@@ -288,7 +289,8 @@ PROMPTS = [
             "GEORADIUSBYMEMBERs that would store their hits at a "
             "destination, overwriting it whatever it held, clearing "
             "its TTL, or deleting it on an empty result — a plain "
-            "GEORADIUS is a read, and GEOSEARCH is a read too — "
+            "GEORADIUS is a read, and GEOSEARCH, GEORADIUS_RO and "
+            "GEORADIUSBYMEMBER_RO are reads too — "
             "GEOSEARCHSTOREs that would store their hits at a "
             "destination, overwriting it whatever it held, clearing "
             "its TTL, or deleting it on an empty result, "

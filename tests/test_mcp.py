@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -1919,13 +1919,19 @@ class FakeCinder(threading.Thread):
             return self._geo_search_reply(
                 hits, opts["withdist"], opts["withhash"],
                 opts["withcoord"], unit_factor)
-        elif name in ("GEORADIUS", "GEORADIUSBYMEMBER"):
+        elif name in ("GEORADIUS", "GEORADIUSBYMEMBER",
+                      "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO"):
             # GEORADIUS key lon lat radius unit [...] and
             # GEORADIUSBYMEMBER key member radius unit [...]: the
             # legacy radius search, with STORE / STOREDIST writing
             # the hits to a destination sorted set. The centre is
             # positional; the options follow it, as in real cinder.
-            by_member = name == "GEORADIUSBYMEMBER"
+            # The _RO variants are the same search but read-only:
+            # STORE / STOREDIST are refused with an error, as in
+            # real cinder, so they never write.
+            read_only = name.endswith("_RO")
+            by_member = name in ("GEORADIUSBYMEMBER",
+                                 "GEORADIUSBYMEMBER_RO")
             key = args[0]
             if by_member:
                 if len(args) < 4:
@@ -1987,6 +1993,9 @@ class FakeCinder(threading.Thread):
             opts, err = self._geo_options(args, i, store_ok=True)
             if err is not None:
                 return err
+            if read_only and opts["store"] is not None:
+                return ("-ERR STORE and STOREDIST are not compatible "
+                        "with the read-only variant\r\n")
             if opts["store"] is not None and (
                     opts["withdist"] or opts["withcoord"]
                     or opts["withhash"]):
@@ -2928,7 +2937,8 @@ class McpTests(unittest.TestCase):
                     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
                     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
                     "kv_geosearch", "kv_geosearchstore", "kv_georadius",
-                    "kv_georadiusbymember",
+                    "kv_georadiusbymember", "kv_georadius_ro",
+                    "kv_georadiusbymember_ro",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -5999,6 +6009,228 @@ class McpTests(unittest.TestCase):
         self.assertIn("could not decode requested zset member",
                       reply["error"]["message"])
 
+    def test_kv_georadius_ro_searches(self):
+        self._sicily()
+        base = {"key": "sicily", "longitude": 15, "latitude": 37,
+                "radius": 200, "unit": "km"}
+        self.assertEqual(self._georadius_ro_result(base),
+                         ["Catania", "Palermo"])
+        self.assertEqual(
+            self._georadius_ro_result({**base, "sort": "desc"}),
+            ["Palermo", "Catania"])
+        self.assertEqual(
+            self._georadius_ro_result({**base, "withdist": True}),
+            [{"member": "Catania", "distance": 56.4413},
+             {"member": "Palermo", "distance": 190.4424}])
+        self.assertEqual(
+            self._georadius_ro_result(
+                {**base, "withhash": True, "withcoord": True}),
+            [{"member": "Catania", "hash": 3479447370796909,
+              "coord": {"longitude": 15.087267458438873,
+                        "latitude": 37.502668423331613}},
+             {"member": "Palermo", "hash": 3479099956230698,
+              "coord": {"longitude": 13.361389338970184,
+                        "latitude": 38.115556395496299}}])
+        self.assertEqual(
+            self._georadius_ro_result({**base, "count": 1}),
+            ["Catania"])
+        self.assertEqual(
+            self._georadius_ro_result(
+                {**base, "count": 1, "any": True}),
+            ["Palermo"])
+        # Radius 0 and COUNT 0 answer empty, as in real cinder.
+        self.assertEqual(self._georadius_ro_result(
+            {**base, "radius": 0}), [])
+        self.assertEqual(self._georadius_ro_result(
+            {**base, "count": 0}), [])
+        # A missing key answers an empty list.
+        self.assertEqual(
+            self._georadius_ro_result(
+                {"key": "ghost", "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "km"}),
+            [])
+        # A bad unit fails even on a missing key.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_georadius_ro",
+            "arguments": {"key": "ghost", "longitude": 15,
+                          "latitude": 37, "radius": 200,
+                          "unit": "parsec"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # The search writes nothing: the key is untouched.
+        self.assertEqual(
+            self._georadius_ro_result(base),
+            ["Catania", "Palermo"])
+
+    def test_kv_georadiusbymember_ro_searches(self):
+        self._sicily()
+        base = {"key": "sicily", "member": "Palermo",
+                "radius": 200, "unit": "km"}
+        self.assertEqual(self._georadiusbymember_ro_result(base),
+                         ["Palermo", "Catania"])
+        self.assertEqual(
+            self._georadiusbymember_ro_result(
+                {**base, "withdist": True}),
+            [{"member": "Palermo", "distance": 0.0},
+             {"member": "Catania", "distance": 166.2742}])
+        # A missing centre member is an error, not an empty list.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_georadiusbymember_ro",
+            "arguments": {"key": "sicily", "member": "Ghost",
+                          "radius": 200, "unit": "km"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertIn("could not decode requested zset member",
+                      reply["error"]["message"])
+
+    def test_kv_georadius_ro_rejects_store(self):
+        self._sicily()
+        base = {"key": "sicily", "longitude": 15, "latitude": 37,
+                "radius": 200, "unit": "km"}
+        # STORE / STOREDIST are rejected client-side, before
+        # anything is sent — cinder refuses them on the read-only
+        # variant — so no destination key is ever created.
+        for args in [
+                {**base, "store": "near"},
+                {**base, "storedist": "dists"},
+                {**base, "store": "near", "withdist": True},
+        ]:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_georadius_ro", "arguments": args,
+            })
+            self.assertIn("error", reply, args)
+            self.assertEqual(reply["error"]["code"], -32602, args)
+            self.assertIn(
+                "not compatible with the read-only variant",
+                reply["error"]["message"], args)
+        for args in [
+                {"key": "sicily", "member": "Palermo",
+                 "radius": 200, "unit": "km", "store": "near"},
+                {"key": "sicily", "member": "Palermo",
+                 "radius": 200, "unit": "km", "storedist": "dists"},
+        ]:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_georadiusbymember_ro", "arguments": args,
+            })
+            self.assertIn("error", reply, args)
+            self.assertEqual(reply["error"]["code"], -32602, args)
+            self.assertIn(
+                "not compatible with the read-only variant",
+                reply["error"]["message"], args)
+        for key in ("near", "dists"):
+            exists = self._call("tools/call", 2, {
+                "name": "kv_exists", "arguments": {"key": key},
+            })
+            self.assertEqual(exists["result"]["content"][0]["text"],
+                             "0", key)
+
+    def test_kv_georadius_ro_rejects_bad_arguments(self):
+        self._sicily()
+        base = {"key": "sicily", "longitude": 15, "latitude": 37,
+                "radius": 200, "unit": "km"}
+        bad = [
+            # Bad radius / unit / sort / count.
+            {**base, "radius": -1},
+            {**base, "radius": "200"},
+            {**base, "unit": "parsec"},
+            {**base, "sort": "near"},
+            {**base, "count": -1},
+            {**base, "count": 1001},
+            {**base, "any": True},
+            # Missing radius / centre.
+            {"key": "sicily", "longitude": 15, "latitude": 37},
+            {"key": "sicily", "latitude": 37, "radius": 200},
+            {"key": "sicily", "longitude": 15, "radius": 200},
+            # The bymember form needs its member.
+            {"key": "sicily", "radius": 200, "unit": "km"},
+        ]
+        for args in bad:
+            name = ("kv_georadius_ro" if "longitude" in args
+                    or "latitude" in args
+                    else "kv_georadiusbymember_ro")
+            reply = self._call("tools/call", 1, {
+                "name": name, "arguments": args,
+            })
+            self.assertIn("error", reply, (name, args))
+            self.assertEqual(reply["error"]["code"], -32602, (name, args))
+
+    def test_kv_georadius_ro_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_geoadd", "key": "b1", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                {"op": "kv_georadius_ro", "key": "b1",
+                 "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "km", "withdist": True},
+                {"op": "kv_georadiusbymember_ro", "key": "b1",
+                 "member": "Palermo", "radius": 200, "unit": "km"},
+                # A rejected STORE fails only that op; the batch
+                # keeps going.
+                {"op": "kv_georadius_ro", "key": "b1",
+                 "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "km", "store": "near"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][1]["result"], [
+            {"member": "Catania", "distance": 56.4413},
+            {"member": "Palermo", "distance": 190.4424},
+        ])
+        self.assertEqual(summary["results"][2]["result"],
+                         ["Palermo", "Catania"])
+        self.assertIn("read-only variant",
+                      summary["results"][3]["error"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b2", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                {"op": "kv_georadius_ro", "key": "b2",
+                 "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "km",
+                 "sort": "desc", "withdist": True},
+                {"op": "kv_georadiusbymember_ro", "key": "b2",
+                 "member": "Palermo", "radius": 200, "unit": "km",
+                 "count": 1},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][1]["result"], [
+            {"member": "Palermo", "distance": 190.4424},
+            {"member": "Catania", "distance": 56.4413},
+        ])
+        self.assertEqual(summary["results"][2]["result"], ["Palermo"])
+        # Bad read-only arguments fail an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b3", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                }},
+                {"op": "kv_georadius_ro", "key": "b3",
+                 "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "km", "store": "near"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "b3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
     def test_kv_geosearchstore_searches_and_stores(self):
         self._sicily()
         base = {"destination": "near", "key": "sicily",
@@ -6639,6 +6871,20 @@ class McpTests(unittest.TestCase):
     def _georadiusbymember_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_georadiusbymember", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _georadius_ro_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_georadius_ro", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _georadiusbymember_ro_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_georadiusbymember_ro", "arguments": arguments,
         })
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
@@ -13492,6 +13738,36 @@ class McpTests(unittest.TestCase):
             "STOREDIST, nothing is written",
             safe,
         )
+
+    def test_prompts_get_write_safety_georadius_ro_is_a_read(self):
+        self._call("tools/call", 1, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "cities", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }},
+        })
+        plan = [
+            # The read-only variants are reads, not writes: there
+            # is no STORE / STOREDIST to audit, so they are skipped
+            # like kv_geosearch.
+            {"op": "kv_georadius_ro", "key": "cities",
+             "longitude": 15, "latitude": 37, "radius": 200,
+             "unit": "km"},
+            {"op": "kv_georadiusbymember_ro", "key": "cities",
+             "member": "Palermo", "radius": 200, "unit": "km"},
+            {"op": "kv_geosearch", "key": "cities",
+             "longitude": 15, "latitude": 37, "radius": 200,
+             "unit": "km"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 3 op(s), 0 audited, 3 not audited.", text)
+        self.assertIn(
+            "op 0: kv_georadius_ro is a read, not a write", text)
+        self.assertIn(
+            "op 1: kv_georadiusbymember_ro is a read, not a write",
+            text)
+        self.assertIn("op 2: kv_geosearch is a read, not a write", text)
 
     def test_prompts_get_write_safety_covers_geosearchstore(self):
         self._call("tools/call", 1, {
