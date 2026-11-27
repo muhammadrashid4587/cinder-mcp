@@ -30,6 +30,9 @@ on a non-integer field or a container, HINCRBYFLOATs that would fail
 on a non-float field or a container, GEORADIUSes and
 GEORADIUSBYMEMBERs that would store their hits at a destination —
 a plain GEORADIUS is a read, and GEOSEARCH is a read too — and
+GEOSEARCHSTOREs that would store their hits at a destination,
+overwriting it whatever it held, clearing its TTL, or deleting it
+on an empty result, and
 EXPIREs with a bad timeout, then asks the model for a go/no-go
 per risky op. SETNX never
 writes to a key that already exists, so the audit reports it as a
@@ -137,7 +140,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_pfadd", "kv_pfmerge",
     "kv_geoadd",
-    "kv_georadius", "kv_georadiusbymember",
+    "kv_georadius", "kv_georadiusbymember", "kv_geosearchstore",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
@@ -286,6 +289,9 @@ PROMPTS = [
             "destination, overwriting it whatever it held, clearing "
             "its TTL, or deleting it on an empty result — a plain "
             "GEORADIUS is a read, and GEOSEARCH is a read too — "
+            "GEOSEARCHSTOREs that would store their hits at a "
+            "destination, overwriting it whatever it held, clearing "
+            "its TTL, or deleting it on an empty result, "
             "and EXPIREs with "
             "a bad timeout, and give a go/no-go per risky op."
         ),
@@ -2184,27 +2190,21 @@ def _audit_georadius_self(name, key, source_ttl, size_value, size,
     )
 
 
-def _audit_georadius(client, op):
-    """Audit one kv_georadius / kv_georadiusbymember op: the source
-    key and, when the op stores its hits, the destination are
-    probed live. A plain search writes nothing, so it is safe. A
-    storing search runs its search read-only first (the same
-    centre and shape, without STORE) to count the hits, then
-    judges the destination: the hits overwrite it whatever it
-    held and clear its TTL, an empty result deletes it instead,
-    and the destination may be the source key itself. Cinder
-    checks the source first — a key that is not a sorted set
-    fails before the destination is touched — and a
-    GEORADIUSBYMEMBER centre member with no position fails too,
-    so the audit follows that order. Returns (verdict, line)."""
-    name, key, centre, radius, unit, options, store = \
-        _georadius_audit_args(op)
-    if store is None:
-        return "safe", (
-            "%s %r — read-only: no STORE or STOREDIST, nothing is "
-            "written" % (name, key)
-        )
-    store_kind, dest = store
+def _audit_storing_geo_search(client, name, key, centre, probe_argv,
+                              store_kind, dest, unit):
+    """Audit one geo search that stores its hits: the source key
+    and the destination are probed live. The search is run
+    read-only first (`probe_argv`, the same centre and shape
+    without STORE) to count the hits, then the destination is
+    judged: the hits overwrite it whatever it held and clear its
+    TTL, an empty result deletes it instead, and the destination
+    may be the source key itself. Cinder checks the source
+    first — a key that is not a sorted set fails before the
+    destination is touched — and a FROMMEMBER / GEORADIUSBYMEMBER
+    centre member with no position fails too, so the audit
+    follows that order. `store_kind` is "store" (geohash scores)
+    or "storedist" (distances in `unit` as scores). Returns
+    (verdict, line)."""
     if client.command("EXISTS", key) == 0:
         return _audit_georadius_empty(
             client, name, key, dest, "the source key does not exist")
@@ -2222,9 +2222,10 @@ def _audit_georadius(client, op):
             "%s %r — would fail with WRONGTYPE: the key is a %s of "
             "%s" % (name, key, kind, size)
         )
-    # The centre member of a GEORADIUSBYMEMBER needs a position: a
-    # member that is not in the set, or one whose score does not
-    # decode as a geohash, fails the call.
+    # The centre member of a FROMMEMBER / GEORADIUSBYMEMBER
+    # search needs a position: a member that is not in the set,
+    # or one whose score does not decode as a geohash, fails the
+    # call.
     if centre[0] == "member":
         pos = client.command("GEOPOS", key, centre[1])
         if not pos or pos[0] is None:
@@ -2236,8 +2237,7 @@ def _audit_georadius(client, op):
     # probe failure is the op failing at runtime, so it is risky
     # rather than a skipped op.
     try:
-        probe = client.command(*_georadius_audit_probe_argv(
-            name, key, centre, radius, unit, options))
+        probe = client.command(*probe_argv)
     except RespError as exc:
         return "risky", (
             "%s %r — would fail: %s" % (name, key, exc))
@@ -2304,6 +2304,157 @@ def _audit_georadius(client, op):
            "expires in %s" % _format_ttl(dest_ttl),
            _geo_hits_text(hits, exact), score_text)
     )
+
+
+def _audit_georadius(client, op):
+    """Audit one kv_georadius / kv_georadiusbymember op: the source
+    key and, when the op stores its hits, the destination are
+    probed live. A plain search writes nothing, so it is safe. A
+    storing search is audited by _audit_storing_geo_search.
+    Returns (verdict, line)."""
+    name, key, centre, radius, unit, options, store = \
+        _georadius_audit_args(op)
+    if store is None:
+        return "safe", (
+            "%s %r — read-only: no STORE or STOREDIST, nothing is "
+            "written" % (name, key)
+        )
+    store_kind, dest = store
+    return _audit_storing_geo_search(
+        client, name, key, centre,
+        _georadius_audit_probe_argv(
+            name, key, centre, radius, unit, options),
+        store_kind, dest, unit)
+
+
+def _geosearch_audit_args(op):
+    """The arguments of a kv_geosearchstore op in a write plan,
+    validated like the tool's own: a destination, a source key, a
+    centre (a member name or longitude/latitude), a shape (a
+    radius or a width/height) in a unit, the shared search
+    options, and `storedist`. Returns (name, destination, key,
+    centre, shape, options, storedist) where centre is
+    ("member", name) or ("lonlat", lon, lat) and shape is
+    ("radius", radius, unit) or ("box", width, height, unit). A
+    bad argument raises ValueError, so the op is skipped instead
+    of being reported as a safe no-op."""
+    name = "kv_geosearchstore"
+    destination = op.get("destination")
+    if not isinstance(destination, str):
+        raise ValueError(
+            "%s destination must be a string: %r"
+            % (name, destination))
+    key = op.get("key")
+    if not isinstance(key, str):
+        raise ValueError("%s key must be a string: %r" % (name, key))
+    member = op.get("member")
+    has_lonlat = "longitude" in op or "latitude" in op
+    if member is not None and has_lonlat:
+        raise ValueError(
+            "%s takes either member or longitude/latitude, not "
+            "both" % name)
+    if member is None and not has_lonlat:
+        raise ValueError(
+            "%s needs a centre: member or longitude/latitude"
+            % name)
+    if member is not None:
+        if not isinstance(member, str):
+            raise ValueError(
+                "%s member must be a string: %r" % (name, member))
+        centre = ("member", member)
+    else:
+        lon = op.get("longitude")
+        lat = op.get("latitude")
+        if lon is None or lat is None:
+            raise ValueError(
+                "%s needs both longitude and latitude: %r"
+                % (name, op))
+        centre = ("lonlat",
+                  _geo_audit_coordinate(lon, "longitude", name),
+                  _geo_audit_coordinate(lat, "latitude", name))
+    radius = op.get("radius")
+    has_box = "width" in op or "height" in op
+    if radius is not None and has_box:
+        raise ValueError(
+            "%s takes either radius or width/height, not both"
+            % name)
+    if radius is None and not has_box:
+        raise ValueError(
+            "%s needs a shape: radius or width/height" % name)
+    unit = op.get("unit", "m")
+    if not isinstance(unit, str) \
+            or unit.lower() not in ("m", "km", "ft", "mi"):
+        raise ValueError(
+            "%s unit must be one of m, km, ft, mi: %r"
+            % (name, unit))
+    unit = unit.lower()
+    if radius is not None:
+        shape = ("radius",
+                 _geo_audit_number(radius, "radius", name), unit)
+    else:
+        width = op.get("width")
+        height = op.get("height")
+        if width is None or height is None:
+            raise ValueError(
+                "%s needs both width and height: %r" % (name, op))
+        shape = ("box",
+                 _geo_audit_number(width, "width", name),
+                 _geo_audit_number(height, "height", name),
+                 unit)
+    options = _geo_search_audit_options(op, name)
+    _sort_desc, _count, _any, withdist, withhash, withcoord = options
+    if withdist or withhash or withcoord:
+        raise ValueError(
+            "%s cannot be combined with withdist, withhash or "
+            "withcoord" % name)
+    storedist = op.get("storedist", False)
+    if not isinstance(storedist, bool):
+        raise ValueError(
+            "%s storedist must be true or false: %r"
+            % (name, storedist))
+    return (name, destination, key, centre, shape, options,
+            storedist)
+
+
+def _geosearch_audit_probe_argv(key, centre, shape, options):
+    """The same search as the audited GEOSEARCHSTORE op, read-only:
+    a GEOSEARCH with the same centre and shape, no STOREDIST,
+    and a COUNT one past the tool's cap so the reply stays
+    bounded however large the geo set is. The op's own COUNT
+    still applies when it is smaller — the probe stores the same
+    hits the op would."""
+    sort_desc, count, count_any, _wd, _wh, _wc = options
+    argv = ["GEOSEARCH", key]
+    if centre[0] == "member":
+        argv += ["FROMMEMBER", centre[1]]
+    else:
+        argv += ["FROMLONLAT", repr(centre[1]), repr(centre[2])]
+    if shape[0] == "radius":
+        argv += ["BYRADIUS", repr(shape[1]), shape[2]]
+    else:
+        argv += ["BYBOX", repr(shape[1]), repr(shape[2]), shape[3]]
+    argv.append("DESC" if sort_desc else "ASC")
+    bound = MAX_GEOSEARCH_MEMBERS + 1
+    if count is not None:
+        bound = min(count, bound)
+    argv += ["COUNT", bound]
+    if count_any:
+        argv.append("ANY")
+    return argv
+
+
+def _audit_geosearchstore(client, op):
+    """Audit one kv_geosearchstore op: GEOSEARCHSTORE always
+    stores its hits, so it is always a write, audited by
+    _audit_storing_geo_search with a read-only GEOSEARCH probe
+    of the same centre and shape. Returns (verdict, line)."""
+    name, destination, key, centre, shape, options, storedist = \
+        _geosearch_audit_args(op)
+    unit = shape[2] if shape[0] == "radius" else shape[3]
+    return _audit_storing_geo_search(
+        client, name, key, centre,
+        _geosearch_audit_probe_argv(key, centre, shape, options),
+        "storedist" if storedist else "store", destination, unit)
 
 
 def _zremrangebyscore_audit_bounds(op):
@@ -2519,6 +2670,10 @@ def _audit_write_op(client, op):
         # it is audited on its own — a plain search with no STORE
         # / STOREDIST is a read, and _audit_georadius says so.
         return _audit_georadius(client, op)
+    if name == "kv_geosearchstore":
+        # GEOSEARCHSTORE always stores its hits at a destination,
+        # so it is audited on its own too.
+        return _audit_geosearchstore(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

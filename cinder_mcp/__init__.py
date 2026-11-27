@@ -1,3 +1,3 @@
 """cinder-mcp: an MCP server that exposes cinder as tools for AI agents."""
 
-__version__ = "0.61.0"
+__version__ = "0.62.0"

@@ -393,16 +393,16 @@ class FakeCinder(threading.Thread):
         finally:
             conn.close()
 
-    def _geo_options(self, args, i, store_ok):
+    def _geo_options(self, args, i, store_ok, storedist_ok=False):
         """Parse the trailing options of a GEOSEARCH / GEORADIUS
         command from args[i:]: ASC / DESC, COUNT [ANY], WITHCOORD
         / WITHDIST / WITHHASH, and (GEORADIUS only) STORE /
-        STOREDIST. Returns (opts, error): opts is a dict, error
-        the RESP error text when the options are malformed, as in
-        real cinder."""
+        STOREDIST, or (GEOSEARCHSTORE only) STOREDIST. Returns
+        (opts, error): opts is a dict, error the RESP error text
+        when the options are malformed, as in real cinder."""
         opts = {"sort_desc": False, "count": None, "count_any": False,
                 "withcoord": False, "withdist": False,
-                "withhash": False, "store": None}
+                "withhash": False, "store": None, "storedist": False}
         sort_given = False
         while i < len(args):
             opt = args[i].upper()
@@ -453,9 +453,34 @@ class FakeCinder(threading.Thread):
                     return None, "-ERR syntax error\r\n"
                 opts["store"] = (opt.lower(), args[i + 1])
                 i += 2
+            elif opt == "STOREDIST" and storedist_ok:
+                if opts["storedist"]:
+                    return None, "-ERR syntax error\r\n"
+                opts["storedist"] = True
+                i += 1
             else:
                 return None, "-ERR syntax error\r\n"
         return opts, None
+
+    def _geo_store(self, dest, hits, store_kind, unit_factor):
+        """Store geo search hits at a destination sorted set: the
+        destination is overwritten whatever it held and its TTL
+        cleared; an empty result deletes it instead; the
+        destination may be the source key itself, since the hits
+        were collected first. STOREDIST stores the distances in
+        the shape's unit as scores, STORE the geohash scores.
+        Returns the RESP integer reply with the stored count."""
+        if not hits:
+            if dest in self.store:
+                del self.store[dest]
+            return ":0\r\n"
+        zset = ZSet()
+        for member, dist, hash_, _lon, _lat in hits:
+            zset.members[member] = (
+                dist * unit_factor if store_kind == "storedist"
+                else float(hash_))
+        self.store[dest] = (zset, None)
+        return ":%d\r\n" % len(hits)
 
     def _geo_search(self, key, clon, clat, is_box, radius_m, width_m,
                     height_m, sort_desc, count, count_any):
@@ -1771,7 +1796,7 @@ class FakeCinder(threading.Thread):
                     out += self._bulk(_geo_hash_string(
                         _geo_encode(pos[0], pos[1], -90.0, 90.0)))
             return out
-        elif name == "GEOSEARCH" and len(args) >= 6:
+        elif name in ("GEOSEARCH", "GEOSEARCHSTORE") and len(args) >= 6:
             # GEOSEARCH key FROMMEMBER member | FROMLONLAT lon lat
             # BYRADIUS radius unit | BYBOX width height unit [ASC |
             # DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST]
@@ -1780,8 +1805,16 @@ class FakeCinder(threading.Thread):
             # centre and the shape come first, in that order, then
             # the trailing options; a missing key answers an empty
             # array, a missing FROMMEMBER member is an error.
-            key = args[0]
-            i = 1
+            # GEOSEARCHSTORE destination key ... [STOREDIST] is
+            # the same search with a destination first, storing
+            # the hits there instead of returning them, with
+            # STOREDIST storing the distances as scores; the
+            # WITH* options are a syntax error there, as in real
+            # cinder.
+            is_store = name == "GEOSEARCHSTORE"
+            dest = args[0] if is_store else None
+            key = args[1] if is_store else args[0]
+            i = 2 if is_store else 1
             clon = clat = None
             from_member = None
             have_from = have_shape = False
@@ -1854,9 +1887,13 @@ class FakeCinder(threading.Thread):
                     break
             if not have_from or not have_shape:
                 return "-ERR syntax error\r\n"
-            opts, err = self._geo_options(args, i, store_ok=False)
+            opts, err = self._geo_options(args, i, store_ok=False,
+                                          storedist_ok=is_store)
             if err is not None:
                 return err
+            if is_store and (opts["withdist"] or opts["withhash"]
+                             or opts["withcoord"]):
+                return "-ERR syntax error\r\n"
             if from_member is not None:
                 value = self._get(key)
                 if value is not None and not isinstance(value, ZSet):
@@ -1874,6 +1911,11 @@ class FakeCinder(threading.Thread):
                 opts["sort_desc"], opts["count"], opts["count_any"])
             if err is not None:
                 return err
+            if is_store:
+                return self._geo_store(
+                    dest, hits,
+                    "storedist" if opts["storedist"] else "store",
+                    unit_factor)
             return self._geo_search_reply(
                 hits, opts["withdist"], opts["withhash"],
                 opts["withcoord"], unit_factor)
@@ -1965,17 +2007,8 @@ class FakeCinder(threading.Thread):
             # deletes it instead; the destination may be the source
             # key itself, since the hits were collected first.
             store_kind, dest = opts["store"]
-            if not hits:
-                if dest in self.store:
-                    del self.store[dest]
-                return ":0\r\n"
-            zset = ZSet()
-            for member, dist, hash_, _lon, _lat in hits:
-                zset.members[member] = (
-                    dist * unit_factor if store_kind == "storedist"
-                    else float(hash_))
-            self.store[dest] = (zset, None)
-            return ":%d\r\n" % len(hits)
+            return self._geo_store(dest, hits, store_kind,
+                                   unit_factor)
         elif name == "PFADD" and len(args) >= 2:
             # PFADD key element [element ...]: 1 when at least one
             # register moved, 0 when every element was already
@@ -2894,7 +2927,8 @@ class McpTests(unittest.TestCase):
                     "kv_zdiff",
                     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
                     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
-                    "kv_geosearch", "kv_georadius", "kv_georadiusbymember",
+                    "kv_geosearch", "kv_geosearchstore", "kv_georadius",
+                    "kv_georadiusbymember",
                     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen",
                     "kv_lpop", "kv_rpop",
                     "kv_lindex", "kv_lset", "kv_linsert",
@@ -5965,6 +5999,287 @@ class McpTests(unittest.TestCase):
         self.assertIn("could not decode requested zset member",
                       reply["error"]["message"])
 
+    def test_kv_geosearchstore_searches_and_stores(self):
+        self._sicily()
+        base = {"destination": "near", "key": "sicily",
+                "longitude": 15, "latitude": 37,
+                "radius": 200, "unit": "km"}
+        # STORE writes the hits with their geohash scores and
+        # answers the stored count.
+        self.assertEqual(self._geosearchstore_result(base), 2)
+        score = self._call("tools/call", 2, {
+            "name": "kv_zscore",
+            "arguments": {"key": "near", "member": "Palermo"},
+        })
+        self.assertEqual(
+            float(score["result"]["content"][0]["text"]),
+            3479099956230698)
+        # STOREDIST writes the distances in the shape unit.
+        self.assertEqual(
+            self._geosearchstore_result(
+                {**base, "destination": "dists", "storedist": True}),
+            2)
+        dists = self._call("tools/call", 3, {
+            "name": "kv_zrange",
+            "arguments": {"key": "dists", "start": 0, "stop": -1,
+                          "withscores": True},
+        })
+        stored = json.loads(dists["result"]["content"][0]["text"])
+        # The distances are from (15, 37): Catania is the nearer.
+        self.assertEqual([s["member"] for s in stored],
+                         ["Catania", "Palermo"])
+        self.assertAlmostEqual(stored[0]["score"], 56.44125787015751,
+                               places=9)
+        self.assertAlmostEqual(stored[1]["score"], 190.44242984775784,
+                               places=9)
+        # A box shape and COUNT work the same way, and FROMMEMBER
+        # centres the search on a member; DESC with COUNT ... ANY
+        # takes the first N in (score, member) order without
+        # sorting — Palermo's geohash score is the smaller one.
+        self.assertEqual(
+            self._geosearchstore_result(
+                {"destination": "box1", "key": "sicily",
+                 "longitude": 15, "latitude": 37,
+                 "width": 120, "height": 120, "unit": "km",
+                 "count": 1}),
+            1)
+        members = self._call("tools/call", 4, {
+            "name": "kv_zrange",
+            "arguments": {"key": "box1", "start": 0, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(members["result"]["content"][0]["text"]),
+            ["Catania"])
+        self.assertEqual(
+            self._geosearchstore_result(
+                {"destination": "one", "key": "sicily",
+                 "member": "Palermo", "radius": 200, "unit": "km",
+                 "sort": "desc", "count": 1, "any": True}),
+            1)
+        members = self._call("tools/call", 5, {
+            "name": "kv_zrange",
+            "arguments": {"key": "one", "start": 0, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(members["result"]["content"][0]["text"]),
+            ["Palermo"])
+        # A missing key stores 0 and creates nothing.
+        self.assertEqual(
+            self._geosearchstore_result(
+                {"destination": "nope", "key": "ghost",
+                 "longitude": 15, "latitude": 37, "radius": 200,
+                 "unit": "km"}),
+            0)
+        exists = self._call("tools/call", 6, {
+            "name": "kv_exists", "arguments": {"key": "nope"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+        # An empty result deletes the destination instead of
+        # leaving an empty set behind.
+        self._call("tools/call", 7, {
+            "name": "kv_set",
+            "arguments": {"key": "old", "value": "v"},
+        })
+        self.assertEqual(
+            self._geosearchstore_result(
+                {**base, "destination": "old", "radius": 1}), 0)
+        exists = self._call("tools/call", 8, {
+            "name": "kv_exists", "arguments": {"key": "old"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+        # STORE overwrites the destination whatever it held — even
+        # a plain string — and clears its TTL.
+        self._call("tools/call", 9, {
+            "name": "kv_set",
+            "arguments": {"key": "strdest", "value": "hello"},
+        })
+        self._call("tools/call", 10, {
+            "name": "kv_expire",
+            "arguments": {"key": "strdest", "seconds": 300},
+        })
+        self.assertEqual(
+            self._geosearchstore_result(
+                {**base, "destination": "strdest"}), 2)
+        card = self._call("tools/call", 11, {
+            "name": "kv_zcard", "arguments": {"key": "strdest"},
+        })
+        self.assertEqual(card["result"]["content"][0]["text"], "2")
+        ttl = self._call("tools/call", 12, {
+            "name": "kv_ttl", "arguments": {"key": "strdest"},
+        })
+        self.assertEqual(ttl["result"]["content"][0]["text"], "-1")
+        # A missing FROMMEMBER member is an error, not an empty
+        # store.
+        reply = self._call("tools/call", 13, {
+            "name": "kv_geosearchstore",
+            "arguments": {"destination": "x", "key": "sicily",
+                          "member": "Ghost", "radius": 200,
+                          "unit": "km"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertIn("could not decode requested zset member",
+                      reply["error"]["message"])
+        # A source key that is not a sorted set fails.
+        self._call("tools/call", 14, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 15, {
+            "name": "kv_geosearchstore",
+            "arguments": {"destination": "x", "key": "plain",
+                          "longitude": 15, "latitude": 37,
+                          "radius": 200, "unit": "km"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32000)
+        self.assertIn("WRONGTYPE", reply["error"]["message"])
+        # The destination may be the source key itself: a store
+        # that keeps only the members inside the shape drops the
+        # rest.
+        self.assertEqual(
+            self._geosearchstore_result(
+                {**base, "destination": "sicily", "radius": 100}), 1)
+        members = self._call("tools/call", 16, {
+            "name": "kv_zrange",
+            "arguments": {"key": "sicily", "start": 0, "stop": -1},
+        })
+        self.assertEqual(
+            json.loads(members["result"]["content"][0]["text"]),
+            ["Catania"])
+
+    def test_kv_geosearchstore_rejects_bad_arguments(self):
+        self._sicily()
+        base = {"destination": "near", "key": "sicily",
+                "longitude": 15, "latitude": 37,
+                "radius": 200, "unit": "km"}
+        bad = [
+            # No destination, or a bad one.
+            {"key": "sicily", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            {**base, "destination": 1},
+            # No key.
+            {"destination": "near", "longitude": 15,
+             "latitude": 37, "radius": 200, "unit": "km"},
+            # No centre.
+            {"destination": "near", "key": "sicily",
+             "radius": 200, "unit": "km"},
+            # Both centre forms.
+            {**base, "member": "Palermo"},
+            # Only half a FROMLONLAT centre.
+            {"destination": "near", "key": "sicily",
+             "longitude": 15, "radius": 200, "unit": "km"},
+            {"destination": "near", "key": "sicily",
+             "latitude": 37, "radius": 200, "unit": "km"},
+            # No shape.
+            {"destination": "near", "key": "sicily",
+             "longitude": 15, "latitude": 37},
+            # Both shapes.
+            {**base, "width": 100, "height": 100},
+            # Only half a box.
+            {"destination": "near", "key": "sicily",
+             "longitude": 15, "latitude": 37,
+             "width": 100, "unit": "km"},
+            # Bad unit, bad radius, bad box.
+            {**base, "unit": "parsec"},
+            {**base, "radius": -5},
+            {**base, "radius": "200"},
+            {**base, "radius": True},
+            {"destination": "near", "key": "sicily",
+             "longitude": 15, "latitude": 37,
+             "width": -100, "height": 100, "unit": "km"},
+            # Bad centre coordinates.
+            {**base, "longitude": 200},
+            {**base, "latitude": 90},
+            {**base, "longitude": "15"},
+            # Bad sort / count / any options.
+            {**base, "sort": "near"},
+            {**base, "count": -1},
+            {**base, "count": 1.5},
+            {**base, "count": "1"},
+            {**base, "count": True},
+            {**base, "count": 1001},
+            {**base, "any": True},
+            {**base, "any": "yes"},
+            # The WITH* options are for returning the hits, so
+            # they are rejected before anything is sent.
+            {**base, "withdist": True},
+            {**base, "withhash": True},
+            {**base, "withcoord": True},
+            # Bad storedist.
+            {**base, "storedist": "yes"},
+            {**base, "storedist": 1},
+            # Bad key / member types.
+            {"destination": "near", "key": 1,
+             "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            {"destination": "near", "key": "sicily", "member": 1,
+             "radius": 200, "unit": "km"},
+        ]
+        for args in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_geosearchstore", "arguments": args,
+            })
+            self.assertIn("error", reply, args)
+            self.assertEqual(reply["error"]["code"], -32602, args)
+
+    def test_kv_geosearchstore_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_geoadd", "key": "b1", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                {"op": "kv_geosearchstore", "destination": "b1-near",
+                 "key": "b1", "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "km"},
+                {"op": "kv_geosearchstore", "destination": "b1-dists",
+                 "key": "b1", "member": "Palermo",
+                 "radius": 200, "unit": "km", "storedist": True},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][1]["result"], 2)
+        self.assertEqual(summary["results"][2]["result"], 2)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b2", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                    "Catania": [15.087269, 37.502669],
+                }},
+                {"op": "kv_geosearchstore", "destination": "b2-box",
+                 "key": "b2", "longitude": 15, "latitude": 37,
+                 "width": 400, "height": 400, "unit": "km",
+                 "count": 1},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][1]["result"], 1)
+        # Bad search arguments fail an atomic batch up front,
+        # before anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_geoadd", "key": "b3", "members": {
+                    "Palermo": [13.361389, 38.115556],
+                }},
+                {"op": "kv_geosearchstore", "destination": "b3-near",
+                 "key": "b3", "longitude": 15, "latitude": 37,
+                 "radius": 200, "unit": "parsec"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "b3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
     def test_kv_georadius_rejects_bad_arguments(self):
         self._sicily()
         base = {"key": "sicily", "longitude": 15, "latitude": 37,
@@ -6303,6 +6618,13 @@ class McpTests(unittest.TestCase):
     def _geosearch_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_geosearch", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _geosearchstore_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_geosearchstore", "arguments": arguments,
         })
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
@@ -13168,6 +13490,271 @@ class McpTests(unittest.TestCase):
         self.assertIn(
             "op 15: kv_georadius 'cities' — read-only: no STORE or "
             "STOREDIST, nothing is written",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_geosearchstore(self):
+        self._call("tools/call", 1, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "cities", "members": {
+                "Palermo": [13.361389, 38.115556],
+                "Catania": [15.087269, 37.502669],
+            }},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_geoadd",
+            "arguments": {"key": "soon-cities", "members": {
+                "Palermo": [13.361389, 38.115556],
+            }},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-cities", "seconds": 3600},
+        })
+        self._call("tools/call", 4, {
+            "name": "kv_set", "arguments": {"key": "name", "value": "alice"},
+        })
+        self.fake.store["todo"] = (["buy milk", "ship it"], None)
+        self._call("tools/call", 5, {
+            "name": "kv_zadd",
+            "arguments": {"key": "dest",
+                          "members": {"a": 1, "b": 2}},
+        })
+        self._call("tools/call", 6, {
+            "name": "kv_zadd",
+            "arguments": {"key": "soon-dest",
+                          "members": {"a": 1, "b": 2}},
+        })
+        self._call("tools/call", 7, {
+            "name": "kv_expire",
+            "arguments": {"key": "soon-dest", "seconds": 3600},
+        })
+        self.fake.store["empty-dest"] = (ZSet(), None)
+        plan = [
+            # A new destination: caution, no expiry.
+            {"op": "kv_geosearchstore", "destination": "brand-new",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "brand-new-dist",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km", "storedist": True},
+            # Overwriting a destination that never expires: risky.
+            {"op": "kv_geosearchstore", "destination": "dest",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # Overwriting one that expires: caution, TTL cleared.
+            {"op": "kv_geosearchstore", "destination": "soon-dest",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # A string / list destination is overwritten whatever
+            # it held, not a WRONGTYPE.
+            {"op": "kv_geosearchstore", "destination": "name",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "todo",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # An empty destination: safe, nothing is discarded.
+            {"op": "kv_geosearchstore", "destination": "empty-dest",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # An empty result stores nothing: a missing destination
+            # stays missing (safe), an existing one is deleted.
+            {"op": "kv_geosearchstore", "destination": "brand-new",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 1, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "dest",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 1, "unit": "km"},
+            # A missing source stores nothing too.
+            {"op": "kv_geosearchstore", "destination": "brand-new",
+             "key": "ghost", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "dest",
+             "key": "ghost", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # A source that is not a sorted set fails.
+            {"op": "kv_geosearchstore", "destination": "brand-new",
+             "key": "name", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # The destination may be the source key itself: every
+            # member inside the shape survives.
+            {"op": "kv_geosearchstore", "destination": "cities",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            # A narrower shape drops the members outside it.
+            {"op": "kv_geosearchstore", "destination": "cities",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 100, "unit": "km"},
+            # STOREDIST into itself replaces the geohash scores
+            # with distances, so the key stops being a geo set.
+            {"op": "kv_geosearchstore", "destination": "cities",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km", "storedist": True},
+            # The FROMMEMBER form, and its missing centre member.
+            {"op": "kv_geosearchstore", "destination": "brand-new",
+             "key": "cities", "member": "Palermo",
+             "radius": 200, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "brand-new",
+             "key": "cities", "member": "Ghost",
+             "radius": 200, "unit": "km"},
+            # A box shape stores the same way.
+            {"op": "kv_geosearchstore", "destination": "brand-new-box",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "width": 400, "height": 400, "unit": "km"},
+            # Bad arguments are skipped, not audited.
+            {"op": "kv_geosearchstore",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "a",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km", "withdist": True},
+            {"op": "kv_geosearchstore", "destination": "a",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "km", "storedist": "yes"},
+            {"op": "kv_geosearchstore", "destination": "a",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": -5, "unit": "km"},
+            {"op": "kv_geosearchstore", "destination": "a",
+             "key": "cities", "longitude": 15, "latitude": 37,
+             "radius": 200, "unit": "parsec"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 23 op(s), 18 audited, 5 not audited.", text)
+        self.assertIn(
+            "op 18: kv_geosearchstore destination must be a string: "
+            "None",
+            text)
+        self.assertIn(
+            "op 19: kv_geosearchstore cannot be combined with "
+            "withdist, withhash or withcoord",
+            text)
+        self.assertIn(
+            "op 20: kv_geosearchstore storedist must be true or "
+            "false: 'yes'",
+            text)
+        self.assertIn(
+            "op 21: kv_geosearchstore radius must be 0 or more: -5",
+            text)
+        self.assertIn(
+            "op 22: kv_geosearchstore unit must be one of m, km, ft, "
+            "mi: 'parsec'",
+            text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_geosearchstore 'cities' — would discard the "
+            "destination 'dest', a zset of 2 elements that never "
+            "expires, replacing it with 2 member(s) with their "
+            "geohash scores",
+            risky,
+        )
+        self.assertIn(
+            "op 4: kv_geosearchstore 'cities' — would discard the "
+            "destination 'name', a string of 5 bytes that never "
+            "expires, replacing it with 2 member(s) with their "
+            "geohash scores",
+            risky,
+        )
+        self.assertIn(
+            "op 5: kv_geosearchstore 'cities' — would discard the "
+            "destination 'todo', a list of 2 elements that never "
+            "expires, replacing it with 2 member(s) with their "
+            "geohash scores",
+            risky,
+        )
+        self.assertIn(
+            "op 8: kv_geosearchstore 'cities' — stores nothing and "
+            "deletes the destination 'dest', a zset of 2 elements "
+            "that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 10: kv_geosearchstore 'ghost' — stores nothing and "
+            "deletes the destination 'dest', a zset of 2 elements "
+            "that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 11: kv_geosearchstore 'name' — would fail with "
+            "WRONGTYPE: the key is a string of 5 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 13: kv_geosearchstore 'cities' — drops 1 member(s) "
+            "outside the shape from a geo set of 2 elements that "
+            "never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_geosearchstore 'cities' — stores 2 member(s) "
+            "back into the source key itself with their distances "
+            "as scores, so it stops being a geo set",
+            risky,
+        )
+        self.assertIn(
+            "op 16: kv_geosearchstore 'cities' — would fail: "
+            "member 'Ghost' has no position in the geo set",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_geosearchstore 'brand-new' — creates a new "
+            "sorted set with no expiry holding 2 member(s) with "
+            "their geohash scores",
+            caution,
+        )
+        self.assertIn(
+            "op 1: kv_geosearchstore 'brand-new-dist' — creates a "
+            "new sorted set with no expiry holding 2 member(s) "
+            "with their distances in km as scores",
+            caution,
+        )
+        self.assertIn(
+            "op 3: kv_geosearchstore 'cities' — replaces the "
+            "destination 'soon-dest', a zset of 2 elements that "
+            "expires in ",
+            caution,
+        )
+        self.assertIn(
+            "with 2 member(s) with their geohash scores; its expiry "
+            "is cleared too",
+            caution,
+        )
+        self.assertIn(
+            "op 15: kv_geosearchstore 'brand-new' — creates a new "
+            "sorted set with no expiry holding 2 member(s) with "
+            "their geohash scores",
+            caution,
+        )
+        self.assertIn(
+            "op 17: kv_geosearchstore 'brand-new-box' — creates a "
+            "new sorted set with no expiry holding 2 member(s) "
+            "with their geohash scores",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 6: kv_geosearchstore 'empty-dest' — stores 2 "
+            "member(s) with their geohash scores into an empty "
+            "sorted set",
+            safe,
+        )
+        self.assertIn(
+            "op 7: kv_geosearchstore 'cities' — no-op: no member is "
+            "inside the shape and the destination 'brand-new' is "
+            "missing too",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_geosearchstore 'ghost' — no-op: the source key "
+            "does not exist and the destination 'brand-new' is "
+            "missing too",
+            safe,
+        )
+        self.assertIn(
+            "op 12: kv_geosearchstore 'cities' — stores its 2 "
+            "member(s) back into itself; every member is inside "
+            "the shape, so nothing is dropped",
             safe,
         )
 
