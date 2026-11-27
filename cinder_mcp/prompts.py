@@ -27,8 +27,11 @@ would fail on a non-integer or a container, LSETs on a missing key
 or with an index out of range, LSETs and LINSERTs on a container,
 HINCRBYs that would fail
 on a non-integer field or a container, HINCRBYFLOATs that would fail
-on a non-float field or a container, and EXPIREs with a bad timeout,
-then asks the model for a go/no-go per risky op. SETNX never
+on a non-float field or a container, GEORADIUSes and
+GEORADIUSBYMEMBERs that would store their hits at a destination —
+a plain GEORADIUS is a read, and GEOSEARCH is a read too — and
+EXPIREs with a bad timeout, then asks the model for a go/no-go
+per risky op. SETNX never
 writes to a key that already exists, so the audit reports it as a
 safe no-op there and a new key with no expiry elsewhere. ttl-renewal plans
 renewing the TTLs of keys that are expiring soon or have no expiry:
@@ -52,6 +55,7 @@ import math
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
+from .tools import MAX_GEOSEARCH_MEMBERS
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
 # The prompts process one batch at a time and keep only bounded
@@ -133,6 +137,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_pfadd", "kv_pfmerge",
     "kv_geoadd",
+    "kv_georadius", "kv_georadiusbymember",
     "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
 )
@@ -145,6 +150,7 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_zlexcount", "kv_zmscore", "kv_zunion",
                          "kv_zinter", "kv_zdiff", "kv_pfcount",
                          "kv_geodist", "kv_geopos", "kv_geohash",
+                         "kv_geosearch",
                          "kv_lindex", "kv_sscan")
 
 # A largest-string recommendation only fires when the biggest string
@@ -275,7 +281,12 @@ PROMPTS = [
             "that would discard a destination's registers or fail "
             "on a plain string or a container, GEOADDs that would "
             "fail on a key that is not a sorted set or move "
-            "members of a geo set, and EXPIREs with "
+            "members of a geo set, GEORADIUSes and "
+            "GEORADIUSBYMEMBERs that would store their hits at a "
+            "destination, overwriting it whatever it held, clearing "
+            "its TTL, or deleting it on an empty result — a plain "
+            "GEORADIUS is a read, and GEOSEARCH is a read too — "
+            "and EXPIREs with "
             "a bad timeout, and give a go/no-go per risky op."
         ),
         "arguments": [
@@ -1909,6 +1920,392 @@ def _audit_pfmerge(client, op):
     )
 
 
+def _geo_audit_coordinate(value, axis, tool):
+    """One GEORADIUS centre coordinate in a write plan: a finite
+    number in the GEOADD range, not a boolean."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "%s %s must be a number: %r" % (tool, axis, value))
+    if not math.isfinite(value):
+        raise ValueError(
+            "%s %s must be finite: %r" % (tool, axis, value))
+    low, high = (-180.0, 180.0) if axis == "longitude" \
+        else (-85.05112878, 85.05112878)
+    if value < low or value > high:
+        raise ValueError(
+            "%s %s must be between %s and %s: %r"
+            % (tool, axis, low, high, value))
+    return value
+
+
+def _geo_audit_number(value, name, tool):
+    """One GEORADIUS radius in a write plan: a finite number, 0 or
+    more, and not a boolean."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "%s %s must be a number: %r" % (tool, name, value))
+    if not math.isfinite(value):
+        raise ValueError(
+            "%s %s must be finite: %r" % (tool, name, value))
+    if value < 0:
+        raise ValueError(
+            "%s %s must be 0 or more: %r" % (tool, name, value))
+    return value
+
+
+def _geo_search_audit_options(op, tool):
+    """The sort / count / any / with* options of a geo search op
+    in a write plan, validated like the tool's own. Returns
+    (sort_desc, count, count_any, withdist, withhash, withcoord)."""
+    sort = op.get("sort", "asc")
+    if not isinstance(sort, str) or sort.lower() not in ("asc", "desc"):
+        raise ValueError(
+            "%s sort must be \"asc\" or \"desc\": %r" % (tool, sort))
+    count = op.get("count")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError(
+                "%s count must be an integer: %r" % (tool, count))
+        if count < 0:
+            raise ValueError(
+                "%s count must be 0 or more: %r" % (tool, count))
+        if count > MAX_GEOSEARCH_MEMBERS:
+            raise ValueError(
+                "%s returns at most %d members; narrow the count"
+                % (tool, MAX_GEOSEARCH_MEMBERS))
+    any_ = op.get("any", False)
+    if not isinstance(any_, bool):
+        raise ValueError(
+            "%s any must be true or false: %r" % (tool, any_))
+    if any_ and count is None:
+        raise ValueError("%s any needs a count" % tool)
+    flags = []
+    for flag in ("withdist", "withhash", "withcoord"):
+        value = op.get(flag, False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                "%s %s must be true or false: %r" % (tool, flag, value))
+        flags.append(value)
+    return (sort.lower() == "desc", count, any_,
+            flags[0], flags[1], flags[2])
+
+
+def _georadius_audit_args(op):
+    """The arguments of a kv_georadius / kv_georadiusbymember op
+    in a write plan, validated like the tool's own: a key, a
+    centre (longitude/latitude or a member name), a radius in a
+    unit, the shared search options, and at most one of store /
+    storedist. Returns (name, key, centre, radius, unit, options,
+    store) where centre is ("lonlat", lon, lat) or ("member",
+    name) and store is ("store", key), ("storedist", key) or
+    None. A bad argument raises ValueError, so the op is skipped
+    instead of being reported as a safe no-op."""
+    name = op.get("op")
+    tool = name
+    key = op.get("key")
+    if not isinstance(key, str):
+        raise ValueError("%s key must be a string: %r" % (tool, key))
+    if name == "kv_georadiusbymember":
+        member = op.get("member")
+        if not isinstance(member, str):
+            raise ValueError(
+                "%s member must be a string: %r" % (tool, member))
+        centre = ("member", member)
+    else:
+        lon = op.get("longitude")
+        lat = op.get("latitude")
+        if lon is None or lat is None:
+            raise ValueError(
+                "%s needs both longitude and latitude: %r"
+                % (tool, op))
+        centre = ("lonlat",
+                  _geo_audit_coordinate(lon, "longitude", tool),
+                  _geo_audit_coordinate(lat, "latitude", tool))
+    radius = op.get("radius")
+    if radius is None:
+        raise ValueError("%s needs a radius: %r" % (tool, op))
+    radius = _geo_audit_number(radius, "radius", tool)
+    unit = op.get("unit", "m")
+    if not isinstance(unit, str) \
+            or unit.lower() not in ("m", "km", "ft", "mi"):
+        raise ValueError(
+            "%s unit must be one of m, km, ft, mi: %r" % (tool, unit))
+    options = _geo_search_audit_options(op, tool)
+    _sort_desc, _count, _any, withdist, withhash, withcoord = options
+    store = op.get("store")
+    storedist = op.get("storedist")
+    if store is not None and storedist is not None:
+        raise ValueError(
+            "%s takes either store or storedist, not both" % tool)
+    dest = store if store is not None else storedist
+    if dest is None:
+        return name, key, centre, radius, unit.lower(), options, None
+    if not isinstance(dest, str):
+        raise ValueError(
+            "%s store must be a string: %r" % (tool, dest))
+    if withdist or withhash or withcoord:
+        raise ValueError(
+            "%s store cannot be combined with withdist, withhash "
+            "or withcoord" % tool)
+    return (name, key, centre, radius, unit.lower(), options,
+            ("store" if store is not None else "storedist", dest))
+
+
+def _georadius_audit_probe_argv(name, key, centre, radius, unit,
+                                options):
+    """The same search as the audited op, read-only: no STORE /
+    STOREDIST, and a COUNT one past the tool's cap so the reply
+    stays bounded however large the geo set is. The op's own
+    COUNT still applies when it is smaller — the probe stores the
+    same hits the op would."""
+    sort_desc, count, count_any, _wd, _wh, _wc = options
+    if name == "kv_georadiusbymember":
+        argv = ["GEORADIUSBYMEMBER", key, centre[1],
+                repr(radius), unit]
+    else:
+        argv = ["GEORADIUS", key, repr(centre[1]), repr(centre[2]),
+                repr(radius), unit]
+    argv.append("DESC" if sort_desc else "ASC")
+    bound = MAX_GEOSEARCH_MEMBERS + 1
+    if count is not None:
+        bound = min(count, bound)
+    argv += ["COUNT", bound]
+    if count_any:
+        argv.append("ANY")
+    return argv
+
+
+def _geo_hits_text(hits, exact):
+    """The hit count of a storing GEORADIUS for an audit line:
+    the exact count, or "at least 1001 members" when the probe
+    hit its bound."""
+    if exact:
+        return "%d member(s)" % hits
+    return "at least %d members" % (MAX_GEOSEARCH_MEMBERS + 1)
+
+
+def _audit_georadius_empty(client, name, key, dest, why):
+    """The verdicts when a storing GEORADIUS stores nothing — the
+    source key does not exist, or no member is inside the shape:
+    the destination is deleted when it exists, and nothing is
+    written otherwise. `why` names the cause."""
+    if client.command("EXISTS", dest) == 0:
+        return "safe", (
+            "%s %r — no-op: %s and the destination %r is missing "
+            "too" % (name, key, why, dest)
+        )
+    dest_ttl = client.command("TTL", dest)
+    if dest_ttl == -2:
+        return "safe", (
+            "%s %r — no-op: %s and the destination %r expired "
+            "while auditing" % (name, key, why, dest)
+        )
+    try:
+        kind, _sv, size, _sample = _inspect_key(client, dest)
+    except ValueError:
+        return "safe", (
+            "%s %r — no-op: %s and the destination %r expired "
+            "while auditing" % (name, key, why, dest)
+        )
+    if dest_ttl == -1:
+        return "risky", (
+            "%s %r — stores nothing and deletes the destination "
+            "%r, a %s of %s that never expires"
+            % (name, key, dest, kind, size)
+        )
+    return "caution", (
+        "%s %r — stores nothing and deletes the destination %r, "
+        "a %s of %s that %s"
+        % (name, key, dest, kind, size,
+           "expires in %s" % _format_ttl(dest_ttl))
+    )
+
+
+def _audit_georadius_self(name, key, source_ttl, size_value, size,
+                          hits, exact, store_kind):
+    """The verdicts when a storing GEORADIUS stores its hits back
+    into the source key itself: the search ran first, so the hits
+    are the members that survive — every member outside the shape
+    is dropped — and the key's TTL is cleared with the overwrite.
+    STOREDIST also replaces every member's geohash score with its
+    distance, so the key stops being a geo set at all."""
+    if store_kind == "storedist":
+        dropped = ""
+        if exact and hits < size_value:
+            dropped = ("; %d member(s) outside the shape are dropped "
+                       "too" % (size_value - hits))
+        return "risky", (
+            "%s %r — stores %s back into the source key itself "
+            "with their distances as scores, so it stops being a "
+            "geo set%s"
+            % (name, key, _geo_hits_text(hits, exact), dropped)
+        )
+    if exact and hits == size_value:
+        # Every member is inside the shape: the set is rewritten
+        # with the same members and the same scores.
+        if source_ttl == -1:
+            return "safe", (
+                "%s %r — stores its %s back into itself; every "
+                "member is inside the shape, so nothing is dropped"
+                % (name, key, _geo_hits_text(hits, exact))
+            )
+        return "caution", (
+            "%s %r — stores its %s back into itself; every member "
+            "is inside the shape, so nothing is dropped, but its "
+            "expiry (currently %s) is cleared"
+            % (name, key, _geo_hits_text(hits, exact),
+               _format_ttl(source_ttl))
+        )
+    if not exact:
+        if source_ttl == -1:
+            return "caution", (
+                "%s %r — stores %s back into itself; any member "
+                "outside the shape is dropped"
+                % (name, key, _geo_hits_text(hits, exact))
+            )
+        return "caution", (
+            "%s %r — stores %s back into itself; any member "
+            "outside the shape is dropped, and its expiry "
+            "(currently %s) is cleared"
+            % (name, key, _geo_hits_text(hits, exact),
+               _format_ttl(source_ttl))
+        )
+    if source_ttl == -1:
+        return "risky", (
+            "%s %r — drops %d member(s) outside the shape from a "
+            "geo set of %s that never expires"
+            % (name, key, size_value - hits, size)
+        )
+    return "caution", (
+        "%s %r — drops %d member(s) outside the shape from a geo "
+        "set of %s that %s; its expiry is cleared too"
+        % (name, key, size_value - hits, size,
+           "expires in %s" % _format_ttl(source_ttl))
+    )
+
+
+def _audit_georadius(client, op):
+    """Audit one kv_georadius / kv_georadiusbymember op: the source
+    key and, when the op stores its hits, the destination are
+    probed live. A plain search writes nothing, so it is safe. A
+    storing search runs its search read-only first (the same
+    centre and shape, without STORE) to count the hits, then
+    judges the destination: the hits overwrite it whatever it
+    held and clear its TTL, an empty result deletes it instead,
+    and the destination may be the source key itself. Cinder
+    checks the source first — a key that is not a sorted set
+    fails before the destination is touched — and a
+    GEORADIUSBYMEMBER centre member with no position fails too,
+    so the audit follows that order. Returns (verdict, line)."""
+    name, key, centre, radius, unit, options, store = \
+        _georadius_audit_args(op)
+    if store is None:
+        return "safe", (
+            "%s %r — read-only: no STORE or STOREDIST, nothing is "
+            "written" % (name, key)
+        )
+    store_kind, dest = store
+    if client.command("EXISTS", key) == 0:
+        return _audit_georadius_empty(
+            client, name, key, dest, "the source key does not exist")
+    source_ttl = client.command("TTL", key)
+    if source_ttl == -2:
+        return _audit_georadius_empty(
+            client, name, key, dest, "the source key does not exist")
+    try:
+        kind, size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        return _audit_georadius_empty(
+            client, name, key, dest, "the source key does not exist")
+    if kind != "zset":
+        return "risky", (
+            "%s %r — would fail with WRONGTYPE: the key is a %s of "
+            "%s" % (name, key, kind, size)
+        )
+    # The centre member of a GEORADIUSBYMEMBER needs a position: a
+    # member that is not in the set, or one whose score does not
+    # decode as a geohash, fails the call.
+    if centre[0] == "member":
+        pos = client.command("GEOPOS", key, centre[1])
+        if not pos or pos[0] is None:
+            return "risky", (
+                "%s %r — would fail: member %r has no position in "
+                "the geo set" % (name, key, centre[1])
+            )
+    # Count the hits with a read-only run of the same search. A
+    # probe failure is the op failing at runtime, so it is risky
+    # rather than a skipped op.
+    try:
+        probe = client.command(*_georadius_audit_probe_argv(
+            name, key, centre, radius, unit, options))
+    except RespError as exc:
+        return "risky", (
+            "%s %r — would fail: %s" % (name, key, exc))
+    hits = len(probe or [])
+    exact = hits <= MAX_GEOSEARCH_MEMBERS
+    if store_kind == "storedist":
+        score_text = "their distances in %s as scores" % unit
+    else:
+        score_text = "their geohash scores"
+    if hits == 0:
+        return _audit_georadius_empty(
+            client, name, key, dest, "no member is inside the shape")
+    if dest == key:
+        return _audit_georadius_self(
+            name, key, source_ttl, size_value, size, hits, exact,
+            store_kind)
+    if client.command("EXISTS", dest) == 0:
+        return "caution", (
+            "%s %r — creates a new sorted set with no expiry "
+            "holding %s with %s"
+            % (name, dest, _geo_hits_text(hits, exact), score_text)
+        )
+    dest_ttl = client.command("TTL", dest)
+    if dest_ttl == -2:
+        return "caution", (
+            "%s %r — creates a new sorted set with no expiry "
+            "holding %s with %s"
+            % (name, dest, _geo_hits_text(hits, exact), score_text)
+        )
+    try:
+        dkind, dsize_value, dsize, _ds = _inspect_key(client, dest)
+    except ValueError:
+        return "caution", (
+            "%s %r — creates a new sorted set with no expiry "
+            "holding %s with %s"
+            % (name, dest, _geo_hits_text(hits, exact), score_text)
+        )
+    if dkind == "zset" and dsize_value == 0:
+        # An empty destination: nothing is discarded, only its
+        # expiry is cleared.
+        if dest_ttl == -1:
+            return "safe", (
+                "%s %r — stores %s with %s into an empty sorted "
+                "set" % (name, dest, _geo_hits_text(hits, exact),
+                         score_text)
+            )
+        return "caution", (
+            "%s %r — stores %s with %s into an empty sorted set, "
+            "clearing its expiry (currently %s)"
+            % (name, dest, _geo_hits_text(hits, exact), score_text,
+               _format_ttl(dest_ttl))
+        )
+    if dest_ttl == -1:
+        return "risky", (
+            "%s %r — would discard the destination %r, a %s of %s "
+            "that never expires, replacing it with %s with %s"
+            % (name, key, dest, dkind, dsize,
+               _geo_hits_text(hits, exact), score_text)
+        )
+    return "caution", (
+        "%s %r — replaces the destination %r, a %s of %s that %s, "
+        "with %s with %s; its expiry is cleared too"
+        % (name, key, dest, dkind, dsize,
+           "expires in %s" % _format_ttl(dest_ttl),
+           _geo_hits_text(hits, exact), score_text)
+    )
+
+
 def _zremrangebyscore_audit_bounds(op):
     """The min/max bounds for a kv_zremrangebyscore op in a write
     plan, as RESP arguments, validated like the tool's own: numbers
@@ -2117,6 +2514,11 @@ def _audit_write_op(client, op):
         # PFMERGE writes a destination from several sources, so it
         # is audited on its own.
         return _audit_pfmerge(client, op)
+    if name in ("kv_georadius", "kv_georadiusbymember"):
+        # GEORADIUS writes a destination from a source search, so
+        # it is audited on its own — a plain search with no STORE
+        # / STOREDIST is a read, and _audit_georadius says so.
+        return _audit_georadius(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))

@@ -903,6 +903,75 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_geosearch",
+        "description": "Search a geo set for the members inside a circle or a box: GEOSEARCH key <FROMMEMBER member | FROMLONLAT longitude latitude> <BYRADIUS radius <m | km | ft | mi> | BYBOX width height <m | km | ft | mi>> [ASC | DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]. Takes `key` plus exactly one centre — `member` for FROMMEMBER, or `longitude` and `latitude` for FROMLONLAT — and exactly one shape — `radius` for BYRADIUS, or `width` and `height` for BYBOX — with `unit` (\"m\" by default, \"km\" / \"ft\" / \"mi\" in any case). `sort` is \"asc\" (nearest-first, the default) or \"desc\"; `count` limits the hits (at most 1000 returned), and `any: true` with a count takes the first N in (score, member) order without sorting. Returns the member names in distance order, or with `withdist` / `withhash` / `withcoord` one object per hit — {\"member\": ..., \"distance\": ..., \"hash\": ..., \"coord\": {\"longitude\": ..., \"latitude\": ...}} with only the requested fields, in that order: the distance is in the shape's unit with four decimals, the hash is the 52-bit geohash score as an integer, the coordinates are the centres of the members' geohash cells. A missing key answers an empty list. Fails with WRONGTYPE on a key holding anything but a sorted set, and when a FROMMEMBER member does not exist or has no position.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member": {"type": "string"},
+                "longitude": {"type": "number"},
+                "latitude": {"type": "number"},
+                "radius": {"type": "number"},
+                "width": {"type": "number"},
+                "height": {"type": "number"},
+                "unit": {"type": "string"},
+                "sort": {"type": "string"},
+                "count": {"type": "integer"},
+                "any": {"type": "boolean"},
+                "withdist": {"type": "boolean"},
+                "withhash": {"type": "boolean"},
+                "withcoord": {"type": "boolean"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_georadius",
+        "description": "Search a geo set for the members inside a circle around a point: GEORADIUS key longitude latitude radius <m | km | ft | mi> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE key | STOREDIST key]. Takes `key`, `longitude`, `latitude`, `radius`, and `unit` (\"m\" by default, \"km\" / \"ft\" / \"mi\" in any case). The same `sort` / `count` / `any` / `withdist` / `withhash` / `withcoord` options as kv_geosearch, returning the member names or the member objects. With `store`, the hits are stored at the destination as a sorted set with their geohash scores and the call returns the number stored; with `storedist`, they are stored with their distances in the radius unit as scores. Either overwrites the destination whatever it held and clears its TTL; an empty result deletes the destination instead; the destination may be the source key itself. `store` / `storedist` cannot be combined with the `with*` options. A missing key answers an empty list (or 0 stored). Fails with WRONGTYPE on a key holding anything but a sorted set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "longitude": {"type": "number"},
+                "latitude": {"type": "number"},
+                "radius": {"type": "number"},
+                "unit": {"type": "string"},
+                "sort": {"type": "string"},
+                "count": {"type": "integer"},
+                "any": {"type": "boolean"},
+                "withdist": {"type": "boolean"},
+                "withhash": {"type": "boolean"},
+                "withcoord": {"type": "boolean"},
+                "store": {"type": "string"},
+                "storedist": {"type": "string"},
+            },
+            "required": ["key", "longitude", "latitude", "radius"],
+        },
+    },
+    {
+        "name": "kv_georadiusbymember",
+        "description": "Search a geo set for the members inside a circle around one of its members: GEORADIUSBYMEMBER key member radius <m | km | ft | mi> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count [ANY]] [ASC | DESC] [STORE key | STOREDIST key]. Takes `key`, `member`, `radius`, and `unit` (\"m\" by default, \"km\" / \"ft\" / \"mi\" in any case). The same `sort` / `count` / `any` / `withdist` / `withhash` / `withcoord` options and the same `store` / `storedist` behaviour as kv_georadius: the hits are stored at the destination with their geohash scores or their distances, overwriting it whatever it held and clearing its TTL, an empty result deletes it, and the destination may be the source key itself. A missing key answers an empty list (or 0 stored). Fails with WRONGTYPE on a key holding anything but a sorted set, and when the centre member does not exist or has no position.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "member": {"type": "string"},
+                "radius": {"type": "number"},
+                "unit": {"type": "string"},
+                "sort": {"type": "string"},
+                "count": {"type": "integer"},
+                "any": {"type": "boolean"},
+                "withdist": {"type": "boolean"},
+                "withhash": {"type": "boolean"},
+                "withcoord": {"type": "boolean"},
+                "store": {"type": "string"},
+                "storedist": {"type": "string"},
+            },
+            "required": ["key", "member", "radius"],
+        },
+    },
+    {
         "name": "kv_lpush",
         "description": "Push elements onto the head of a list: LPUSH key element [element ...]. Takes `elements` as a list of strings. Returns the length of the list after the push; several elements at once are pushed left one at a time, so the last element ends up at the head. Creates the list when the key does not exist.",
         "inputSchema": {
@@ -1126,7 +1195,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_georadius, kv_georadiusbymember, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1264,6 +1333,7 @@ BATCHABLE_TOOLS = {
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
+    "kv_geosearch", "kv_georadius", "kv_georadiusbymember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1353,6 +1423,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_zrandmember", "kv_zscan", "kv_zunion", "kv_zinter", "kv_zdiff",
     "kv_pfadd", "kv_pfcount", "kv_pfmerge",
     "kv_geoadd", "kv_geodist", "kv_geopos", "kv_geohash",
+    "kv_geosearch", "kv_georadius", "kv_georadiusbymember",
     "kv_lpush", "kv_rpush", "kv_lrange", "kv_llen", "kv_lpop", "kv_rpop",
     "kv_lindex", "kv_lset", "kv_linsert",
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
@@ -1578,6 +1649,29 @@ def _call_batch_atomic(client, ops):
             # pairs (or nulls) inside the transaction; shape it
             # like the standalone tool does.
             value = _geopos_result(reply)
+        elif op_name in ("kv_geosearch", "kv_georadius",
+                         "kv_georadiusbymember"):
+            # A geo search came back as a member list — plain names
+            # or nested arrays with the WITH* fields — or as a
+            # stored count for a GEORADIUS with STORE / STOREDIST;
+            # shape it like the standalone tool does. A search
+            # wider than the cap is recorded as this op's error, in
+            # place, like an EXEC-time failure — the rest still run.
+            if op_name == "kv_geosearch":
+                options = _geosearch_args(op)[3]
+                store = None
+            else:
+                _k, _c, _r, _u, options, store = _georadius_args(
+                    op, op_name, op_name == "kv_georadiusbymember")
+            if store is not None:
+                value = reply
+            else:
+                try:
+                    value = _geosearch_result(reply, options, op_name)
+                except ValueError as exc:
+                    results.append(
+                        {"op": op_name, "ok": False, "error": str(exc)})
+                    continue
         elif op_name == "kv_zmscore":
             # ZMSCORE came back as a list of bulk score strings (or
             # nils) inside the transaction; shape it like the
@@ -2029,6 +2123,42 @@ def _op_argv(name, args):
         return ["GEOPOS", _require(args, "key")] + _geo_members_args(args, name)
     if name == "kv_geohash":
         return ["GEOHASH", _require(args, "key")] + _geo_members_args(args, name)
+    if name == "kv_geosearch":
+        key, centre, shape, options = _geosearch_args(args)
+        sort_desc, count, count_any, withdist, withhash, withcoord = options
+        cmd = ["GEOSEARCH", key]
+        if centre[0] == "member":
+            cmd += ["FROMMEMBER", centre[1]]
+        else:
+            cmd += ["FROMLONLAT", repr(centre[1]), repr(centre[2])]
+        if shape[0] == "radius":
+            cmd += ["BYRADIUS", repr(shape[1]), shape[2]]
+        else:
+            cmd += ["BYBOX", repr(shape[1]), repr(shape[2]), shape[3]]
+        cmd += _geo_search_option_argv(sort_desc, count, count_any,
+                                       withdist, withhash, withcoord)
+        return cmd
+    if name == "kv_georadius":
+        key, centre, radius, unit, options, store = _georadius_args(
+            args, name, False)
+        sort_desc, count, count_any, withdist, withhash, withcoord = options
+        _kind, lon, lat = centre
+        cmd = ["GEORADIUS", key, repr(lon), repr(lat), repr(radius), unit]
+        cmd += _geo_search_option_argv(sort_desc, count, count_any,
+                                       withdist, withhash, withcoord)
+        if store is not None:
+            cmd += [store[0].upper(), store[1]]
+        return cmd
+    if name == "kv_georadiusbymember":
+        key, centre, radius, unit, options, store = _georadius_args(
+            args, name, True)
+        sort_desc, count, count_any, withdist, withhash, withcoord = options
+        cmd = ["GEORADIUSBYMEMBER", key, centre[1], repr(radius), unit]
+        cmd += _geo_search_option_argv(sort_desc, count, count_any,
+                                       withdist, withhash, withcoord)
+        if store is not None:
+            cmd += [store[0].upper(), store[1]]
+        return cmd
     if name == "kv_sscan":
         key, pattern, batch_size, cursor = _hscan_args(args, "kv_sscan")
         return ["SSCAN", key, cursor or "0", "MATCH", pattern,
@@ -2857,6 +2987,68 @@ def _call_geohash(client, args):
     return list(client.command(*_op_argv("kv_geohash", args)) or [])
 
 
+def _geosearch_result(reply, options, tool):
+    """Shape a GEOSEARCH / GEORADIUS reply into the tool's return
+    value: member names in distance order, or one object per hit
+    when any WITH* option was given — {"member": ...} plus
+    "distance" (a number in the shape's unit), "hash" (the 52-bit
+    geohash score as an integer) and "coord" ({"longitude": ...,
+    "latitude": ...}) for the options requested, in that order.
+    Cinder answers the distance as a "%.4f" bulk string and the
+    coordinates as bulk strings, the hash as an integer. A search
+    wider than MAX_GEOSEARCH_MEMBERS fails instead of returning a
+    truncated list."""
+    _sort_desc, _count, _any, withdist, withhash, withcoord = options
+    hits = reply or []
+    if len(hits) > MAX_GEOSEARCH_MEMBERS:
+        raise ValueError(
+            "%s returns at most %d members; narrow the search or "
+            "add a count" % (tool, MAX_GEOSEARCH_MEMBERS))
+    if not (withdist or withhash or withcoord):
+        return list(hits)
+    shaped = []
+    for hit in hits:
+        # A hit is [member, distance?, hash?, [lon, lat]?] in that
+        # order — the distance, then the hash, then the
+        # coordinates, as in Redis.
+        item = {"member": hit[0]}
+        index = 1
+        if withdist:
+            item["distance"] = float(hit[index])
+            index += 1
+        if withhash:
+            item["hash"] = hit[index]
+            index += 1
+        if withcoord:
+            item["coord"] = {
+                "longitude": float(hit[index][0]),
+                "latitude": float(hit[index][1]),
+            }
+        shaped.append(item)
+    return shaped
+
+
+def _call_geosearch(client, args):
+    """kv_geosearch: the members inside the shape, nearest-first
+    by default, or one object per hit with the WITH* fields."""
+    options = _geosearch_args(args)[3]
+    return _geosearch_result(
+        client.command(*_op_argv("kv_geosearch", args)), options,
+        "kv_geosearch")
+
+
+def _call_georadius(client, args, name):
+    """kv_georadius / kv_georadiusbymember: the members inside the
+    circle, or the number stored when STORE / STOREDIST was given
+    (cinder answers an integer then, not a member list)."""
+    _key, _centre, _radius, _unit, options, store = _georadius_args(
+        args, name, name == "kv_georadiusbymember")
+    reply = client.command(*_op_argv(name, args))
+    if store is not None:
+        return reply
+    return _geosearch_result(reply, options, name)
+
+
 def _zmscore_result(reply):
     """Shape a ZMSCORE reply into the tool's return value: one score
     per member, in request order, as a number, or null for a member
@@ -3165,21 +3357,23 @@ GEO_UNITS = ("m", "km", "ft", "mi")
 MAX_GEO_MEMBERS = 1000
 
 
-def _geo_coordinate(value, name):
+def _geo_coordinate(value, name, tool="kv_geoadd"):
     """One GEOADD coordinate as a number: finite, in range, and not
     a boolean (True is an int in Python, but it is not a
     coordinate). Anything else fails the call instead of sending a
-    half-formed GEOADD."""
+    half-formed GEOADD. The same ranges bound the FROMLONLAT /
+    GEORADIUS centre coordinates, so the search tools pass their
+    own name for the error message."""
     low, high = (GEO_LON_MIN, GEO_LON_MAX) if name == "longitude" \
         else (GEO_LAT_MIN, GEO_LAT_MAX)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("kv_geoadd %s must be a number" % name)
+        raise ValueError("%s %s must be a number" % (tool, name))
     if not math.isfinite(value):
-        raise ValueError("kv_geoadd %s must be finite" % name)
+        raise ValueError("%s %s must be finite" % (tool, name))
     if value < low or value > high:
         raise ValueError(
-            "kv_geoadd %s must be between %s and %s, got %r"
-            % (name, low, high, value)
+            "%s %s must be between %s and %s, got %r"
+            % (tool, name, low, high, value)
         )
     return value
 
@@ -3253,6 +3447,199 @@ def _geo_members_args(args, name):
         if not isinstance(member, str):
             raise ValueError("%s members must be strings" % name)
     return list(members)
+
+
+# The most members one kv_geosearch / kv_georadius /
+# kv_georadiusbymember call returns; a wider search fails instead
+# of returning a truncated list, as the other range tools do.
+MAX_GEOSEARCH_MEMBERS = 1000
+
+
+def _geo_search_number(value, name, tool):
+    """One GEOSEARCH / GEORADIUS radius, width or height: a finite
+    number, 0 or more, and not a boolean. Cinder accepts 0 (an
+    empty shape) and rejects a negative one, so the tool does the
+    same instead of sending a half-formed search."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("%s %s must be a number" % (tool, name))
+    if not math.isfinite(value):
+        raise ValueError("%s %s must be finite" % (tool, name))
+    if value < 0:
+        raise ValueError(
+            "%s %s must be 0 or more, got %r" % (tool, name, value))
+    return value
+
+
+def _geo_search_unit(args, tool):
+    """The unit of a geo search shape: "m" by default, one of "m",
+    "km", "ft", "mi" in any case; anything else fails the call
+    instead of sending a half-formed search."""
+    unit = args.get("unit", "m")
+    if not isinstance(unit, str) or unit.lower() not in GEO_UNITS:
+        raise ValueError(
+            "%s unit must be one of %s, got %r"
+            % (tool, ", ".join(GEO_UNITS), unit)
+        )
+    return unit.lower()
+
+
+def _geo_search_options(args, tool):
+    """The options shared by the three geo search tools: sort,
+    count, any, withdist, withhash, withcoord. Returns (sort_desc,
+    count, count_any, withdist, withhash, withcoord). `sort`
+    defaults to "asc"; `count` is a non-negative integer at most
+    MAX_GEOSEARCH_MEMBERS, and `any` needs a count."""
+    sort = args.get("sort", "asc")
+    if not isinstance(sort, str) or sort.lower() not in ("asc", "desc"):
+        raise ValueError(
+            "%s sort must be \"asc\" or \"desc\", got %r" % (tool, sort))
+    count = args.get("count")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("%s count must be an integer" % tool)
+        if count < 0:
+            raise ValueError(
+                "%s count must be 0 or more, got %r" % (tool, count))
+        if count > MAX_GEOSEARCH_MEMBERS:
+            raise ValueError(
+                "%s returns at most %d members; narrow the count"
+                % (tool, MAX_GEOSEARCH_MEMBERS))
+    any_ = args.get("any", False)
+    if not isinstance(any_, bool):
+        raise ValueError("%s any must be true or false" % tool)
+    if any_ and count is None:
+        raise ValueError("%s any needs a count" % tool)
+    flags = []
+    for flag in ("withdist", "withhash", "withcoord"):
+        value = args.get(flag, False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                "%s %s must be true or false" % (tool, flag))
+        flags.append(value)
+    return (sort.lower() == "desc", count, any_,
+            flags[0], flags[1], flags[2])
+
+
+def _geo_search_option_argv(sort_desc, count, count_any,
+                            withdist, withhash, withcoord):
+    """The trailing options of a geo search command, in the order
+    cinder documents them: the sort, then COUNT [ANY], then the
+    WITH* flags."""
+    cmd = ["DESC" if sort_desc else "ASC"]
+    if count is not None:
+        cmd += ["COUNT", count]
+        if count_any:
+            cmd.append("ANY")
+    if withdist:
+        cmd.append("WITHDIST")
+    if withhash:
+        cmd.append("WITHHASH")
+    if withcoord:
+        cmd.append("WITHCOORD")
+    return cmd
+
+
+def _geosearch_args(args):
+    """Validate a kv_geosearch call: (key, centre, shape, options).
+    The centre is ("member", name) for FROMMEMBER or ("lonlat",
+    lon, lat) for FROMLONLAT; the shape is ("radius", radius,
+    unit) for BYRADIUS or ("box", width, height, unit) for BYBOX.
+    Exactly one centre and exactly one shape; anything else fails
+    the call instead of sending a half-formed GEOSEARCH."""
+    tool = "kv_geosearch"
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_geosearch key must be a string")
+    member = args.get("member")
+    has_lonlat = "longitude" in args or "latitude" in args
+    if member is not None and has_lonlat:
+        raise ValueError(
+            "kv_geosearch takes either member or longitude/latitude, "
+            "not both")
+    if member is None and not has_lonlat:
+        raise ValueError(
+            "kv_geosearch needs a centre: member or "
+            "longitude/latitude")
+    if member is not None:
+        if not isinstance(member, str):
+            raise ValueError("kv_geosearch member must be a string")
+        centre = ("member", member)
+    else:
+        if "longitude" not in args or "latitude" not in args:
+            raise ValueError(
+                "kv_geosearch needs both longitude and latitude")
+        centre = ("lonlat",
+                  _geo_coordinate(args["longitude"], "longitude", tool),
+                  _geo_coordinate(args["latitude"], "latitude", tool))
+    radius = args.get("radius")
+    has_box = "width" in args or "height" in args
+    if radius is not None and has_box:
+        raise ValueError(
+            "kv_geosearch takes either radius or width/height, "
+            "not both")
+    if radius is None and not has_box:
+        raise ValueError(
+            "kv_geosearch needs a shape: radius or width/height")
+    unit = _geo_search_unit(args, tool)
+    if radius is not None:
+        shape = ("radius",
+                 _geo_search_number(radius, "radius", tool), unit)
+    else:
+        if "width" not in args or "height" not in args:
+            raise ValueError(
+                "kv_geosearch needs both width and height")
+        shape = ("box",
+                 _geo_search_number(args["width"], "width", tool),
+                 _geo_search_number(args["height"], "height", tool),
+                 unit)
+    return key, centre, shape, _geo_search_options(args, tool)
+
+
+def _georadius_args(args, tool, by_member):
+    """Validate a kv_georadius / kv_georadiusbymember call: (key,
+    centre, radius, unit, options, store). The centre is
+    ("lonlat", lon, lat) for GEORADIUS and ("member", name) for
+    GEORADIUSBYMEMBER; store is ("store", key), ("storedist",
+    key) or None. The two store forms are mutually exclusive, and
+    neither combines with the WITH* options — cinder rejects that
+    combination, so the tool does too, before anything is sent."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("%s key must be a string" % tool)
+    if by_member:
+        member = _require(args, "member")
+        if not isinstance(member, str):
+            raise ValueError("%s member must be a string" % tool)
+        centre = ("member", member)
+    else:
+        if "longitude" not in args or "latitude" not in args:
+            raise ValueError(
+                "%s needs both longitude and latitude" % tool)
+        centre = ("lonlat",
+                  _geo_coordinate(args["longitude"], "longitude", tool),
+                  _geo_coordinate(args["latitude"], "latitude", tool))
+    if "radius" not in args:
+        raise ValueError("%s needs a radius" % tool)
+    radius = _geo_search_number(args["radius"], "radius", tool)
+    unit = _geo_search_unit(args, tool)
+    options = _geo_search_options(args, tool)
+    _sort_desc, _count, _any, withdist, withhash, withcoord = options
+    store = args.get("store")
+    storedist = args.get("storedist")
+    if store is not None and storedist is not None:
+        raise ValueError(
+            "%s takes either store or storedist, not both" % tool)
+    dest = store if store is not None else storedist
+    if dest is None:
+        return key, centre, radius, unit, options, None
+    if not isinstance(dest, str):
+        raise ValueError("%s store must be a string" % tool)
+    if withdist or withhash or withcoord:
+        raise ValueError(
+            "%s store cannot be combined with withdist, withhash "
+            "or withcoord" % tool)
+    return (key, centre, radius, unit, options,
+            ("store" if store is not None else "storedist", dest))
 
 
 def _call_zincrby(client, args):
@@ -3910,4 +4297,8 @@ def _call_single(client, name, args):
         return _call_geopos(client, args)
     if name == "kv_geohash":
         return _call_geohash(client, args)
+    if name == "kv_geosearch":
+        return _call_geosearch(client, args)
+    if name in ("kv_georadius", "kv_georadiusbymember"):
+        return _call_georadius(client, args, name)
     return client.command(*_op_argv(name, args))
