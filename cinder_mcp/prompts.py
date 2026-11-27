@@ -166,7 +166,7 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_geosearch", "kv_georadius_ro",
                          "kv_georadiusbymember_ro",
                          "kv_lindex", "kv_sscan",
-                         "kv_xrange", "kv_xlen", "kv_xread")
+                         "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread")
 
 # A largest-string recommendation only fires when the biggest string
 # is at least this many bytes, and a largest-container one when the

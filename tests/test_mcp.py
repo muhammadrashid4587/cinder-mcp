@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -3415,6 +3415,55 @@ class FakeCinder(threading.Thread):
                 for item in flat:
                     reply += self._bulk(item)
             return reply
+        elif name == "XREVRANGE":
+            # XREVRANGE key end start [COUNT count]: the entries
+            # whose IDs fall in [start, end] inclusive, each as
+            # [id, [field, value, ...]], newest first — the bounds
+            # are given end-first, as in real cinder.
+            if len(args) < 3:
+                return ("-ERR wrong number of arguments for 'xrevrange' "
+                        "command\r\n")
+            end = _stream_parse_bound(args[1], True)
+            start = _stream_parse_bound(args[2], False)
+            if start is None or end is None:
+                return ("-ERR Invalid stream ID specified as stream "
+                        "command argument\r\n")
+            count = -1
+            i = 3
+            while i < len(args):
+                if args[i].upper() != "COUNT":
+                    return "-ERR syntax error\r\n"
+                if i + 1 >= len(args):
+                    return ("-ERR wrong number of arguments for "
+                            "'xrevrange' command\r\n")
+                try:
+                    count = int(args[i + 1])
+                except ValueError:
+                    return "-ERR COUNT must be a positive integer\r\n"
+                if count < 0:
+                    return "-ERR COUNT must be a positive integer\r\n"
+                i += 2
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, Stream):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            out = []
+            if value is not None:
+                for ms, seq, pairs in reversed(value.entries):
+                    if (ms, seq) < start or (ms, seq) > end:
+                        continue
+                    if count >= 0 and len(out) >= count:
+                        break
+                    out.append((ms, seq, pairs))
+            reply = "*%d\r\n" % len(out)
+            for ms, seq, pairs in out:
+                reply += "*2\r\n"
+                reply += self._bulk("%d-%d" % (ms, seq))
+                flat = [item for pair in pairs for item in pair]
+                reply += "*%d\r\n" % len(flat)
+                for item in flat:
+                    reply += self._bulk(item)
+            return reply
         elif name == "XREAD":
             # XREAD [COUNT count] [BLOCK milliseconds] STREAMS key
             # [key ...] id [id ...], as in real cinder: the entries
@@ -3629,7 +3678,8 @@ class McpTests(unittest.TestCase):
                     "kv_hexpire", "kv_hpexpire", "kv_hexpireat",
                     "kv_hpexpireat", "kv_httl", "kv_hpttl",
                     "kv_hpersist",
-                    "kv_xadd", "kv_xrange", "kv_xlen", "kv_xread",
+                    "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen",
+                    "kv_xread",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -8652,6 +8702,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _xrevrange_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xrevrange", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def _xlen_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_xlen", "arguments": arguments,
@@ -8877,6 +8934,178 @@ class McpTests(unittest.TestCase):
         self.assertEqual(len(page), 1000)
         self.assertEqual(page[0]["id"], "1-0")
         self.assertEqual(page[-1]["id"], "1000-0")
+
+    def test_kv_xrevrange_reads_entries_newest_first(self):
+        # The same stream as the xrange test, read backwards:
+        # the full range comes back highest first.
+        for entry_id, fields in (
+                ("1000-0", {"name": "alice", "age": "30"}),
+                ("1000-1", {"name": "bob"}),
+                ("1000-2", {"name": "carol"}),
+                ("2000-0", {"name": "erin"})):
+            self.assertEqual(
+                self._xadd_result({"key": "rs", "id": entry_id,
+                                   "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            self._xrevrange_result({"key": "rs"}),
+            [{"id": "2000-0", "fields": {"name": "erin"}},
+             {"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}}])
+        # The bounds are given end-first, as in Redis: end then
+        # start, and the entries still come back highest first.
+        self.assertEqual(
+            self._xrevrange_result({"key": "rs", "end": "1000-2",
+                                    "start": "1000-1"}),
+            [{"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "1000-1", "fields": {"name": "bob"}}])
+        # A bare millisecond covers the whole millisecond, and
+        # COUNT takes the highest entries first.
+        self.assertEqual(
+            self._xrevrange_result({"key": "rs", "end": "1000",
+                                    "start": "1000"}),
+            [{"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}}])
+        self.assertEqual(
+            self._xrevrange_result({"key": "rs", "count": 2}),
+            [{"id": "2000-0", "fields": {"name": "erin"}},
+             {"id": "1000-2", "fields": {"name": "carol"}}])
+        self.assertEqual(
+            self._xrevrange_result({"key": "rs", "count": 0}), [])
+        # A missing key answers an empty list, and an end below
+        # the start does too.
+        self.assertEqual(self._xrevrange_result({"key": "ghost"}), [])
+        self.assertEqual(
+            self._xrevrange_result({"key": "rs", "end": "-",
+                                    "start": "+"}),
+            [])
+        # The reverse of kv_xrange is kv_xrange in reverse: the
+        # same range reads the same entries, opposite order.
+        self.assertEqual(
+            list(reversed(self._xrange_result({"key": "rs"}))),
+            self._xrevrange_result({"key": "rs"}))
+        # WRONGTYPE on a string key.
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        reply = self._call("tools/call", 2, {
+            "name": "kv_xrevrange", "arguments": {"key": "plain"},
+        })
+        self.assertIn("error", reply)
+        self.assertIn("WRONGTYPE", reply["error"]["message"])
+
+    def test_kv_xrevrange_rejects_bad_arguments(self):
+        self._xadd_result({"key": "s", "id": "1-0",
+                           "fields": {"f": "v"}})
+        for bad in ({"key": "s", "start": "abc"},
+                    {"key": "s", "end": "abc"},
+                    {"key": "s", "end": "7-"},
+                    {"key": "s", "start": "1-2-3"},
+                    {"key": "s", "end": "18446744073709551616"},
+                    {"key": "s", "start": 1000},
+                    {"key": "s", "count": -1},
+                    {"key": "s", "count": 1001},
+                    {"key": "s", "count": 1.5},
+                    {"key": "s", "count": True},
+                    {"key": 1},
+                    {}):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xrevrange",
+                "arguments": bad,
+            })
+            self.assertIn("error", reply, bad)
+            self.assertEqual(reply["error"]["code"], -32602, bad)
+
+    def test_kv_xrevrange_caps_at_1000_entries(self):
+        # Seed 1001 entries in batches of 100 ops per call.
+        ops = [{"op": "kv_xadd", "key": "bigrev", "id": "%d-0" % i,
+                "fields": {"v": str(i)}} for i in range(1, 1002)]
+        for start in range(0, len(ops), 100):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_batch",
+                "arguments": {"ops": ops[start:start + 100]},
+            })
+            summary = json.loads(reply["result"]["content"][0]["text"])
+            self.assertEqual(summary["ok"], len(ops[start:start + 100]))
+        self.assertEqual(self._xlen_result({"key": "bigrev"}), 1001)
+        # The whole range is wider than the cap, so it fails
+        # instead of returning a truncated list.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_xrevrange", "arguments": {"key": "bigrev"},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # A count at the cap returns exactly 1000 entries, the
+        # last 1000 in ID order — highest first.
+        page = self._xrevrange_result({"key": "bigrev", "count": 1000})
+        self.assertEqual(len(page), 1000)
+        self.assertEqual(page[0]["id"], "1001-0")
+        self.assertEqual(page[-1]["id"], "2-0")
+
+    def test_kv_xrevrange_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "rb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "rb1", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xrevrange", "key": "rb1"},
+                {"op": "kv_xrevrange", "key": "rb1", "count": 1},
+                {"op": "kv_xrevrange", "key": "ghost"},
+                {"op": "kv_xrevrange", "key": "rb1", "count": 1001},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], "1-0")
+        self.assertEqual(summary["results"][1]["result"], "2-0")
+        self.assertEqual(summary["results"][2]["result"], [
+            {"id": "2-0", "fields": {"v": "b"}},
+            {"id": "1-0", "fields": {"v": "a"}},
+        ])
+        self.assertEqual(summary["results"][3]["result"], [
+            {"id": "2-0", "fields": {"v": "b"}},
+        ])
+        self.assertEqual(summary["results"][4]["result"], [])
+        self.assertFalse(summary["results"][5]["ok"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "rb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xrevrange", "key": "rb2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], "5-0")
+        self.assertEqual(summary["results"][1]["result"], [
+            {"id": "5-0", "fields": {"v": "x"}},
+        ])
+        # A bad bound fails an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "rb3", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xrevrange", "key": "rb3", "end": "abc"},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "rb3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
 
     def test_kv_xlen_counts_entries_and_wrong_type(self):
         self.assertEqual(self._xlen_result({"key": "ghost"}), 0)
@@ -9253,9 +9482,10 @@ class McpTests(unittest.TestCase):
             {"op": "kv_xrange", "key": "ws:s"},
             {"op": "kv_xlen", "key": "ws:s"},
             {"op": "kv_xread", "streams": {"ws:s": "0-0"}},
+            {"op": "kv_xrevrange", "key": "ws:s"},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 10 op(s), 6 audited, 4 not audited.", text)
+        self.assertIn("Plan: 11 op(s), 6 audited, 5 not audited.", text)
         risky = text.split("Risky (")[1].split("\n\n")[0]
         self.assertIn(
             "op 2: kv_xadd 'ws:plain' — would fail with WRONGTYPE: "
@@ -9296,6 +9526,8 @@ class McpTests(unittest.TestCase):
             "op 8: kv_xlen is a read, not a write", text)
         self.assertIn(
             "op 9: kv_xread is a read, not a write", text)
+        self.assertIn(
+            "op 10: kv_xrevrange is a read, not a write", text)
 
     def _geoadd_result(self, arguments):
         reply = self._call("tools/call", 1, {
@@ -21416,6 +21648,100 @@ class LiveCinderMigrationTests(unittest.TestCase):
                       blocked["error"]["message"])
         self.assertEqual(
             self._tool("kv_exists", {"key": "stream:tx3"}), 0)
+
+    def test_live_xrevrange_reads_newest_first(self):
+        """kv_xrevrange against a real cinder (XREVRANGE shipped
+        in cinder 0.67.0): the full range newest first, end-first
+        bounds, a bare millisecond covering the whole millisecond,
+        COUNT taking the highest entries first, COUNT 0, a missing
+        key, an end below the start, WRONGTYPE on a string key, the
+        tool queueing in one MULTI/EXEC transaction, and the
+        write-safety audit classifying it as a read."""
+        for entry_id, fields in (
+                ("1000-0", {"name": "alice", "age": "30"}),
+                ("1000-1", {"name": "bob"}),
+                ("1000-2", {"name": "carol"}),
+                ("2000-0", {"name": "erin"})):
+            self.assertEqual(
+                self._tool("kv_xadd", {"key": "stream:rev",
+                                       "id": entry_id,
+                                       "fields": fields}),
+                entry_id)
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:rev"}),
+            [{"id": "2000-0", "fields": {"name": "erin"}},
+             {"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}}])
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:rev",
+                                        "end": "1000-2",
+                                        "start": "1000-1"}),
+            [{"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "1000-1", "fields": {"name": "bob"}}])
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:rev",
+                                        "end": "1000",
+                                        "start": "1000"}),
+            [{"id": "1000-2", "fields": {"name": "carol"}},
+             {"id": "1000-1", "fields": {"name": "bob"}},
+             {"id": "1000-0",
+              "fields": {"age": "30", "name": "alice"}}])
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:rev",
+                                        "count": 2}),
+            [{"id": "2000-0", "fields": {"name": "erin"}},
+             {"id": "1000-2", "fields": {"name": "carol"}}])
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:rev",
+                                        "count": 0}),
+            [])
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:ghost"}), [])
+        self.assertEqual(
+            self._tool("kv_xrevrange", {"key": "stream:rev",
+                                        "end": "-", "start": "+"}),
+            [])
+        # The reverse of kv_xrange is kv_xrange in reverse.
+        self.assertEqual(
+            list(reversed(
+                self._tool("kv_xrange", {"key": "stream:rev"}))),
+            self._tool("kv_xrevrange", {"key": "stream:rev"}))
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "stream:plain2", "value": "v"}),
+            "OK")
+        for name, arguments in (
+                ("kv_xrevrange", {"key": "stream:plain2"}),
+                ("kv_xrevrange", {"key": "stream:rev", "end": "abc"}),
+                ("kv_xrevrange", {"key": "stream:rev", "count": -1}),
+                ("kv_xrevrange", {"key": "stream:rev",
+                                  "count": 1001})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+        # The tool queues in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_xadd", "key": "stream:revtx", "id": "5-0",
+             "fields": {"v": "x"}},
+            {"op": "kv_xrevrange", "key": "stream:revtx"},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], "5-0")
+        self.assertEqual(summary["results"][1]["result"], [
+            {"id": "5-0", "fields": {"v": "x"}},
+        ])
+        # The write-safety audit classifies it as a read.
+        text = self._call("prompts/get", 98, {
+            "name": "write-safety",
+            "arguments": {"plan": json.dumps([
+                {"op": "kv_xrevrange", "key": "stream:rev"},
+            ])},
+        })["result"]["messages"][0]["content"]["text"]
+        self.assertIn("op 0: kv_xrevrange is a read, not a write", text)
 
 
 if __name__ == "__main__":

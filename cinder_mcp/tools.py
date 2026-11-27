@@ -636,6 +636,20 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_xrevrange",
+        "description": "Entries of a stream in an ID range, newest first: XREVRANGE key end start [COUNT count]. Takes `end` and `start` as stream IDs (\"+\" for the last entry, \"-\" for the first, a bare millisecond for the whole millisecond, or \"ms-seq\"), defaulting to \"+\" and \"-\" — the bounds are given end-first, as in Redis, and the entries come back in reverse ID order, the bounds inclusive. Pass `count` to take at most that many entries, highest first (0 answers an empty list); without a count at most 1000 entries are returned, and a wider range fails instead of returning a truncated list. A missing key answers an empty list, and an end below the start does too. A field named twice in one entry keeps only its last value in the object.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "end": {"type": "string"},
+                "start": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
         "name": "kv_xlen",
         "description": "The number of entries in a stream: XLEN key. Returns 0 when the key does not exist.",
         "inputSchema": {
@@ -1475,7 +1489,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xlen, kv_xread, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1608,7 +1622,7 @@ BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
-    "kv_xadd", "kv_xrange", "kv_xlen", "kv_xread",
+    "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1705,7 +1719,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
-    "kv_xadd", "kv_xrange", "kv_xlen", "kv_xread",
+    "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1933,6 +1947,22 @@ def _call_batch_atomic(client, ops):
                 results.append(
                     {"op": op_name, "ok": False,
                      "error": "kv_xrange returns at most %d entries; "
+                              "narrow the range or pass a count"
+                              % MAX_XRANGE_ENTRIES})
+                continue
+            value = entries
+        elif op_name == "kv_xrevrange":
+            # XREVRANGE came back as [[id, [field, value, ...]],
+            # ...] inside the transaction, highest first; shape it
+            # like the standalone tool does, into id/fields
+            # objects. A range wider than the cap is recorded as
+            # this op's error, in place, like an EXEC-time failure
+            # — the rest still run.
+            entries = _xrange_result(reply or [])
+            if len(entries) > MAX_XRANGE_ENTRIES:
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_xrevrange returns at most %d entries; "
                               "narrow the range or pass a count"
                               % MAX_XRANGE_ENTRIES})
                 continue
@@ -2425,6 +2455,15 @@ def _op_argv(name, args):
         # extra entry proves the range is too wide.
         key, start, end, count = _xrange_args(args)
         return ["XRANGE", key, start, end, "COUNT",
+                count if count is not None else MAX_XRANGE_ENTRIES + 1]
+    if name == "kv_xrevrange":
+        # XREVRANGE key end start [COUNT count] — the bounds are
+        # given end-first, as in Redis, and COUNT is always sent,
+        # so the reply stays bounded even when the caller did not
+        # ask for a count: one past the cap, and the extra entry
+        # proves the range is too wide.
+        key, end, start, count = _xrevrange_args(args)
+        return ["XREVRANGE", key, end, start, "COUNT",
                 count if count is not None else MAX_XRANGE_ENTRIES + 1]
     if name == "kv_xlen":
         return ["XLEN", _require(args, "key")]
@@ -3485,6 +3524,46 @@ def _xrange_result(reply):
             "fields": {flat[i]: flat[i + 1]
                        for i in range(0, len(flat), 2)},
         })
+    return entries
+
+
+def _xrevrange_args(args):
+    """Validate a kv_xrevrange call: (key, end, start, count). The
+    bounds default to "+" and "-" — given end-first, as in Redis,
+    so the defaults read the whole stream newest-first. `count`
+    must be an integer between 0 and MAX_XRANGE_ENTRIES when given
+    — 0 answers an empty list, as in cinder. The bounds validate
+    with the same rules as kv_xrange's, so a malformed bound fails
+    here as invalid params instead of as a server error."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xrevrange key must be a string")
+    end = _stream_bound(args.get("end", "+"), "kv_xrevrange")
+    start = _stream_bound(args.get("start", "-"), "kv_xrevrange")
+    count = args.get("count")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("kv_xrevrange count must be an integer")
+        if count < 0 or count > MAX_XRANGE_ENTRIES:
+            raise ValueError(
+                "kv_xrevrange count must be between 0 and %d, got %d"
+                % (MAX_XRANGE_ENTRIES, count)
+            )
+    return key, end, start, count
+
+
+def _call_xrevrange(client, args):
+    """kv_xrevrange: the entries in [start, end], newest first,
+    shaped into id/fields objects. At most MAX_XRANGE_ENTRIES
+    entries per call; a wider range fails instead of returning a
+    truncated list."""
+    reply = client.command(*_op_argv("kv_xrevrange", args))
+    entries = _xrange_result(reply or [])
+    if len(entries) > MAX_XRANGE_ENTRIES:
+        raise ValueError(
+            "kv_xrevrange returns at most %d entries; narrow the range "
+            "or pass a count" % MAX_XRANGE_ENTRIES
+        )
     return entries
 
 
@@ -5337,6 +5416,8 @@ def _call_single(client, name, args):
         return _call_hincrbyfloat(client, args)
     if name == "kv_xrange":
         return _call_xrange(client, args)
+    if name == "kv_xrevrange":
+        return _call_xrevrange(client, args)
     if name == "kv_xread":
         return _call_xread(client, args)
     if name == "kv_smembers":
