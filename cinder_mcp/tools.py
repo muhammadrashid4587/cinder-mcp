@@ -645,6 +645,19 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_xread",
+        "description": "Entries added to several streams after given IDs: XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]. Takes `streams` as an object mapping stream keys to IDs (\"$\" for the top ID at read time, so only entries added after the read qualify, \"-\" for every entry, a bare millisecond for the entries after that whole millisecond, or \"ms-seq\"), and returns one {\"key\": ..., \"entries\": [{\"id\": ..., \"fields\": {...}}]} object per stream that has anything new, in stream order — streams with nothing new are left out, and a read with nothing new at all answers an empty list. Pass `count` for at most that many entries per stream (1 to 1000); without a count at most 1000 entries per stream are returned, and a wider stream fails instead of returning a truncated list. Pass `block` to wait up to that many milliseconds for new entries instead of answering at once (1 to 4000: BLOCK 0 would wait forever, and the socket to cinder times out after 5 seconds, so a longer block would die as a connection error instead of a clean timeout); a block that times out answers an empty list. \">\" is not an ID: it needs XREADGROUP, which cinder does not have.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "streams": {"type": "object"},
+                "count": {"type": "integer"},
+                "block": {"type": "integer"},
+            },
+            "required": ["streams"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -1462,7 +1475,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xlen, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xlen, kv_xread, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1505,6 +1518,8 @@ TOOLS = [
                             "operation": {"type": "string"},
                             "sources": {"type": "array", "items": {"type": "string"}},
                             "count": {"type": "integer"},
+                            "streams": {"type": "object"},
+                            "block": {"type": "integer"},
                             "withscores": {"type": "boolean"},
                             "weights": {"type": "array",
                                         "items": {"type": "number"}},
@@ -1593,7 +1608,7 @@ BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
-    "kv_xadd", "kv_xrange", "kv_xlen",
+    "kv_xadd", "kv_xrange", "kv_xlen", "kv_xread",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1690,7 +1705,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
     "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
     "kv_httl", "kv_hpttl", "kv_hpersist",
-    "kv_xadd", "kv_xrange", "kv_xlen",
+    "kv_xadd", "kv_xrange", "kv_xlen", "kv_xread",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1922,6 +1937,25 @@ def _call_batch_atomic(client, ops):
                               % MAX_XRANGE_ENTRIES})
                 continue
             value = entries
+        elif op_name == "kv_xread":
+            # XREAD came back as [[key, [[id, [field, value,
+            # ...]], ...]], ...] inside the transaction; shape it
+            # like the standalone tool does, into per-stream
+            # key/entries objects. A BLOCK never reaches EXEC:
+            # cinder refuses to queue it, so the whole call fails
+            # up front instead. A stream wider than the cap is
+            # recorded as this op's error, in place, like an
+            # EXEC-time failure — the rest still run.
+            streams = _xread_result(reply)
+            if any(len(s["entries"]) > MAX_XRANGE_ENTRIES
+                   for s in streams):
+                results.append(
+                    {"op": op_name, "ok": False,
+                     "error": "kv_xread returns at most %d entries "
+                              "per stream; narrow the read or pass a "
+                              "count" % MAX_XRANGE_ENTRIES})
+                continue
+            value = streams
         elif op_name in ("kv_zpopmin", "kv_zpopmax"):
             # ZPOPMIN/ZPOPMAX came back as a flat list inside the
             # transaction; shape it like the standalone tool does,
@@ -2394,6 +2428,20 @@ def _op_argv(name, args):
                 count if count is not None else MAX_XRANGE_ENTRIES + 1]
     if name == "kv_xlen":
         return ["XLEN", _require(args, "key")]
+    if name == "kv_xread":
+        # XREAD [COUNT count] [BLOCK milliseconds] STREAMS key ...
+        # id ... — COUNT is always sent, so the reply stays bounded
+        # even when the caller did not ask for a count: one past
+        # the cap, and the extra entry proves the stream is too
+        # wide. BLOCK is sent as given: cinder refuses it inside
+        # MULTI at queue time, so an atomic batch carrying one
+        # fails the whole call before anything runs.
+        keys, ids, count, block = _xread_args(args)
+        cmd = ["XREAD", "COUNT",
+               count if count is not None else MAX_XRANGE_ENTRIES + 1]
+        if block is not None:
+            cmd += ["BLOCK", block]
+        return cmd + ["STREAMS"] + keys + ids
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -3452,6 +3500,117 @@ def _call_xrange(client, args):
             "or pass a count" % MAX_XRANGE_ENTRIES
         )
     return entries
+
+
+# The most streams one kv_xread call reads; each stream can return
+# up to MAX_XRANGE_ENTRIES entries, so the bound keeps one call
+# from asking for an unbounded slice of the keyspace.
+MAX_XREAD_STREAMS = 100
+
+# The longest a kv_xread BLOCK may wait, in milliseconds. BLOCK 0
+# waits forever, which has no place in a one-shot tool call, and
+# the socket to cinder times out after 5 seconds — a longer block
+# would die as a connection error instead of a clean timeout.
+MAX_XREAD_BLOCK_MS = 4000
+
+
+def _stream_xread_id(value, tool="kv_xread"):
+    """One XREAD stream ID: "$" (the stream's top ID at read time,
+    resolved once, so only entries added after the read qualify),
+    "-" (after 0-0: every entry), "+" (after the last ID:
+    nothing), a bare millisecond (the whole millisecond: entries
+    after ms-0), or "ms-seq". ">" needs XREADGROUP, which cinder
+    does not have, so it fails here as invalid params instead of
+    as a server error. The ID is returned verbatim for the argv."""
+    if not isinstance(value, str):
+        raise ValueError("%s id must be a string" % tool)
+    if value == "$":
+        return value
+    if value == ">":
+        raise ValueError(
+            "%s id \">\" needs XREADGROUP, which cinder does not have"
+            % tool
+        )
+    return _stream_bound(value, tool)
+
+
+def _xread_args(args):
+    """Validate a kv_xread call: (keys, ids, count, block).
+    `streams` must be a non-empty object mapping stream keys to
+    IDs, at most MAX_XREAD_STREAMS, sent in sorted key order so
+    the argv is deterministic. `count` is the entries per stream,
+    1..MAX_XRANGE_ENTRIES when given — 0 is not sent, since
+    cinder needs a positive COUNT for XREAD (unlike XRANGE).
+    `block` is the milliseconds to wait for new entries,
+    1..MAX_XREAD_BLOCK_MS when given — 0 would wait forever."""
+    streams = args.get("streams")
+    if not isinstance(streams, dict) or not streams:
+        raise ValueError("kv_xread streams must be a non-empty object")
+    if len(streams) > MAX_XREAD_STREAMS:
+        raise ValueError(
+            "kv_xread reads at most %d streams; narrow the list"
+            % MAX_XREAD_STREAMS
+        )
+    keys = []
+    for key in streams:
+        if not isinstance(key, str):
+            raise ValueError(
+                "kv_xread streams must map string stream names to IDs"
+            )
+        keys.append(key)
+    keys.sort()
+    ids = [_stream_xread_id(streams[key]) for key in keys]
+    count = args.get("count")
+    if count is not None:
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError("kv_xread count must be an integer")
+        if count < 1 or count > MAX_XRANGE_ENTRIES:
+            raise ValueError(
+                "kv_xread count must be between 1 and %d, got %d"
+                % (MAX_XRANGE_ENTRIES, count)
+            )
+    block = args.get("block")
+    if block is not None:
+        if isinstance(block, bool) or not isinstance(block, int):
+            raise ValueError("kv_xread block must be an integer")
+        if block < 1 or block > MAX_XREAD_BLOCK_MS:
+            raise ValueError(
+                "kv_xread block must be between 1 and %d "
+                "milliseconds, got %d" % (MAX_XREAD_BLOCK_MS, block)
+            )
+    return keys, ids, count, block
+
+
+def _xread_result(reply):
+    """Shape a flat XREAD reply [[key, [[id, [field, value,
+    ...]], ...]], ...] into [{"key": ..., "entries": [{"id": ...,
+    "fields": {...}}, ...]}, ...], in cinder's order — streams
+    with nothing new are left out. A nil reply (a BLOCK that
+    timed out) becomes [], as does an empty array."""
+    streams = []
+    for key, entries in reply or []:
+        streams.append({
+            "key": key,
+            "entries": _xrange_result(entries),
+        })
+    return streams
+
+
+def _call_xread(client, args):
+    """kv_xread: the entries after each stream's ID, shaped into
+    per-stream key/entries objects. At most MAX_XRANGE_ENTRIES
+    entries per stream; a wider stream fails instead of returning
+    a truncated list."""
+    reply = client.command(*_op_argv("kv_xread", args))
+    streams = _xread_result(reply)
+    for stream in streams:
+        if len(stream["entries"]) > MAX_XRANGE_ENTRIES:
+            raise ValueError(
+                "kv_xread returns at most %d entries per stream; "
+                "narrow the read or pass a count"
+                % MAX_XRANGE_ENTRIES
+            )
+    return streams
 
 
 # The most members one kv_zrange call returns; a wider range fails
@@ -5178,6 +5337,8 @@ def _call_single(client, name, args):
         return _call_hincrbyfloat(client, args)
     if name == "kv_xrange":
         return _call_xrange(client, args)
+    if name == "kv_xread":
+        return _call_xread(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":

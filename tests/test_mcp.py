@@ -160,6 +160,18 @@ def _stream_parse_bound(text, is_end):
     return ms, seq
 
 
+def _xread_has_block(args):
+    """Whether an XREAD argv carries a BLOCK option (scanned only
+    up to STREAMS, so a key literally named BLOCK is not mistaken
+    for one), as cinder's xread_has_block does."""
+    for arg in args[1:]:
+        if arg.upper() == "STREAMS":
+            return False
+        if arg.upper() == "BLOCK":
+            return True
+    return False
+
+
 # The 52-bit geohash Redis stores as a sorted-set score: 26
 # latitude bits and 26 longitude bits interleaved, latitude in the
 # even bit positions, longitude in the odd ones — the same layout
@@ -545,8 +557,16 @@ class FakeCinder(threading.Thread):
                         )
                         self._reply(conn, out)
                 elif in_multi:
-                    queue.append(cmd)
-                    self._reply(conn, "+QUEUED\r\n")
+                    if name == "XREAD" and _xread_has_block(cmd):
+                        # Cinder refuses a BLOCK inside MULTI at
+                        # queue time: there is no client to park at
+                        # EXEC time.
+                        self._reply(
+                            conn,
+                            "-ERR BLOCK is not allowed in MULTI/EXEC\r\n")
+                    else:
+                        queue.append(cmd)
+                        self._reply(conn, "+QUEUED\r\n")
                 else:
                     self._reply(conn, self._dispatch(cmd))
         finally:
@@ -3395,6 +3415,105 @@ class FakeCinder(threading.Thread):
                 for item in flat:
                     reply += self._bulk(item)
             return reply
+        elif name == "XREAD":
+            # XREAD [COUNT count] [BLOCK milliseconds] STREAMS key
+            # [key ...] id [id ...], as in real cinder: the entries
+            # after each ID, one [key, [[id, [field, value, ...]],
+            # ...]] element per stream that has any. "$" resolves
+            # once to the stream's top ID; ">" needs XREADGROUP,
+            # which does not exist. With BLOCK and nothing new, the
+            # fake answers the timeout outcome — a nil array — at
+            # once instead of parking for real; with data already
+            # present it answers at once, as cinder does.
+            count = -1
+            block = -1
+            i = 0
+            seen_count = False
+            seen_block = False
+            while i < len(args) and args[i].upper() != "STREAMS":
+                opt = args[i].upper()
+                if opt == "COUNT":
+                    if seen_count or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        count = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR COUNT must be a positive "
+                                "integer\r\n")
+                    if count < 1:
+                        return ("-ERR COUNT must be a positive "
+                                "integer\r\n")
+                    seen_count = True
+                    i += 2
+                elif opt == "BLOCK":
+                    if seen_block or i + 1 >= len(args):
+                        return "-ERR syntax error\r\n"
+                    try:
+                        block = int(args[i + 1])
+                    except ValueError:
+                        return ("-ERR BLOCK must be a non-negative "
+                                "integer\r\n")
+                    if block < 0:
+                        return ("-ERR BLOCK must be a non-negative "
+                                "integer\r\n")
+                    seen_block = True
+                    i += 2
+                else:
+                    return "-ERR syntax error\r\n"
+            if i >= len(args):
+                return ("-ERR wrong number of arguments for 'xread' "
+                        "command\r\n")
+            i += 1
+            rest = args[i:]
+            if len(rest) < 2 or len(rest) % 2 != 0:
+                return ("-ERR Unbalanced XREAD list of streams: for "
+                        "each stream key an ID or '$' must be "
+                        "specified.\r\n")
+            n = len(rest) // 2
+            keys = rest[:n]
+            ids = rest[n:]
+            out = []
+            for key, id_text in zip(keys, ids):
+                if id_text == ">":
+                    return ("-ERR The > ID can be specified only when "
+                            "calling XREADGROUP\r\n")
+                value = self._get(key)
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key holding "
+                            "the wrong kind of value\r\n")
+                if id_text == "$":
+                    bound = ((value.top_ms, value.top_seq)
+                             if value is not None else (0, 0))
+                else:
+                    bound = _stream_parse_bound(id_text, False)
+                    if bound is None:
+                        return ("-ERR Invalid stream ID specified as "
+                                "stream command argument\r\n")
+                entries = []
+                if value is not None:
+                    for ms, seq, pairs in value.entries:
+                        if (ms, seq) <= bound:
+                            continue
+                        if count >= 0 and len(entries) >= count:
+                            break
+                        entries.append((ms, seq, pairs))
+                if entries:
+                    out.append((key, entries))
+            if not out and block >= 0:
+                return "$-1\r\n"
+            reply = "*%d\r\n" % len(out)
+            for key, entries in out:
+                reply += "*2\r\n"
+                reply += self._bulk(key)
+                reply += "*%d\r\n" % len(entries)
+                for ms, seq, pairs in entries:
+                    reply += "*2\r\n"
+                    reply += self._bulk("%d-%d" % (ms, seq))
+                    flat = [item for pair in pairs for item in pair]
+                    reply += "*%d\r\n" % len(flat)
+                    for item in flat:
+                        reply += self._bulk(item)
+            return reply
         elif name == "XLEN" and len(args) == 1:
             value = self._get(args[0])
             if value is not None and not isinstance(value, Stream):
@@ -3510,7 +3629,7 @@ class McpTests(unittest.TestCase):
                     "kv_hexpire", "kv_hpexpire", "kv_hexpireat",
                     "kv_hpexpireat", "kv_httl", "kv_hpttl",
                     "kv_hpersist",
-                    "kv_xadd", "kv_xrange", "kv_xlen",
+                    "kv_xadd", "kv_xrange", "kv_xlen", "kv_xread",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -8540,6 +8659,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _xread_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xread", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def test_kv_xadd_returns_ids_and_xrange_reads_entries(self):
         # Explicit IDs, then a partial ID in the same millisecond,
         # then an auto ID: the IDs sort in insertion order.
@@ -8855,6 +8981,229 @@ class McpTests(unittest.TestCase):
         self.assertIn("WRONGTYPE", summary["results"][0]["error"])
         self.assertEqual(summary["results"][1]["result"], 1)
 
+    def test_kv_xread_reads_several_streams_after_ids(self):
+        # Two streams, several entries each: a read from 0-0
+        # returns both, in stream order, with the entries in ID
+        # order.
+        for key, entries in (
+                ("r1", [("1000-0", {"name": "alice"}),
+                        ("1000-1", {"name": "bob"}),
+                        ("2000-0", {"name": "carol"})]),
+                ("r2", [("500-0", {"v": "x"}),
+                        ("500-1", {"v": "y"})])):
+            for entry_id, fields in entries:
+                self.assertEqual(
+                    self._xadd_result({"key": key, "id": entry_id,
+                                       "fields": fields}),
+                    entry_id)
+        self.assertEqual(
+            self._xread_result({"streams": {"r1": "0-0",
+                                            "r2": "0-0"}}),
+            [{"key": "r1",
+              "entries": [{"id": "1000-0",
+                           "fields": {"name": "alice"}},
+                          {"id": "1000-1",
+                           "fields": {"name": "bob"}},
+                          {"id": "2000-0",
+                           "fields": {"name": "carol"}}]},
+             {"key": "r2",
+              "entries": [{"id": "500-0", "fields": {"v": "x"}},
+                          {"id": "500-1", "fields": {"v": "y"}}]}])
+        # A later ID reads only the entries after it, and a
+        # stream with nothing new is left out.
+        self.assertEqual(
+            self._xread_result({"streams": {"r1": "1000-1",
+                                            "r2": "500-1"}}),
+            [{"key": "r1",
+              "entries": [{"id": "2000-0",
+                           "fields": {"name": "carol"}}]}])
+        # "$" resolves once to the top ID, so only entries added
+        # after the read qualify — none here.
+        self.assertEqual(
+            self._xread_result({"streams": {"r1": "$", "r2": "$"}}),
+            [])
+        # A bare millisecond covers the whole millisecond: the
+        # entries after ms-0.
+        self.assertEqual(
+            self._xread_result({"streams": {"r1": "1000"}}),
+            [{"key": "r1",
+              "entries": [{"id": "1000-1",
+                           "fields": {"name": "bob"}},
+                          {"id": "2000-0",
+                           "fields": {"name": "carol"}}]}])
+        # "-" reads every entry; a missing key answers nothing.
+        self.assertEqual(
+            self._xread_result({"streams": {"r1": "-"}}),
+            [{"key": "r1",
+              "entries": [{"id": "1000-0",
+                           "fields": {"name": "alice"}},
+                          {"id": "1000-1",
+                           "fields": {"name": "bob"}},
+                          {"id": "2000-0",
+                           "fields": {"name": "carol"}}]}])
+        self.assertEqual(
+            self._xread_result({"streams": {"ghost": "0-0"}}), [])
+        # COUNT bounds the entries per stream.
+        self.assertEqual(
+            self._xread_result({"streams": {"r1": "0-0", "r2": "0-0"},
+                                "count": 1}),
+            [{"key": "r1",
+              "entries": [{"id": "1000-0",
+                           "fields": {"name": "alice"}}]},
+             {"key": "r2",
+              "entries": [{"id": "500-0", "fields": {"v": "x"}}]}])
+
+    def test_kv_xread_rejects_bad_arguments(self):
+        self._xadd_result({"key": "s", "id": "1-0",
+                           "fields": {"f": "v"}})
+        bad = [{}, {"streams": {}}, {"streams": []},
+               {"streams": {"s": 1}}, {"streams": {1: "0-0"}},
+               {"streams": {"s": ">"}},
+               {"streams": {"s": "abc"}},
+               {"streams": {"s": "7-"}},
+               {"streams": {"s": "1-2-3"}},
+               {"streams": {"s": "18446744073709551616"}},
+               {"streams": {"s": "0-0", "t": ">"}},
+               {"streams": {"s": "0-0"}, "count": 0},
+               {"streams": {"s": "0-0"}, "count": -1},
+               {"streams": {"s": "0-0"}, "count": 1001},
+               {"streams": {"s": "0-0"}, "count": 1.5},
+               {"streams": {"s": "0-0"}, "count": True},
+               {"streams": {"s": "0-0"}, "block": 0},
+               {"streams": {"s": "0-0"}, "block": -1},
+               {"streams": {"s": "0-0"}, "block": 4001},
+               {"streams": {"s": "0-0"}, "block": 1.5},
+               {"streams": {"s": "0-0"}, "block": True},
+               {"streams": {"s%d" % i: "0-0" for i in range(101)}}]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xread", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_kv_xread_caps_at_1000_entries_per_stream(self):
+        # Seed 1001 entries in batches of 100 ops per call.
+        ops = [{"op": "kv_xadd", "key": "bigx", "id": "%d-0" % i,
+                "fields": {"v": str(i)}} for i in range(1, 1002)]
+        for start in range(0, len(ops), 100):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_batch",
+                "arguments": {"ops": ops[start:start + 100]},
+            })
+            summary = json.loads(reply["result"]["content"][0]["text"])
+            self.assertEqual(summary["ok"], len(ops[start:start + 100]))
+        # The whole stream is wider than the cap, so it fails
+        # instead of returning a truncated list.
+        reply = self._call("tools/call", 2, {
+            "name": "kv_xread",
+            "arguments": {"streams": {"bigx": "0-0"}},
+        })
+        self.assertIn("error", reply)
+        self.assertEqual(reply["error"]["code"], -32602)
+        # A count at the cap returns exactly 1000 entries.
+        page = self._xread_result({"streams": {"bigx": "0-0"},
+                                   "count": 1000})
+        self.assertEqual(len(page), 1)
+        self.assertEqual(page[0]["key"], "bigx")
+        self.assertEqual(len(page[0]["entries"]), 1000)
+        self.assertEqual(page[0]["entries"][0]["id"], "1-0")
+        self.assertEqual(page[0]["entries"][-1]["id"], "1000-0")
+
+    def test_kv_xread_block_times_out_and_reads_at_once(self):
+        self._xadd_result({"key": "b", "id": "1-0",
+                           "fields": {"f": "v"}})
+        # A BLOCK with nothing new times out to an empty list —
+        # the fake answers the nil outcome at once instead of
+        # parking for real; the live test proves the wait.
+        self.assertEqual(
+            self._xread_result({"streams": {"b": "$"}, "block": 200}),
+            [])
+        # With data already present a BLOCK answers at once.
+        self.assertEqual(
+            self._xread_result({"streams": {"b": "0-0"}, "block": 200}),
+            [{"key": "b",
+              "entries": [{"id": "1-0", "fields": {"f": "v"}}]}])
+
+    def test_kv_xread_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        self.fake.store["todo"] = (["buy milk"], None)
+        for key in ("plain", "todo"):
+            reply = self._call("tools/call", 2, {
+                "name": "kv_xread",
+                "arguments": {"streams": {key: "0-0"}},
+            })
+            self.assertIn("error", reply, key)
+            self.assertIn("WRONGTYPE", reply["error"]["message"], key)
+
+    def test_kv_xread_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "xb1", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xread", "streams": {"xb1": "0-0"}},
+                {"op": "kv_xread", "streams": {"xb1": "1-0"}},
+                {"op": "kv_xread", "streams": {"xb1": ">"}},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["results"][0]["result"], "1-0")
+        self.assertEqual(summary["results"][1]["result"], "2-0")
+        self.assertEqual(summary["results"][2]["result"], [
+            {"key": "xb1",
+             "entries": [{"id": "1-0", "fields": {"v": "a"}},
+                         {"id": "2-0", "fields": {"v": "b"}}]},
+        ])
+        self.assertEqual(summary["results"][3]["result"], [
+            {"key": "xb1",
+             "entries": [{"id": "2-0", "fields": {"v": "b"}}]},
+        ])
+        self.assertFalse(summary["results"][4]["ok"])
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xread", "streams": {"xb2": "0-0"}},
+                {"op": "kv_xlen", "key": "xb2"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], "5-0")
+        self.assertEqual(summary["results"][1]["result"], [
+            {"key": "xb2",
+             "entries": [{"id": "5-0", "fields": {"v": "x"}}]},
+        ])
+        self.assertEqual(summary["results"][2]["result"], 1)
+        # A BLOCK inside an atomic batch fails the whole call
+        # before anything runs: cinder refuses to queue it.
+        blocked = self._call("tools/call", 3, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xb3", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xread", "streams": {"xb3": "0-0"},
+                 "block": 100},
+            ]},
+        })
+        self.assertIn("error", blocked)
+        self.assertIn("BLOCK is not allowed in MULTI/EXEC",
+                      blocked["error"]["message"])
+        untouched = self._call("tools/call", 4, {
+            "name": "kv_exists", "arguments": {"key": "xb3"},
+        })
+        self.assertEqual(untouched["result"]["content"][0]["text"], "0")
+
     def test_resources_read_key_stream_returns_type_and_length(self):
         self.assertEqual(
             self._xadd_result({"key": "log", "id": "1-0",
@@ -8903,9 +9252,10 @@ class McpTests(unittest.TestCase):
              "fields": {"v": "d"}},
             {"op": "kv_xrange", "key": "ws:s"},
             {"op": "kv_xlen", "key": "ws:s"},
+            {"op": "kv_xread", "streams": {"ws:s": "0-0"}},
         ]
         text = self._write_safety_text(plan)
-        self.assertIn("Plan: 9 op(s), 6 audited, 3 not audited.", text)
+        self.assertIn("Plan: 10 op(s), 6 audited, 4 not audited.", text)
         risky = text.split("Risky (")[1].split("\n\n")[0]
         self.assertIn(
             "op 2: kv_xadd 'ws:plain' — would fail with WRONGTYPE: "
@@ -8944,6 +9294,8 @@ class McpTests(unittest.TestCase):
             "op 7: kv_xrange is a read, not a write", text)
         self.assertIn(
             "op 8: kv_xlen is a read, not a write", text)
+        self.assertIn(
+            "op 9: kv_xread is a read, not a write", text)
 
     def _geoadd_result(self, arguments):
         reply = self._call("tools/call", 1, {
@@ -20758,16 +21110,16 @@ class LiveCinderMigrationTests(unittest.TestCase):
         self.assertIn("op 2: kv_httl is a read, not a write", text)
 
     def test_live_stream_tools(self):
-        """kv_xadd / kv_xrange / kv_xlen against a real cinder
+        """kv_xadd / kv_xrange / kv_xlen / kv_xread against a real cinder
         (streams shipped in cinder 0.64.0, stream reads in
-        0.65.0): explicit, partial and auto IDs, a partial 0-*
+        0.65.0, multi-stream reads in 0.66.0): explicit, partial and auto IDs, a partial 0-*
         resolving to 0-0 on an empty stream, XRANGE bounds
         (exact, bare-millisecond, COUNT 0, a missing key, a
         reversed range), MAXLEN trimming from the front (exact
         and ~) and MAXLEN 0 deleting the key at once, XADD
         preserving the TTL, WRONGTYPE on a string key, the tools
         queueing in one MULTI/EXEC transaction, the write-safety
-        audit classifying XADD as a write and XRANGE/XLEN as
+        audit classifying XADD as a write and XRANGE/XLEN/XREAD as
         reads, and cinder://key/<stream> reporting the type."""
         self.assertEqual(
             self._tool("kv_xadd", {"key": "stream:live",
@@ -20945,9 +21297,11 @@ class LiveCinderMigrationTests(unittest.TestCase):
                  "fields": {"v": "z"}},
                 {"op": "kv_xrange", "key": "stream:live"},
                 {"op": "kv_xlen", "key": "stream:live"},
+                {"op": "kv_xread",
+                 "streams": {"stream:live": "0-0"}},
             ])},
         })["result"]["messages"][0]["content"]["text"]
-        self.assertIn("Plan: 4 op(s), 2 audited, 2 not audited.", text)
+        self.assertIn("Plan: 5 op(s), 2 audited, 3 not audited.", text)
         self.assertIn(
             "op 1: kv_xadd 'stream:plain' — would fail with "
             "WRONGTYPE: the key is a string of 1 bytes",
@@ -20955,6 +21309,113 @@ class LiveCinderMigrationTests(unittest.TestCase):
         )
         self.assertIn("op 2: kv_xrange is a read, not a write", text)
         self.assertIn("op 3: kv_xlen is a read, not a write", text)
+        self.assertIn("op 4: kv_xread is a read, not a write", text)
+        # kv_xread reads several streams after given IDs, and a
+        # BLOCK waits for new entries instead of answering at
+        # once.
+        self.assertEqual(
+            self._tool("kv_xread",
+                       {"streams": {"stream:live": "0-0",
+                                    "stream:trim": "0-0"}}),
+            [{"key": "stream:live",
+              "entries": [{"id": "1000-0",
+                           "fields": {"age": "30", "name": "alice"}},
+                          {"id": "1000-1",
+                           "fields": {"name": "bob"}},
+                          {"id": "1000-2",
+                           "fields": {"name": "carol"}},
+                          {"id": "2000-0",
+                           "fields": {"name": "erin"}},
+                          {"id": auto,
+                           "fields": {"name": "dan"}}]},
+             {"key": "stream:trim",
+              "entries": [{"id": "2-0", "fields": {"v": "b"}},
+                          {"id": "3-0", "fields": {"v": "c"}}]}])
+        self.assertEqual(
+            self._tool("kv_xread",
+                       {"streams": {"stream:live": "1000-1"}}),
+            [{"key": "stream:live",
+              "entries": [{"id": "1000-2",
+                           "fields": {"name": "carol"}},
+                          {"id": "2000-0",
+                           "fields": {"name": "erin"}},
+                          {"id": auto,
+                           "fields": {"name": "dan"}}]}])
+        self.assertEqual(
+            self._tool("kv_xread",
+                       {"streams": {"stream:live": "$"}}),
+            [])
+        self.assertEqual(
+            self._tool("kv_xread",
+                       {"streams": {"stream:live": "1000"}}),
+            [{"key": "stream:live",
+              "entries": [{"id": "1000-1",
+                           "fields": {"name": "bob"}},
+                          {"id": "1000-2",
+                           "fields": {"name": "carol"}},
+                          {"id": "2000-0",
+                           "fields": {"name": "erin"}},
+                          {"id": auto,
+                           "fields": {"name": "dan"}}]}])
+        # A BLOCK with nothing new times out to an empty list.
+        started = time.monotonic()
+        self.assertEqual(
+            self._tool("kv_xread",
+                       {"streams": {"stream:live": "$"}, "block": 200}),
+            [])
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
+        # A BLOCK wakes as soon as an entry lands, instead of
+        # waiting out the timeout.
+        added = []
+
+        def _late_add():
+            time.sleep(0.15)
+            added.append(RespClient("127.0.0.1", self.PORT).command(
+                "XADD", "stream:live", "*", "name", "wake"))
+
+        thread = threading.Thread(target=_late_add)
+        thread.start()
+        started = time.monotonic()
+        woke = self._tool(
+            "kv_xread",
+            {"streams": {"stream:live": "$"}, "block": 2000})
+        thread.join()
+        self.assertEqual(len(added), 1)
+        self.assertEqual(
+            woke,
+            [{"key": "stream:live",
+              "entries": [{"id": added[0],
+                           "fields": {"name": "wake"}}]}])
+        self.assertLess(time.monotonic() - started, 1.5)
+        # A plain kv_xread queues and runs at EXEC; a BLOCK
+        # inside an atomic batch fails the whole call before
+        # anything runs.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_xadd", "key": "stream:tx2", "id": "5-0",
+             "fields": {"v": "x"}},
+            {"op": "kv_xread", "streams": {"stream:tx2": "0-0"}},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 2)
+        self.assertEqual(summary["results"][0]["result"], "5-0")
+        self.assertEqual(summary["results"][1]["result"], [
+            {"key": "stream:tx2",
+             "entries": [{"id": "5-0", "fields": {"v": "x"}}]},
+        ])
+        blocked = self._call("tools/call", 96, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "stream:tx3", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xread", "streams": {"stream:tx3": "0-0"},
+                 "block": 100},
+            ]},
+        })
+        self.assertIn("error", blocked)
+        self.assertIn("BLOCK is not allowed in MULTI/EXEC",
+                      blocked["error"]["message"])
+        self.assertEqual(
+            self._tool("kv_exists", {"key": "stream:tx3"}), 0)
 
 
 if __name__ == "__main__":
