@@ -27,7 +27,9 @@ would fail on a non-integer or a container, LSETs on a missing key
 or with an index out of range, LSETs and LINSERTs on a container,
 HINCRBYs that would fail
 on a non-integer field or a container, HINCRBYFLOATs that would fail
-on a non-float field or a container, GEORADIUSes and
+on a non-float field or a container, HEXPIREs that would delete
+fields at once or fail on a bad timeout, condition, or container,
+and HPERSISTs that would strip a field's expiry, GEORADIUSes and
 GEORADIUSBYMEMBERs that would store their hits at a destination —
 a plain GEORADIUS is a read, and GEOSEARCH is a read too — and
 GEOSEARCHSTOREs that would store their hits at a destination,
@@ -55,6 +57,7 @@ move, and the prompt says so.
 import bisect
 import json
 import math
+import time
 
 from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
@@ -136,6 +139,8 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_append", "kv_decr", "kv_decrby", "kv_getex", "kv_setrange",
     "kv_setbit", "kv_bitop", "kv_bitfield",
     "kv_hsetnx", "kv_hincrby", "kv_hincrbyfloat",
+    "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
+    "kv_hpersist",
     "kv_zpopmin", "kv_zpopmax",
     "kv_zremrangebyscore", "kv_zremrangebyrank", "kv_zremrangebylex",
     "kv_zunionstore", "kv_zinterstore", "kv_zdiffstore",
@@ -150,6 +155,7 @@ WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_strlen", "kv_getrange", "kv_getbit",
                          "kv_bitcount", "kv_hscan",
                          "kv_hkeys", "kv_hvals",
+                         "kv_httl", "kv_hpttl",
                          "kv_zrandmember", "kv_zscan", "kv_zrangebylex",
                          "kv_zrevrange", "kv_zrevrangebyscore",
                          "kv_zlexcount", "kv_zmscore", "kv_zunion",
@@ -1033,6 +1039,105 @@ def _hincrby_audit_increment(op):
             "kv_hincrby increment is not an integer: %r" % (increment,)
         )
     return increment
+
+
+def _hexpire_audit_args(op):
+    """The arguments of a hash-field TTL op in a write plan,
+    validated like the tool's own arguments: `fields` a non-empty
+    list of strings, at most 1000; the expire family's time an
+    integer, 0 or more when relative, within cinder's range when
+    absolute; the condition one of nx, xx, gt, lt. Returns
+    (fields, condition, time_value, is_ms, absolute) — the time
+    parts are None for kv_hpersist, which takes no time. Anything
+    wrong raises ValueError, so the caller reports the op as not
+    audited instead of guessing."""
+    name = op.get("op")
+    fields = op.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise ValueError(
+            "%s fields must be a non-empty list: %r" % (name, fields)
+        )
+    if len(fields) > 1000:
+        raise ValueError(
+            "%s fields must have at most 1000 entries: %r"
+            % (name, fields)
+        )
+    for field in fields:
+        if not isinstance(field, str):
+            raise ValueError(
+                "%s fields must be strings: %r" % (name, field)
+            )
+    condition = op.get("condition")
+    if condition is not None:
+        if not isinstance(condition, str) \
+                or condition.lower() not in ("nx", "xx", "gt", "lt"):
+            raise ValueError(
+                "%s condition must be one of nx, xx, gt, lt: %r"
+                % (name, condition)
+            )
+        condition = condition.lower()
+    if name == "kv_hpersist":
+        return fields, None, None, None, False
+    absolute = name.endswith("at")
+    is_ms = name in ("kv_hpexpire", "kv_hpexpireat")
+    time_field = "milliseconds" if is_ms else "seconds"
+    time_value = op.get(time_field)
+    if time_value is None:
+        raise ValueError(
+            "%s is missing %s: %r" % (name, time_field, op)
+        )
+    if isinstance(time_value, bool) or not isinstance(time_value, int):
+        raise ValueError(
+            "%s %s is not an integer: %r"
+            % (name, time_field, time_value)
+        )
+    if absolute:
+        if is_ms:
+            lo, hi = -(2 ** 63), 2 ** 63 - 1
+        else:
+            lo = -((2 ** 63 - 1) // 1000)
+            hi = (2 ** 63 - 1) // 1000
+        if time_value < lo or time_value > hi:
+            raise ValueError(
+                "%s %s is out of range: %r"
+                % (name, time_field, time_value)
+            )
+    elif time_value < 0:
+        raise ValueError(
+            "%s %s must be 0 or more: %r"
+            % (name, time_field, time_value)
+        )
+    return fields, condition, time_value, is_ms, absolute
+
+
+def _hexpire_condition_applies(condition, current_ms, effective_ms):
+    """Whether a HEXPIRE-family op with `condition` would change a
+    field whose current TTL is `current_ms` milliseconds (-1 for
+    no expiry), setting it to expire in `effective_ms` — 0 or less
+    deletes it at once. A field with no expiry counts as never
+    expiring, as in cinder: GT never applies to it, LT always
+    does."""
+    if condition is None:
+        return True
+    if condition == "nx":
+        return current_ms == -1
+    if condition == "xx":
+        return current_ms != -1
+    if condition == "gt":
+        return current_ms != -1 and effective_ms > current_ms
+    return current_ms == -1 or effective_ms < current_ms
+
+
+def _hexpire_effective_ms(time_value, is_ms, absolute):
+    """The new field TTL a HEXPIRE-family op would set, in
+    milliseconds from now — 0 or less means the fields are
+    deleted at once. A relative time is already a duration; an
+    absolute one is measured against now."""
+    if absolute:
+        now_ms = int(time.time() * 1000)
+        at_ms = time_value if is_ms else time_value * 1000
+        return at_ms - now_ms
+    return time_value if is_ms else time_value * 1000
 
 
 def _lset_audit_args(op):
@@ -3320,6 +3425,15 @@ def _audit_write_op(client, op):
             return "safe", (
                 "kv_ltrim %r — no-op, the key does not exist" % key
             )
+        if name in ("kv_hexpire", "kv_hpexpire", "kv_hexpireat",
+                    "kv_hpexpireat", "kv_hpersist"):
+            # A hash-field TTL op on a missing key answers -2 per
+            # field and changes nothing, as in Redis — but the
+            # arguments still have to parse.
+            _hexpire_audit_args(op)
+            return "safe", (
+                "%s %r — no-op, the key does not exist" % (name, key)
+            )
         # kv_expire on a missing key.
         seconds = op.get("seconds")
         if seconds is None:
@@ -4144,6 +4258,104 @@ def _audit_write_op(client, op):
         return "caution", (
             "kv_zremrangebylex %r — removes %d of %d members"
             % (key, removed, size_value)
+        )
+    if name in ("kv_hexpire", "kv_hpexpire", "kv_hexpireat",
+                "kv_hpexpireat"):
+        fields, condition, time_value, is_ms, absolute = \
+            _hexpire_audit_args(op)
+        if kind != "hash":
+            return "risky", (
+                "%s %r — would fail with WRONGTYPE: the key is "
+                "a %s of %s" % (name, key, kind, size)
+            )
+        # The current field TTLs, probed live in the op's unit
+        # and converted to milliseconds for the comparison: -2
+        # the field does not exist, -1 no expiry.
+        probe = "HPTTL" if is_ms else "HTTL"
+        current = client.command(
+            probe, key, "FIELDS", len(fields), *fields) or []
+        effective = _hexpire_effective_ms(time_value, is_ms, absolute)
+        if ttl == -1:
+            hash_text = "a hash of %s that never expires" % size
+        else:
+            hash_text = "a hash of %s that %s" % (size, ttl_text)
+        changed = 0
+        deleted = 0
+        for ttl_value in current:
+            if ttl_value == -2:
+                continue
+            current_ms = -1 if ttl_value == -1 else ttl_value * (
+                1 if is_ms else 1000)
+            if not _hexpire_condition_applies(
+                    condition, current_ms, effective):
+                continue
+            changed += 1
+            if effective <= 0:
+                deleted += 1
+        if changed == 0:
+            return "safe", (
+                "%s %r — no-op, the condition was not met for any "
+                "field" % (name, key)
+            )
+        if deleted:
+            if deleted >= size_value:
+                # Every field goes, so the key goes with them.
+                flags = []
+                if ttl == -1:
+                    flags.append(
+                        "deletes every field of a hash that never "
+                        "expires"
+                    )
+                if large:
+                    flags.append(
+                        "deletes every field of a large hash (%s)"
+                        % size
+                    )
+                if flags:
+                    return "risky", "%s %r — %s" % (
+                        name, key, "; ".join(flags))
+                return "caution", (
+                    "%s %r — deletes every field of %s"
+                    % (name, key, hash_text)
+                )
+            return "caution", (
+                "%s %r — deletes %d of %d fields of %s"
+                % (name, key, deleted, size_value, hash_text)
+            )
+        if is_ms:
+            new_text = "%dms" % effective
+        else:
+            new_text = _format_ttl(max(effective // 1000, 0))
+        return "safe", (
+            "%s %r — sets a field expiry of %s on %d field(s) of %s"
+            % (name, key, new_text, changed, hash_text)
+        )
+    if name == "kv_hpersist":
+        fields, _condition, _time, _is_ms, _absolute = \
+            _hexpire_audit_args(op)
+        if kind != "hash":
+            return "risky", (
+                "kv_hpersist %r — would fail with WRONGTYPE: the "
+                "key is a %s of %s" % (key, kind, size)
+            )
+        current = client.command(
+            "HPTTL", key, "FIELDS", len(fields), *fields) or []
+        expiring = sum(1 for value in current if value >= 0)
+        if expiring == 0:
+            return "safe", (
+                "kv_hpersist %r — no-op, none of the fields has an "
+                "expiry" % key
+            )
+        if ttl == -1:
+            return "caution", (
+                "kv_hpersist %r — removes the expiry from %d "
+                "field(s) of a hash that never expires"
+                % (key, expiring)
+            )
+        return "safe", (
+            "kv_hpersist %r — removes the expiry from %d field(s) "
+            "of a hash of %s that %s"
+            % (key, expiring, size, ttl_text)
         )
     # kv_expire on an existing key.
     seconds = op.get("seconds")

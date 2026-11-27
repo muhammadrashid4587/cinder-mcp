@@ -179,6 +179,9 @@ class FakeCinder(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.store = {}  # key -> (value, expires_at or None)
+        # Hash-field TTLs: key -> {field: expires_at epoch seconds}.
+        # A field with no entry here has no expiry, as in cinder.
+        self.hexpires = {}
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", 0))
@@ -232,12 +235,81 @@ class FakeCinder(threading.Thread):
     def _get(self, key):
         entry = self.store.get(key)
         if entry is None:
+            # The key is gone, so any field TTLs recorded for it
+            # are stale: a hash recreated under the same name
+            # starts with no expiries, as in real cinder.
+            self.hexpires.pop(key, None)
             return None
         value, expires = entry
         if expires is not None and expires <= time.time():
             del self.store[key]
+            self.hexpires.pop(key, None)
             return None
+        if isinstance(value, dict):
+            # A hash read reaps its expired fields first, as real
+            # cinder does; a hash emptied this way is gone.
+            self._reap_fields(key)
+            entry = self.store.get(key)
+            if entry is None:
+                return None
+            value = entry[0]
+        else:
+            # A key holding another type has no field TTLs.
+            self.hexpires.pop(key, None)
         return value
+
+    def _reap_fields(self, key):
+        """Drop the hash fields whose TTL has passed, as real
+        cinder does on read; a hash emptied this way is gone.
+        Entries for fields the hash no longer holds (removed with
+        HDEL) are pruned too, so a field re-added later starts
+        with no expiry."""
+        entry = self.store.get(key)
+        if entry is None:
+            self.hexpires.pop(key, None)
+            return
+        value, _expires = entry
+        if not isinstance(value, dict):
+            self.hexpires.pop(key, None)
+            return
+        fexp = self.hexpires.get(key)
+        if not fexp:
+            return
+        now = time.time()
+        for field in [f for f in fexp
+                      if f not in value or fexp[f] <= now]:
+            value.pop(field, None)
+            del fexp[field]
+        if not value:
+            del self.store[key]
+            self.hexpires.pop(key, None)
+        elif not fexp:
+            self.hexpires.pop(key, None)
+
+    def _parse_fields_tail(self, args, i, lname):
+        """Parse the FIELDS numfields field ... tail of a
+        hash-field TTL command, as in real cinder: returns (first,
+        nf, error) — error is the RESP error text when the tail
+        is malformed, else None. A missing FIELDS keyword, an
+        unparsable count, or a count below 1 is a syntax error; a
+        field count that does not match is a wrong number of
+        arguments."""
+        if i >= len(args) or args[i].upper() != "FIELDS":
+            return 0, 0, "-ERR syntax error\r\n"
+        i += 1
+        if i >= len(args):
+            return 0, 0, "-ERR syntax error\r\n"
+        try:
+            nf = int(args[i])
+        except ValueError:
+            return 0, 0, "-ERR syntax error\r\n"
+        if nf < 1:
+            return 0, 0, "-ERR syntax error\r\n"
+        i += 1
+        if len(args) - i != nf:
+            return 0, 0, ("-ERR wrong number of arguments for '%s' "
+                          "command\r\n" % lname)
+        return i, nf, None
 
     def _parse_bitfield(self, type_name, offset_text):
         """Parse a BITFIELD type and offset, as in real cinder:
@@ -1391,6 +1463,171 @@ class FakeCinder(threading.Thread):
             return ("*2\r\n" + self._bulk(str(nxt))
                     + "*%d\r\n" % len(flat)
                     + "".join(self._bulk(v) for v in flat))
+        elif name in ("HEXPIRE", "HPEXPIRE", "HEXPIREAT",
+                      "HPEXPIREAT"):
+            # HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields
+            # field ... — HPEXPIRE the same in milliseconds,
+            # HEXPIREAT / HPEXPIREAT with an absolute Unix time.
+            # One integer reply per field, as in Redis: -2 the key
+            # or the field does not exist, 0 the condition was not
+            # met, 1 the expiry was set, 2 the field was deleted
+            # at once (a zero relative TTL, or an absolute time
+            # already past). A field with no expiry counts as
+            # never expiring, so GT never applies to it and LT
+            # always does.
+            is_ms = name in ("HPEXPIRE", "HPEXPIREAT")
+            is_abs = name in ("HEXPIREAT", "HPEXPIREAT")
+            lname = name.lower()
+            if len(args) < 5:
+                return ("-ERR wrong number of arguments for '%s' "
+                        "command\r\n" % lname)
+            try:
+                t = int(args[1])
+            except ValueError:
+                return ("-ERR value is not an integer or out of "
+                        "range\r\n")
+            if t > 2 ** 63 - 1 or t < -(2 ** 63):
+                return ("-ERR value is not an integer or out of "
+                        "range\r\n")
+            if is_abs:
+                if not is_ms and t > (2 ** 63 - 1) // 1000:
+                    return ("-ERR invalid expire time in '%s' "
+                            "command\r\n" % lname)
+                at = t / 1000.0 if is_ms else float(t)
+            else:
+                if t < 0:
+                    return ("-ERR invalid expire time in '%s' "
+                            "command\r\n" % lname)
+                if not is_ms and t > (2 ** 63 - 1) // 1000:
+                    return ("-ERR invalid expire time in '%s' "
+                            "command\r\n" % lname)
+                at = time.time() + (t / 1000.0 if is_ms else t)
+            # At most one condition option, between the time and
+            # FIELDS; a second one, or an unknown one, is a
+            # syntax error.
+            cond = None
+            i = 2
+            if i < len(args) and args[i].upper() in (
+                    "NX", "XX", "GT", "LT"):
+                cond = args[i].upper()
+                i += 1
+                if i < len(args) and args[i].upper() in (
+                        "NX", "XX", "GT", "LT"):
+                    return "-ERR syntax error\r\n"
+            first, nf, err = self._parse_fields_tail(args, i, lname)
+            if err:
+                return err
+            fields = args[first:first + nf]
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            if value is None:
+                return "*%d\r\n" % nf + "".join(
+                    ":-2\r\n" for _ in fields)
+            fexp = self.hexpires.setdefault(args[0], {})
+            now = time.time()
+            results = []
+            for field in fields:
+                if field not in value:
+                    results.append(-2)
+                    continue
+                cur = fexp.get(field)
+                if cond == "NX" and cur is not None:
+                    results.append(0)
+                    continue
+                if cond == "XX" and cur is None:
+                    results.append(0)
+                    continue
+                if cond == "GT" and (cur is None or at <= cur):
+                    results.append(0)
+                    continue
+                if cond == "LT" and cur is not None and at >= cur:
+                    results.append(0)
+                    continue
+                if at <= now:
+                    del value[field]
+                    fexp.pop(field, None)
+                    results.append(2)
+                    continue
+                fexp[field] = at
+                results.append(1)
+            if not value:
+                # The last field went, so the key goes with it.
+                del self.store[args[0]]
+                self.hexpires.pop(args[0], None)
+            elif not fexp:
+                self.hexpires.pop(args[0], None)
+            return "*%d\r\n" % len(results) + "".join(
+                ":%d\r\n" % r for r in results)
+        elif name in ("HTTL", "HPTTL"):
+            # HTTL key FIELDS numfields field ... — one integer
+            # reply per field: the remaining TTL (seconds for
+            # HTTL, milliseconds for HPTTL), -1 when the field
+            # has no expiry, -2 when the key or the field does
+            # not exist.
+            is_ms = name == "HPTTL"
+            lname = name.lower()
+            if len(args) < 4:
+                return ("-ERR wrong number of arguments for '%s' "
+                        "command\r\n" % lname)
+            first, nf, err = self._parse_fields_tail(args, 1, lname)
+            if err:
+                return err
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            fexp = self.hexpires.get(args[0], {}) \
+                if value is not None else {}
+            now = time.time()
+            results = []
+            for field in args[first:first + nf]:
+                if value is None or field not in value:
+                    results.append(-2)
+                    continue
+                at = fexp.get(field)
+                if at is None:
+                    results.append(-1)
+                    continue
+                rem_ms = int((at - now) * 1000)
+                if rem_ms < 0:
+                    results.append(-2)
+                    continue
+                results.append(rem_ms if is_ms else rem_ms // 1000)
+            return "*%d\r\n" % len(results) + "".join(
+                ":%d\r\n" % r for r in results)
+        elif name == "HPERSIST":
+            # HPERSIST key FIELDS numfields field ... — one
+            # integer reply per field: 1 an expiry was removed,
+            # -1 the field had none, -2 the key or the field does
+            # not exist.
+            if len(args) < 4:
+                return ("-ERR wrong number of arguments for "
+                        "'hpersist' command\r\n")
+            first, nf, err = self._parse_fields_tail(
+                args, 1, "hpersist")
+            if err:
+                return err
+            value = self._get(args[0])
+            if value is not None and not isinstance(value, dict):
+                return ("-WRONGTYPE Operation against a key holding "
+                        "the wrong kind of value\r\n")
+            fexp = self.hexpires.get(args[0], {})
+            results = []
+            for field in args[first:first + nf]:
+                if value is None or field not in value:
+                    results.append(-2)
+                    continue
+                if field not in fexp:
+                    results.append(-1)
+                    continue
+                del fexp[field]
+                results.append(1)
+            if value is not None and not fexp:
+                self.hexpires.pop(args[0], None)
+            return "*%d\r\n" % len(results) + "".join(
+                ":%d\r\n" % r for r in results)
         elif name == "ZADD" and len(args) >= 3:
             # Options come after the key and before the first score,
             # as in cinder 0.25.0: NX | XX | GT | LT | CH | INCR.
@@ -3066,6 +3303,9 @@ class McpTests(unittest.TestCase):
                     "kv_hmget", "kv_hsetnx", "kv_hincrby",
                     "kv_hscan",
                     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
+                    "kv_hexpire", "kv_hpexpire", "kv_hexpireat",
+                    "kv_hpexpireat", "kv_httl", "kv_hpttl",
+                    "kv_hpersist",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -3962,6 +4202,428 @@ class McpTests(unittest.TestCase):
             ]},
         })
         self.assertIn("error", bad)
+
+    def test_tools_call_hash_field_ttls(self):
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "h",
+                          "fields": {"a": "1", "b": "2", "c": "3"}},
+        })
+        # kv_hexpire sets a per-field TTL and answers one integer
+        # per field, in order.
+        set_ = self._call("tools/call", 2, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 100,
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(set_["result"]["content"][0]["text"]), [1, 1])
+        ttl = self._call("tools/call", 3, {
+            "name": "kv_httl",
+            "arguments": {"key": "h", "fields": ["a", "b", "c"]},
+        })
+        values = json.loads(ttl["result"]["content"][0]["text"])
+        self.assertEqual(len(values), 3)
+        self.assertGreater(values[0], 0)
+        self.assertLessEqual(values[0], 100)
+        self.assertLessEqual(abs(values[0] - values[1]), 1)
+        self.assertEqual(values[2], -1)
+        # kv_hpttl answers the same TTLs in milliseconds.
+        pttl = self._call("tools/call", 4, {
+            "name": "kv_hpttl",
+            "arguments": {"key": "h", "fields": ["a", "c"]},
+        })
+        ms = json.loads(pttl["result"]["content"][0]["text"])
+        self.assertGreater(ms[0], 0)
+        self.assertLessEqual(ms[0], 100000)
+        self.assertEqual(ms[1], -1)
+        # A missing key or field answers -2 per field.
+        missing = self._call("tools/call", 5, {
+            "name": "kv_httl",
+            "arguments": {"key": "ghost", "fields": ["a"]},
+        })
+        self.assertEqual(
+            json.loads(missing["result"]["content"][0]["text"]), [-2])
+        missing_field = self._call("tools/call", 6, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 100,
+                          "fields": ["nope", "a"]},
+        })
+        self.assertEqual(
+            json.loads(missing_field["result"]["content"][0]["text"]),
+            [-2, 1],
+        )
+        # kv_hpersist removes the expiry: 1 removed, -1 none.
+        persist = self._call("tools/call", 7, {
+            "name": "kv_hpersist",
+            "arguments": {"key": "h", "fields": ["a", "c", "nope"]},
+        })
+        self.assertEqual(
+            json.loads(persist["result"]["content"][0]["text"]),
+            [1, -1, -2],
+        )
+        after = self._call("tools/call", 8, {
+            "name": "kv_httl",
+            "arguments": {"key": "h", "fields": ["a", "b"]},
+        })
+        after_values = json.loads(after["result"]["content"][0]["text"])
+        self.assertEqual(after_values[0], -1)
+        # The b TTL can tick down by a second between the reads.
+        self.assertLessEqual(after_values[1], values[1])
+        self.assertGreaterEqual(after_values[1], values[1] - 1)
+        # kv_hpexpire sets the TTL in milliseconds.
+        pexpire = self._call("tools/call", 9, {
+            "name": "kv_hpexpire",
+            "arguments": {"key": "h", "milliseconds": 60000,
+                          "fields": ["c"]},
+        })
+        self.assertEqual(
+            json.loads(pexpire["result"]["content"][0]["text"]), [1])
+        ms_after = self._call("tools/call", 10, {
+            "name": "kv_hpttl",
+            "arguments": {"key": "h", "fields": ["c"]},
+        })
+        ms_c = json.loads(ms_after["result"]["content"][0]["text"])[0]
+        self.assertGreater(ms_c, 0)
+        self.assertLessEqual(ms_c, 60000)
+
+    def test_tools_call_hash_field_ttls_conditions(self):
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"a": "1", "b": "2"}},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 200, "fields": ["b"]},
+        })
+        # NX sets only fields with no expiry; XX only fields
+        # that already have one.
+        nx = self._call("tools/call", 3, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 300, "condition": "nx",
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(nx["result"]["content"][0]["text"]), [1, 0])
+        xx = self._call("tools/call", 4, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 300, "condition": "xx",
+                          "fields": ["a", "b"]},
+        })
+        # Both fields have an expiry now — a from the NX call,
+        # b from the first call — so XX applies to both.
+        self.assertEqual(
+            json.loads(xx["result"]["content"][0]["text"]), [1, 1])
+        # GT moves the expiry only later, LT only sooner — and a
+        # field with no expiry counts as never expiring, so GT
+        # never applies to it and LT always does.
+        self._call("tools/call", 5, {
+            "name": "kv_hpersist",
+            "arguments": {"key": "h", "fields": ["a"]},
+        })
+        # XX does not apply to a field with no expiry any more.
+        xx_after = self._call("tools/call", 6, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 300, "condition": "xx",
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(xx_after["result"]["content"][0]["text"]),
+            [0, 1],
+        )
+        gt_short = self._call("tools/call", 7, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 50, "condition": "gt",
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(gt_short["result"]["content"][0]["text"]),
+            [0, 0],
+        )
+        gt_long = self._call("tools/call", 8, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 400, "condition": "gt",
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(gt_long["result"]["content"][0]["text"]),
+            [0, 1],
+        )
+        lt_short = self._call("tools/call", 9, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 100, "condition": "lt",
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(lt_short["result"]["content"][0]["text"]),
+            [1, 1],
+        )
+        lt_long = self._call("tools/call", 10, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 500, "condition": "lt",
+                          "fields": ["a", "b"]},
+        })
+        # Neither moves: the LT 100 call above gave both fields a
+        # 100-second expiry, and 500 is not sooner than that.
+        self.assertEqual(
+            json.loads(lt_long["result"]["content"][0]["text"]),
+            [0, 0],
+        )
+        # A zero TTL deletes the field at once, and deleting the
+        # last field deletes the key.
+        gone = self._call("tools/call", 11, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 0,
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(gone["result"]["content"][0]["text"]), [2, 2])
+        exists = self._call("tools/call", 12, {
+            "name": "kv_exists", "arguments": {"key": "h"},
+        })
+        self.assertEqual(exists["result"]["content"][0]["text"], "0")
+
+    def test_tools_call_hash_field_ttls_absolute(self):
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"a": "1", "b": "2"}},
+        })
+        # kv_hexpireat with a future time; the TTL reads back in
+        # seconds.
+        future = int(time.time()) + 3600
+        set_ = self._call("tools/call", 2, {
+            "name": "kv_hexpireat",
+            "arguments": {"key": "h", "seconds": future,
+                          "fields": ["a"]},
+        })
+        self.assertEqual(
+            json.loads(set_["result"]["content"][0]["text"]), [1])
+        ttl = self._call("tools/call", 3, {
+            "name": "kv_httl",
+            "arguments": {"key": "h", "fields": ["a"]},
+        })
+        value = json.loads(ttl["result"]["content"][0]["text"])[0]
+        self.assertGreater(value, 3590)
+        self.assertLessEqual(value, 3600)
+        # kv_hpexpireat with a future time in milliseconds.
+        future_ms = int(time.time() * 1000) + 3600000
+        set_ms = self._call("tools/call", 4, {
+            "name": "kv_hpexpireat",
+            "arguments": {"key": "h", "milliseconds": future_ms,
+                          "fields": ["b"]},
+        })
+        self.assertEqual(
+            json.loads(set_ms["result"]["content"][0]["text"]), [1])
+        pttl = self._call("tools/call", 5, {
+            "name": "kv_hpttl",
+            "arguments": {"key": "h", "fields": ["b"]},
+        })
+        ms = json.loads(pttl["result"]["content"][0]["text"])[0]
+        self.assertGreater(ms, 3599000)
+        self.assertLessEqual(ms, 3600000)
+        # An absolute time already past deletes the field at once.
+        past = self._call("tools/call", 6, {
+            "name": "kv_hexpireat",
+            "arguments": {"key": "h",
+                          "seconds": int(time.time()) - 10,
+                          "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(past["result"]["content"][0]["text"]), [2, 2])
+        getall = self._call("tools/call", 7, {
+            "name": "kv_hgetall", "arguments": {"key": "h"},
+        })
+        self.assertEqual(
+            json.loads(getall["result"]["content"][0]["text"]), {})
+
+    def test_tools_call_hash_field_ttls_expire(self):
+        # A field whose TTL passes is gone on the next read, and
+        # the key goes with it when it was the last field.
+        self._call("tools/call", 1, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"a": "1", "b": "2"}},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hpexpire",
+            "arguments": {"key": "h", "milliseconds": 200,
+                          "fields": ["a"]},
+        })
+        time.sleep(0.35)
+        getall = self._call("tools/call", 3, {
+            "name": "kv_hgetall", "arguments": {"key": "h"},
+        })
+        self.assertEqual(
+            json.loads(getall["result"]["content"][0]["text"]),
+            {"b": "2"},
+        )
+        ttl = self._call("tools/call", 4, {
+            "name": "kv_httl",
+            "arguments": {"key": "h", "fields": ["a", "b"]},
+        })
+        self.assertEqual(
+            json.loads(ttl["result"]["content"][0]["text"]), [-2, -1])
+        # A field removed with HDEL loses its TTL, so re-adding
+        # the field starts with no expiry.
+        self._call("tools/call", 5, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "h", "seconds": 100, "fields": ["b"]},
+        })
+        self._call("tools/call", 6, {
+            "name": "kv_hdel",
+            "arguments": {"key": "h", "fields": ["b"]},
+        })
+        self._call("tools/call", 7, {
+            "name": "kv_hset",
+            "arguments": {"key": "h", "fields": {"b": "3"}},
+        })
+        ttl_after = self._call("tools/call", 8, {
+            "name": "kv_httl",
+            "arguments": {"key": "h", "fields": ["b"]},
+        })
+        self.assertEqual(
+            json.loads(ttl_after["result"]["content"][0]["text"]),
+            [-1],
+        )
+
+    def test_tools_call_hash_field_ttls_reject_bad_arguments(self):
+        cases = [
+            # kv_hexpire: a negative TTL, a non-integer TTL, a bad
+            # condition, an empty fields list, a non-string field.
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": -5,
+                           "fields": ["a"]}},
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": "100",
+                           "fields": ["a"]}},
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": 100,
+                           "condition": "zz", "fields": ["a"]}},
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": 100, "fields": []}},
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": 100,
+                           "fields": ["a", 7]}},
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": 100}},
+            {"name": "kv_hexpire",
+             "arguments": {"key": "h", "seconds": 100,
+                           "fields": ["f%04d" % i
+                                      for i in range(1001)]}},
+            # kv_hpexpire: a negative TTL.
+            {"name": "kv_hpexpire",
+             "arguments": {"key": "h", "milliseconds": -1,
+                           "fields": ["a"]}},
+            # kv_hexpireat: a time outside the 64-bit range.
+            {"name": "kv_hexpireat",
+             "arguments": {"key": "h", "seconds": 2 ** 63,
+                           "fields": ["a"]}},
+            # kv_httl / kv_hpersist: bad fields.
+            {"name": "kv_httl",
+             "arguments": {"key": "h", "fields": "a"}},
+            {"name": "kv_hpersist", "arguments": {"key": "h"}},
+        ]
+        for i, call in enumerate(cases):
+            reply = self._call("tools/call", i + 1, call)
+            self.assertIn("error", reply, call)
+            self.assertEqual(reply["error"]["code"], -32602, call)
+
+    def test_tools_call_hash_field_ttls_wrong_type_errors(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        for i, call in enumerate([
+            {"name": "kv_hexpire",
+             "arguments": {"key": "plain", "seconds": 100,
+                           "fields": ["a"]}},
+            {"name": "kv_httl",
+             "arguments": {"key": "plain", "fields": ["a"]}},
+            {"name": "kv_hpersist",
+             "arguments": {"key": "plain", "fields": ["a"]}},
+        ]):
+            reply = self._call("tools/call", i + 2, call)
+            self.assertIn("error", reply, call)
+
+    def test_tools_call_hash_field_ttls_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_hset", "key": "h",
+                 "fields": {"a": "1", "b": "2"}},
+                {"op": "kv_hexpire", "key": "h", "seconds": 100,
+                 "fields": ["a", "b", "nope"]},
+                {"op": "kv_httl", "key": "h", "fields": ["a", "b"]},
+                {"op": "kv_hpersist", "key": "h", "fields": ["a"]},
+                {"op": "kv_httl", "key": "h", "fields": ["a", "b"]},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], [1, 1, -2])
+        ttl = summary["results"][2]["result"]
+        self.assertGreater(ttl[0], 0)
+        self.assertLessEqual(ttl[0], 100)
+        self.assertEqual(summary["results"][3]["result"], [1])
+        after_ttl = summary["results"][4]["result"]
+        self.assertEqual(after_ttl[0], -1)
+        # The b TTL can tick down by a second between the reads.
+        self.assertLessEqual(after_ttl[1], ttl[1])
+        self.assertGreaterEqual(after_ttl[1], ttl[1] - 1)
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h2",
+                 "fields": {"a": "1"}},
+                {"op": "kv_hpexpire", "key": "h2",
+                 "milliseconds": 60000, "fields": ["a"]},
+                {"op": "kv_hpttl", "key": "h2", "fields": ["a"]},
+                {"op": "kv_hexpireat", "key": "h2",
+                 "seconds": int(time.time()) + 3600,
+                 "condition": "nx", "fields": ["a"]},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 4)
+        self.assertEqual(summary["results"][0]["result"], 1)
+        self.assertEqual(summary["results"][1]["result"], [1])
+        self.assertGreater(summary["results"][2]["result"][0], 0)
+        self.assertLessEqual(summary["results"][2]["result"][0], 60000)
+        # NX does not move a field that already has an expiry.
+        self.assertEqual(summary["results"][3]["result"], [0])
+        # An EXEC-time WRONGTYPE is recorded in place, while the
+        # rest still run.
+        self._call("tools/call", 3, {
+            "name": "kv_set",
+            "arguments": {"key": "plain", "value": "v"},
+        })
+        mixed = self._call("tools/call", 4, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hexpire", "key": "plain", "seconds": 100,
+                 "fields": ["a"]},
+                {"op": "kv_hlen", "key": "h2"},
+            ]},
+        })
+        summary = json.loads(mixed["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["results"][0]["ok"])
+        self.assertIn("WRONGTYPE", summary["results"][0]["error"])
+        self.assertEqual(summary["results"][1]["result"], 1)
+        # Bad arguments fail an atomic batch up front, before
+        # anything runs.
+        bad = self._call("tools/call", 5, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_hset", "key": "h3",
+                 "fields": {"a": "1"}},
+                {"op": "kv_hexpire", "key": "h3", "seconds": -5,
+                 "fields": ["a"]},
+            ]},
+        })
+        self.assertIn("error", bad)
+        self.assertEqual(bad["error"]["code"], -32602)
 
     def test_tools_call_hash_set_get_getall(self):
         added = self._call("tools/call", 1, {
@@ -14524,6 +15186,136 @@ class McpTests(unittest.TestCase):
             safe,
         )
 
+    def test_prompts_get_write_safety_covers_hash_field_ttls(self):
+        self._call("tools/call", 1, {
+            "name": "kv_set", "arguments": {"key": "plain", "value": "v"},
+        })
+        self._call("tools/call", 2, {
+            "name": "kv_hset",
+            "arguments": {"key": "forever",
+                          "fields": {"a": "1", "b": "2", "c": "3"}},
+        })
+        self._call("tools/call", 3, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "forever", "seconds": 100,
+                          "fields": ["a"]},
+        })
+        self.fake.store["soon"] = ({"x": "1", "y": "2"},
+                                   time.time() + 3600)
+        self._call("tools/call", 4, {
+            "name": "kv_hexpire",
+            "arguments": {"key": "soon", "seconds": 100,
+                          "fields": ["x"]},
+        })
+        plan = [
+            {"op": "kv_hexpire", "key": "forever", "seconds": 200,
+             "fields": ["b"]},
+            {"op": "kv_hexpire", "key": "forever", "seconds": 200,
+             "condition": "nx", "fields": ["a"]},
+            {"op": "kv_hexpire", "key": "forever", "seconds": 0,
+             "fields": ["b"]},
+            {"op": "kv_hexpire", "key": "forever", "seconds": 0,
+             "fields": ["a", "b", "c"]},
+            {"op": "kv_hexpire", "key": "ghost", "seconds": 100,
+             "fields": ["a"]},
+            {"op": "kv_hexpire", "key": "plain", "seconds": 100,
+             "fields": ["a"]},
+            {"op": "kv_hexpire", "key": "forever", "seconds": -5,
+             "fields": ["a"]},
+            {"op": "kv_hexpire", "key": "forever", "seconds": 100,
+             "fields": []},
+            {"op": "kv_hexpire", "key": "forever", "seconds": 100,
+             "condition": "zz", "fields": ["a"]},
+            {"op": "kv_hpexpire", "key": "soon", "milliseconds": 60000,
+             "fields": ["y"]},
+            {"op": "kv_hexpireat", "key": "soon",
+             "seconds": int(time.time()) - 10, "fields": ["x"]},
+            {"op": "kv_hpersist", "key": "forever", "fields": ["a"]},
+            {"op": "kv_hpersist", "key": "forever", "fields": ["b"]},
+            {"op": "kv_hpersist", "key": "ghost", "fields": ["a"]},
+            {"op": "kv_hpersist", "key": "plain", "fields": ["a"]},
+            {"op": "kv_httl", "key": "forever", "fields": ["a"]},
+            {"op": "kv_hpttl", "key": "forever", "fields": ["a"]},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 17 op(s), 12 audited, 5 not audited.", text)
+        self.assertIn(
+            "op 6: kv_hexpire seconds must be 0 or more: -5", text)
+        self.assertIn(
+            "op 7: kv_hexpire fields must be a non-empty list: []",
+            text)
+        self.assertIn(
+            "op 8: kv_hexpire condition must be one of nx, xx, gt, "
+            "lt: 'zz'",
+            text)
+        self.assertIn("op 15: kv_httl is a read, not a write", text)
+        self.assertIn("op 16: kv_hpttl is a read, not a write", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 3: kv_hexpire 'forever' — deletes every field of a "
+            "hash that never expires",
+            risky,
+        )
+        self.assertIn(
+            "op 5: kv_hexpire 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 14: kv_hpersist 'plain' — would fail with WRONGTYPE: "
+            "the key is a string of 1 bytes",
+            risky,
+        )
+        caution = text.split("Caution (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 2: kv_hexpire 'forever' — deletes 1 of 3 fields of "
+            "a hash of 3 elements that never expires",
+            caution,
+        )
+        self.assertIn(
+            "op 10: kv_hexpireat 'soon' — deletes 1 of 2 fields of "
+            "a hash of 2 elements that expires in ",
+            caution,
+        )
+        self.assertIn(
+            "op 11: kv_hpersist 'forever' — removes the expiry "
+            "from 1 field(s) of a hash that never expires",
+            caution,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_hexpire 'forever' — sets a field expiry of "
+            "3m on 1 field(s) of a hash of 3 elements that never "
+            "expires",
+            safe,
+        )
+        self.assertIn(
+            "op 1: kv_hexpire 'forever' — no-op, the condition was "
+            "not met for any field",
+            safe,
+        )
+        self.assertIn(
+            "op 4: kv_hexpire 'ghost' — no-op, the key does not "
+            "exist",
+            safe,
+        )
+        self.assertIn(
+            "op 9: kv_hpexpire 'soon' — sets a field expiry of "
+            "60000ms on 1 field(s) of a hash of 2 elements that "
+            "expires in ",
+            safe,
+        )
+        self.assertIn(
+            "op 12: kv_hpersist 'forever' — no-op, none of the "
+            "fields has an expiry",
+            safe,
+        )
+        self.assertIn(
+            "op 13: kv_hpersist 'ghost' — no-op, the key does not "
+            "exist",
+            safe,
+        )
+
     def test_prompts_get_write_safety_covers_hyperloglog_write_ops(self):
         self._call("tools/call", 1, {
             "name": "kv_pfadd",
@@ -19126,6 +19918,213 @@ class LiveCinderMigrationTests(unittest.TestCase):
         # before expecting the count to drop.
         self.assertIsNone(self._tool("kv_get", {"key": "db:soon"}))
         self.assertEqual(self._tool("kv_dbsize", {}), before + 1)
+
+    def test_live_hexpire_family(self):
+        """kv_hexpire / kv_hpexpire / kv_hexpireat / kv_hpexpireat
+        / kv_httl / kv_hpttl / kv_hpersist against a real cinder
+        (hash field TTLs shipped in cinder 0.63.0): per-field
+        TTLs in seconds and milliseconds, the -2 / 0 / 1 / 2
+        replies, the NX / XX / GT / LT conditions against a
+        field with no expiry, absolute times in seconds and
+        milliseconds, a zero TTL and a past absolute time deleting
+        the field at once, a field whose TTL passes disappearing
+        on read, HEXPIRE preserving the key-level TTL, WRONGTYPE
+        on a string key, the tools queueing in one MULTI/EXEC
+        transaction, and the write-safety audit classifying the
+        expire family as writes."""
+        self.assertEqual(
+            self._tool("kv_hset", {"key": "httl:h",
+                                   "fields": {"a": "1", "b": "2",
+                                              "c": "3"}}),
+            3)
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 100,
+                                      "fields": ["a", "b", "nope"]}),
+            [1, 1, -2])
+        ttl = self._tool("kv_httl", {"key": "httl:h",
+                                     "fields": ["a", "b", "c"]})
+        self.assertGreater(ttl[0], 0)
+        self.assertLessEqual(ttl[0], 100)
+        self.assertLessEqual(abs(ttl[0] - ttl[1]), 1)
+        self.assertEqual(ttl[2], -1)
+        ms = self._tool("kv_hpttl", {"key": "httl:h",
+                                     "fields": ["a", "c"]})
+        self.assertGreater(ms[0], 0)
+        self.assertLessEqual(ms[0], 100000)
+        self.assertEqual(ms[1], -1)
+        # NX sets only fields with no expiry; XX only fields
+        # that already have one. Both fields have an expiry after
+        # the NX call — a from the first HEXPIRE, c from NX — so
+        # XX applies to both.
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 300,
+                                      "condition": "nx",
+                                      "fields": ["a", "c"]}),
+            [0, 1])
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 300,
+                                      "condition": "xx",
+                                      "fields": ["a", "c"]}),
+            [1, 1])
+        # GT only moves later, LT sooner — and a field with no
+        # expiry counts as never expiring, so GT never applies to
+        # it and LT always does.
+        self.assertEqual(
+            self._tool("kv_hpersist", {"key": "httl:h",
+                                       "fields": ["a"]}),
+            [1])
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 50,
+                                      "condition": "gt",
+                                      "fields": ["a", "b"]}),
+            [0, 0])
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 400,
+                                      "condition": "gt",
+                                      "fields": ["a", "b"]}),
+            [0, 1])
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 100,
+                                      "condition": "lt",
+                                      "fields": ["a", "b"]}),
+            [1, 1])
+        # A zero TTL deletes the field at once, and HPERSIST
+        # removes an expiry.
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:h", "seconds": 0,
+                                      "fields": ["c"]}),
+            [2])
+        self.assertEqual(
+            self._tool("kv_hgetall", {"key": "httl:h"}),
+            {"a": "1", "b": "2"})
+        self.assertEqual(
+            self._tool("kv_hpersist", {"key": "httl:h",
+                                       "fields": ["a", "b", "nope"]}),
+            [1, 1, -2])
+        self.assertEqual(
+            self._tool("kv_httl", {"key": "httl:h",
+                                   "fields": ["a", "b"]}),
+            [-1, -1])
+        # Absolute times: a future HEXPIREAT, a future
+        # HPEXPIREAT in milliseconds, and a past HEXPIREAT that
+        # deletes at once.
+        future = int(time.time()) + 3600
+        self.assertEqual(
+            self._tool("kv_hexpireat", {"key": "httl:h",
+                                        "seconds": future,
+                                        "fields": ["a"]}),
+            [1])
+        ttl_a = self._tool("kv_httl", {"key": "httl:h",
+                                       "fields": ["a"]})[0]
+        self.assertGreater(ttl_a, 3590)
+        self.assertLessEqual(ttl_a, 3600)
+        future_ms = int(time.time() * 1000) + 3600000
+        self.assertEqual(
+            self._tool("kv_hpexpireat", {"key": "httl:h",
+                                         "milliseconds": future_ms,
+                                         "fields": ["b"]}),
+            [1])
+        ms_b = self._tool("kv_hpttl", {"key": "httl:h",
+                                       "fields": ["b"]})[0]
+        self.assertGreater(ms_b, 3599000)
+        self.assertLessEqual(ms_b, 3600000)
+        self.assertEqual(
+            self._tool("kv_hexpireat", {"key": "httl:h",
+                                        "seconds": int(time.time()) - 10,
+                                        "fields": ["a", "b"]}),
+            [2, 2])
+        self.assertEqual(
+            self._tool("kv_hgetall", {"key": "httl:h"}), {})
+        # A field whose TTL passes is gone on the next read.
+        self.assertEqual(
+            self._tool("kv_hset", {"key": "httl:e",
+                                   "fields": {"x": "1", "y": "2"}}),
+            2)
+        self.assertEqual(
+            self._tool("kv_hpexpire", {"key": "httl:e",
+                                       "milliseconds": 200,
+                                       "fields": ["x"]}),
+            [1])
+        time.sleep(0.35)
+        self.assertEqual(
+            self._tool("kv_hgetall", {"key": "httl:e"}), {"y": "2"})
+        # HEXPIRE preserves the key-level TTL, and a field TTL
+        # outliving the key dies with it.
+        self.assertEqual(
+            self._tool("kv_hset", {"key": "httl:k",
+                                   "fields": {"f": "1"}}),
+            1)
+        self.assertEqual(
+            self._tool("kv_expire", {"key": "httl:k", "seconds": 1000}),
+            1)
+        self.assertEqual(
+            self._tool("kv_hexpire", {"key": "httl:k", "seconds": 100,
+                                      "fields": ["f"]}),
+            [1])
+        key_ttl = self._tool("kv_ttl", {"key": "httl:k"})
+        self.assertGreater(key_ttl, 990)
+        self.assertLessEqual(key_ttl, 1000)
+        # WRONGTYPE on a string key, and bad arguments fail as
+        # invalid params.
+        self.assertEqual(
+            self._tool("kv_set", {"key": "httl:plain", "value": "v"}),
+            "OK")
+        for name, arguments in (
+                ("kv_hexpire",
+                 {"key": "httl:plain", "seconds": 100,
+                  "fields": ["a"]}),
+                ("kv_httl",
+                 {"key": "httl:plain", "fields": ["a"]}),
+                ("kv_hpersist",
+                 {"key": "httl:plain", "fields": ["a"]}),
+                ("kv_hexpire",
+                 {"key": "httl:k", "seconds": -5, "fields": ["f"]}),
+                ("kv_hexpire",
+                 {"key": "httl:k", "seconds": 100,
+                  "condition": "zz", "fields": ["f"]})):
+            reply = self._call("tools/call", 99, {
+                "name": name, "arguments": arguments})
+            self.assertIn("error", reply, arguments)
+        # The tools queue in one MULTI/EXEC transaction.
+        summary = self._tool("kv_batch", {"atomic": True, "ops": [
+            {"op": "kv_hset", "key": "httl:tx",
+             "fields": {"a": "1", "b": "2"}},
+            {"op": "kv_hexpire", "key": "httl:tx", "seconds": 100,
+             "fields": ["a", "b"]},
+            {"op": "kv_httl", "key": "httl:tx", "fields": ["a", "b"]},
+        ]})
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 3)
+        self.assertEqual(summary["results"][0]["result"], 2)
+        self.assertEqual(summary["results"][1]["result"], [1, 1])
+        self.assertGreater(summary["results"][2]["result"][0], 0)
+        # The write-safety audit classifies the expire family as
+        # writes: deleting every field of a never-expiring hash
+        # is risky, setting an expiry is safe, and the reads are
+        # not audited.
+        text = self._call("prompts/get", 98, {
+            "name": "write-safety",
+            "arguments": {"plan": json.dumps([
+                {"op": "kv_hexpire", "key": "httl:tx", "seconds": 0,
+                 "fields": ["a", "b"]},
+                {"op": "kv_hexpire", "key": "httl:tx", "seconds": 200,
+                 "fields": ["a"]},
+                {"op": "kv_httl", "key": "httl:tx", "fields": ["a"]},
+            ])},
+        })["result"]["messages"][0]["content"]["text"]
+        self.assertIn("Plan: 3 op(s), 2 audited, 1 not audited.", text)
+        self.assertIn(
+            "op 0: kv_hexpire 'httl:tx' — deletes every field of a "
+            "hash that never expires",
+            text.split("Risky (")[1].split("\n\n")[0],
+        )
+        self.assertIn(
+            "op 1: kv_hexpire 'httl:tx' — sets a field expiry of "
+            "3m on 1 field(s) of a hash of 2 elements that never "
+            "expires",
+            text.split("Safe (")[1].split("\n\n")[0],
+        )
+        self.assertIn("op 2: kv_httl is a read, not a write", text)
 
 
 if __name__ == "__main__":

@@ -507,13 +507,105 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "key": {"type": "string"},
-                "field": {"type": "string"},
-                "increment": {"type": "number"},
+                "key": { "type": "string" },
+                "field": { "type": "string" },
+                "increment": { "type": "number" },
             },
             "required": ["key", "field", "increment"],
         },
     },
+    {
+        "name": "kv_hexpire",
+        "description": "Set fields of a hash to expire after a number of seconds: HEXPIRE key seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]. Takes `seconds` and `fields` as a list of field names (at most 1000). Returns one integer per field, in order: -2 the key or the field does not exist, 0 the condition was not met, 1 the expiry was set, 2 the field was deleted at once (a zero TTL). With condition \"nx\" only fields with no expiry are set, \"xx\" only fields that already have one, \"gt\" only when the new expiry is later than the current one, \"lt\" only when it is sooner — a field with no expiry counts as never expiring, so gt never applies to it and lt always does. Seconds must be 0 or more.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "seconds": {"type": "integer"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "condition": {"type": "string"},
+           },
+            "required": ["key", "seconds", "fields"],
+       },
+   },
+    {
+        "name": "kv_hpexpire",
+        "description": "Set fields of a hash to expire after a number of milliseconds: HPEXPIRE key milliseconds [NX | XX | GT | LT] FIELDS numfields field [field ...]. Takes `milliseconds` and `fields` as a list of field names (at most 1000). Returns one integer per field, in order: -2 the key or the field does not exist, 0 the condition was not met, 1 the expiry was set, 2 the field was deleted at once (a zero TTL). With condition \"nx\" only fields with no expiry are set, \"xx\" only fields that already have one, \"gt\" only when the new expiry is later than the current one, \"lt\" only when it is sooner — a field with no expiry counts as never expiring, so gt never applies to it and lt always does. Milliseconds must be 0 or more.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "milliseconds": {"type": "integer"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "condition": {"type": "string"},
+           },
+            "required": ["key", "milliseconds", "fields"],
+       },
+   },
+    {
+        "name": "kv_hexpireat",
+        "description": "Set fields of a hash to expire at an absolute Unix time in seconds: HEXPIREAT key seconds [NX | XX | GT | LT] FIELDS numfields field [field ...]. Takes `seconds` as a Unix timestamp and `fields` as a list of field names (at most 1000). Returns one integer per field, in order: -2 the key or the field does not exist, 0 the condition was not met, 1 the expiry was set, 2 the field was deleted at once (a time already past). With condition \"nx\" only fields with no expiry are set, \"xx\" only fields that already have one, \"gt\" only when the new expiry is later than the current one, \"lt\" only when it is sooner — a field with no expiry counts as never expiring, so gt never applies to it and lt always does.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "seconds": {"type": "integer"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "condition": {"type": "string"},
+           },
+            "required": ["key", "seconds", "fields"],
+       },
+   },
+    {
+        "name": "kv_hpexpireat",
+        "description": "Set fields of a hash to expire at an absolute Unix time in milliseconds: HPEXPIREAT key milliseconds [NX | XX | GT | LT] FIELDS numfields field [field ...]. Takes `milliseconds` as a Unix timestamp in milliseconds and `fields` as a list of field names (at most 1000). Returns one integer per field, in order: -2 the key or the field does not exist, 0 the condition was not met, 1 the expiry was set, 2 the field was deleted at once (a time already past). With condition \"nx\" only fields with no expiry are set, \"xx\" only fields that already have one, \"gt\" only when the new expiry is later than the current one, \"lt\" only when it is sooner — a field with no expiry counts as never expiring, so gt never applies to it and lt always does.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "milliseconds": {"type": "integer"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+                "condition": {"type": "string"},
+           },
+            "required": ["key", "milliseconds", "fields"],
+       },
+   },
+    {
+        "name": "kv_httl",
+        "description": "Seconds until fields of a hash expire: HTTL key FIELDS numfields field [field ...]. Takes `fields` as a list of field names (at most 1000). Returns one integer per field, in order: the remaining TTL in seconds, -1 when the field has no expiry, -2 when the key or the field does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+           },
+            "required": ["key", "fields"],
+       },
+   },
+    {
+        "name": "kv_hpttl",
+        "description": "Milliseconds until fields of a hash expire: HPTTL key FIELDS numfields field [field ...]. Takes `fields` as a list of field names (at most 1000). Returns one integer per field, in order: the remaining TTL in milliseconds, -1 when the field has no expiry, -2 when the key or the field does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+           },
+            "required": ["key", "fields"],
+       },
+   },
+    {
+        "name": "kv_hpersist",
+        "description": "Remove the expiry from fields of a hash: HPERSIST key FIELDS numfields field [field ...]. Takes `fields` as a list of field names (at most 1000). Returns one integer per field, in order: 1 an expiry was removed, -1 the field had no expiry, -2 the key or the field does not exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "fields": {"type": "array", "items": {"type": "string"}},
+           },
+            "required": ["key", "fields"],
+       },
+   },
     {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
@@ -1332,7 +1424,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1461,6 +1553,8 @@ BATCHABLE_TOOLS = {
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
+    "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
+    "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1555,6 +1649,8 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_hset", "kv_hget", "kv_hgetall", "kv_hdel", "kv_hexists", "kv_hlen",
     "kv_hmget", "kv_hsetnx", "kv_hincrby", "kv_hscan",
     "kv_hkeys", "kv_hvals", "kv_hincrbyfloat",
+    "kv_hexpire", "kv_hpexpire", "kv_hexpireat", "kv_hpexpireat",
+    "kv_httl", "kv_hpttl", "kv_hpersist",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -2194,6 +2290,33 @@ def _op_argv(name, args):
     if name == "kv_hincrbyfloat":
         key, field, increment = _hincrbyfloat_args(args)
         return ["HINCRBYFLOAT", key, field, increment]
+    if name in ("kv_hexpire", "kv_hpexpire", "kv_hexpireat",
+                "kv_hpexpireat"):
+        # HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field
+        # ... — HPEXPIRE the same in milliseconds, HEXPIREAT /
+        # HPEXPIREAT with an absolute Unix time instead.
+        command, time_field = {
+            "kv_hexpire": ("HEXPIRE", "seconds"),
+            "kv_hpexpire": ("HPEXPIRE", "milliseconds"),
+            "kv_hexpireat": ("HEXPIREAT", "seconds"),
+            "kv_hpexpireat": ("HPEXPIREAT", "milliseconds"),
+        }[name]
+        key, time_value, condition, fields = _hexpire_time_args(
+            args, name, time_field,
+            absolute=name.endswith("at"),
+            is_ms=name in ("kv_hpexpire", "kv_hpexpireat"),
+        )
+        cmd = [command, key, time_value]
+        if condition is not None:
+            cmd.append(condition)
+        return cmd + ["FIELDS", len(fields)] + fields
+    if name in ("kv_httl", "kv_hpttl", "kv_hpersist"):
+        # HTTL / HPTTL / HPERSIST key FIELDS numfields field ...
+        command = {"kv_httl": "HTTL", "kv_hpttl": "HPTTL",
+                   "kv_hpersist": "HPERSIST"}[name]
+        fields = _hexpire_fields_args(args, name)
+        return [command, _require(args, "key"),
+                "FIELDS", len(fields)] + fields
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -3015,6 +3138,78 @@ def _hash_fields_args(args, name):
         if not isinstance(field, str):
             raise ValueError("%s fields must be strings" % name)
     return list(fields)
+
+
+# The most fields one hash-field TTL call covers; a wider call
+# fails instead of returning a silently truncated list.
+MAX_HASH_TTL_FIELDS = 1000
+
+# The one condition a HEXPIRE-family call may carry, between the
+# time and FIELDS.
+HEXPIRE_CONDITIONS = ("nx", "xx", "gt", "lt")
+
+
+def _hexpire_fields_args(args, name):
+    """The field names for a hash-field TTL call, as an argv list.
+    `fields` must be a non-empty list of strings, at most
+    MAX_HASH_TTL_FIELDS; anything else fails the call instead of
+    sending a half-formed command."""
+    fields = _hash_fields_args(args, name)
+    if len(fields) > MAX_HASH_TTL_FIELDS:
+        raise ValueError(
+            "%s fields must have at most %d entries, got %d"
+            % (name, MAX_HASH_TTL_FIELDS, len(fields))
+        )
+    return fields
+
+
+def _hexpire_condition(args, name):
+    """The optional NX/XX/GT/LT condition for a HEXPIRE-family
+    call, upper-cased for the argv, or None when no condition was
+    given. Anything else fails as invalid params instead of as a
+    server syntax error."""
+    condition = args.get("condition")
+    if condition is None:
+        return None
+    if not isinstance(condition, str) \
+            or condition.lower() not in HEXPIRE_CONDITIONS:
+        raise ValueError(
+            "%s condition must be one of nx, xx, gt, lt: %r"
+            % (name, condition)
+        )
+    return condition.upper()
+
+
+def _hexpire_time_args(args, name, time_field, absolute, is_ms):
+    """Validate a HEXPIRE-family call: (key, time, condition,
+    fields). The time must be an integer: a relative one must be 0
+    or more — 0 deletes the fields at once, as in Redis — while an
+    absolute one may be in the past (it deletes the fields too)
+    but must fit in a signed 64-bit integer, and for seconds must
+    survive cinder's conversion to milliseconds, as cinder's
+    parser requires."""
+    key = _require(args, "key")
+    time_value = _require(args, time_field)
+    if isinstance(time_value, bool) or not isinstance(time_value, int):
+        raise ValueError("%s %s must be an integer" % (name, time_field))
+    if absolute:
+        if is_ms:
+            lo, hi = -(2 ** 63), 2 ** 63 - 1
+        else:
+            lo = -((2 ** 63 - 1) // 1000)
+            hi = (2 ** 63 - 1) // 1000
+        if time_value < lo or time_value > hi:
+            raise ValueError(
+                "%s %s is out of range: %r" % (name, time_field, time_value)
+            )
+    elif time_value < 0:
+        raise ValueError(
+            "%s %s must be 0 or more, got %d"
+            % (name, time_field, time_value)
+        )
+    condition = _hexpire_condition(args, name)
+    fields = _hexpire_fields_args(args, name)
+    return key, time_value, condition, fields
 
 
 # The most members one kv_zrange call returns; a wider range fails
