@@ -801,6 +801,40 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_xinfo_stream",
+        "description": "Stream info: XINFO STREAM key. Takes `key` as a string and returns {\"length\": ..., \"last_generated_id\": ..., \"max_deleted_entry_id\": ..., \"entries_added\": ..., \"groups\": ..., \"first_entry\": ... or null, \"last_entry\": ... or null} — the entry count, the top ID, the highest ID trimmed away by MAXLEN (\"0-0\" when nothing was trimmed), how many entries were ever added, how many consumer groups the stream has, and its first and last entries as {\"id\": ..., \"fields\": {...}} (null when the stream is empty). A missing key fails, and a key that is not a stream fails with WRONGTYPE. A read, so it changes nothing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_xinfo_groups",
+        "description": "Consumer groups of a stream: XINFO GROUPS key. Takes `key` as a string and returns one {\"name\": ..., \"consumers\": ..., \"pending\": ..., \"last_delivered_id\": ..., \"entries_read\": ... or null} object per consumer group, in creation order — the group's name, how many consumers it has, how many entries are pending in it, the last ID it delivered, and how many new entries it has read (null for a group that has never read; a pending re-read does not count). A missing key answers an empty list, and a key that is not a stream fails with WRONGTYPE. A read, so it changes nothing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "kv_xinfo_consumers",
+        "description": "Consumers of a consumer group: XINFO CONSUMERS key group. Takes `key` and `group` as strings and returns one {\"name\": ..., \"pending\": ..., \"idle_ms\": ..., \"inactive_ms\": ...} object per consumer, in the order the consumers first read (or were created) — the consumer's name, how many of the group's pending entries it holds, the milliseconds since it last attempted to interact (an XREADGROUP or XCLAIM), and the milliseconds since it last successfully read (an XREADGROUP that delivered entries). A missing key or a group that does not exist fails with NOGROUP, and a key that is not a stream fails with WRONGTYPE. A read, so it changes nothing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "group": {"type": "string"},
+            },
+            "required": ["key", "group"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -1618,7 +1652,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_xgroup_setid, kv_xgroup_destroy, kv_xgroup_delconsumer, kv_xgroup_createconsumer, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_xgroup_setid, kv_xgroup_destroy, kv_xgroup_delconsumer, kv_xgroup_createconsumer, kv_xinfo_stream, kv_xinfo_groups, kv_xinfo_consumers, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1755,6 +1789,7 @@ BATCHABLE_TOOLS = {
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
     "kv_xclaim", "kv_xgroup_setid", "kv_xgroup_destroy",
     "kv_xgroup_delconsumer", "kv_xgroup_createconsumer",
+    "kv_xinfo_stream", "kv_xinfo_groups", "kv_xinfo_consumers",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1855,6 +1890,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
     "kv_xclaim", "kv_xgroup_setid", "kv_xgroup_destroy",
     "kv_xgroup_delconsumer", "kv_xgroup_createconsumer",
+    "kv_xinfo_stream", "kv_xinfo_groups", "kv_xinfo_consumers",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -2148,6 +2184,22 @@ def _call_batch_atomic(client, ops):
             # transaction; shape it like the standalone tool does.
             value = _xpending_result(
                 reply, _xpending_args(op)[2] is not None)
+        elif op_name == "kv_xinfo_stream":
+            # XINFO STREAM came back as the flat 14-element
+            # [key, value, ...] array inside the transaction;
+            # shape it like the standalone tool does, into the
+            # stream-info object.
+            value = _xinfo_stream_result(reply)
+        elif op_name == "kv_xinfo_groups":
+            # XINFO GROUPS came back as one flat 10-element array
+            # per group inside the transaction; shape it like the
+            # standalone tool does, into group objects.
+            value = _xinfo_groups_result(reply)
+        elif op_name == "kv_xinfo_consumers":
+            # XINFO CONSUMERS came back as one flat 8-element
+            # array per consumer inside the transaction; shape it
+            # like the standalone tool does, into consumer objects.
+            value = _xinfo_consumers_result(reply)
         elif op_name == "kv_xclaim":
             # XCLAIM came back as [[id, [field, value, ...]], ...]
             # — or only the IDs with JUSTID — inside the
@@ -2739,6 +2791,21 @@ def _op_argv(name, args):
         # entries are untouched, and the stream is untouched.
         key, group, consumer = _xgroup_createconsumer_args(args)
         return ["XGROUP", "CREATECONSUMER", key, group, consumer]
+    if name == "kv_xinfo_stream":
+        # XINFO STREAM key — the stream at a glance: its length,
+        # top ID, highest ID trimmed away, how many entries were
+        # ever added, how many groups it has, and its first and
+        # last entries (nil when it is empty).
+        return ["XINFO", "STREAM", _xinfo_stream_args(args)]
+    if name == "kv_xinfo_groups":
+        # XINFO GROUPS key — one entry per consumer group, in
+        # creation order.
+        return ["XINFO", "GROUPS", _xinfo_groups_args(args)]
+    if name == "kv_xinfo_consumers":
+        # XINFO CONSUMERS key group — one entry per consumer, in
+        # the order the consumers first read (or were created).
+        key, group = _xinfo_consumers_args(args)
+        return ["XINFO", "CONSUMERS", key, group]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -4397,6 +4464,135 @@ def _call_xgroup_createconsumer(client, args):
     0 when it already existed."""
     reply = client.command(*_op_argv("kv_xgroup_createconsumer", args))
     return reply
+
+
+def _xinfo_stream_args(args):
+    """Validate a kv_xinfo_stream call: (key). The key must be a
+    string. There is nothing else to validate: a missing key fails
+    at the server, as in real cinder."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xinfo_stream key must be a string")
+    return key
+
+
+def _xinfo_groups_args(args):
+    """Validate a kv_xinfo_groups call: (key). The key must be a
+    string. A missing key answers an empty list at the server, as
+    in real cinder."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xinfo_groups key must be a string")
+    return key
+
+
+def _xinfo_consumers_args(args):
+    """Validate a kv_xinfo_consumers call: (key, group). Both must
+    be strings. A missing key or group fails with NOGROUP at the
+    server, as in real cinder."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xinfo_consumers key must be a string")
+    group = _require(args, "group")
+    if not isinstance(group, str):
+        raise ValueError("kv_xinfo_consumers group must be a string")
+    return key, group
+
+
+def _xinfo_entry(entry):
+    """Shape one XINFO STREAM first/last entry [id, [field, value,
+    ...]] into {"id": ..., "fields": {...}}, or None for a nil
+    entry — an empty stream reports both ends as nil, as in real
+    cinder. A field named twice keeps only its last value in the
+    object, as in _xrange_result."""
+    if entry is None:
+        return None
+    entry_id, flat = entry
+    return {
+        "id": entry_id,
+        "fields": {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)},
+    }
+
+
+def _xinfo_stream_result(reply):
+    """Shape a flat XINFO STREAM reply [length, n,
+    last-generated-id, id, max-deleted-entry-id, id,
+    entries-added, n, groups, n, first-entry, entry-or-nil,
+    last-entry, entry-or-nil] into the stream-info object. The
+    keys come back as bulk strings, so the flat list is zipped
+    into a dict first."""
+    flat = dict(zip(reply[0::2], reply[1::2]))
+    return {
+        "length": flat["length"],
+        "last_generated_id": flat["last-generated-id"],
+        "max_deleted_entry_id": flat["max-deleted-entry-id"],
+        "entries_added": flat["entries-added"],
+        "groups": flat["groups"],
+        "first_entry": _xinfo_entry(flat["first-entry"]),
+        "last_entry": _xinfo_entry(flat["last-entry"]),
+    }
+
+
+def _xinfo_groups_result(reply):
+    """Shape an XINFO GROUPS reply [[name, ..., consumers, n,
+    pending, n, last-delivered-id, id, entries-read, n-or-nil],
+    ...] into a list of group objects, in creation order.
+    entries-read stays None for a group that has never read, as
+    in real cinder."""
+    groups = []
+    for flat_list in reply or []:
+        flat = dict(zip(flat_list[0::2], flat_list[1::2]))
+        groups.append({
+            "name": flat["name"],
+            "consumers": flat["consumers"],
+            "pending": flat["pending"],
+            "last_delivered_id": flat["last-delivered-id"],
+            "entries_read": flat["entries-read"],
+        })
+    return groups
+
+
+def _xinfo_consumers_result(reply):
+    """Shape an XINFO CONSUMERS reply [[name, ..., pending, n,
+    idle, ms, inactive, ms], ...] into a list of consumer
+    objects, in the order the consumers first read (or were
+    created). idle is the ms since the consumer last attempted
+    to interact, inactive the ms since it last successfully
+    read."""
+    consumers = []
+    for flat_list in reply or []:
+        flat = dict(zip(flat_list[0::2], flat_list[1::2]))
+        consumers.append({
+            "name": flat["name"],
+            "pending": flat["pending"],
+            "idle_ms": flat["idle"],
+            "inactive_ms": flat["inactive"],
+        })
+    return consumers
+
+
+def _call_xinfo_stream(client, args):
+    """kv_xinfo_stream: the stream at a glance — length, top ID,
+    highest trimmed ID, entries ever added, group count, and its
+    first and last entries (null when it is empty)."""
+    reply = client.command(*_op_argv("kv_xinfo_stream", args))
+    return _xinfo_stream_result(reply)
+
+
+def _call_xinfo_groups(client, args):
+    """kv_xinfo_groups: one object per consumer group on the
+    stream, in creation order — an empty list for a missing
+    key."""
+    reply = client.command(*_op_argv("kv_xinfo_groups", args))
+    return _xinfo_groups_result(reply)
+
+
+def _call_xinfo_consumers(client, args):
+    """kv_xinfo_consumers: one object per consumer of the group,
+    in first-read order, with pending counts and idle/inactive
+    times in milliseconds."""
+    reply = client.command(*_op_argv("kv_xinfo_consumers", args))
+    return _xinfo_consumers_result(reply)
 
 
 # The most members one kv_zrange call returns; a wider range fails
@@ -6145,6 +6341,12 @@ def _call_single(client, name, args):
         return _call_xgroup_delconsumer(client, args)
     if name == "kv_xgroup_createconsumer":
         return _call_xgroup_createconsumer(client, args)
+    if name == "kv_xinfo_stream":
+        return _call_xinfo_stream(client, args)
+    if name == "kv_xinfo_groups":
+        return _call_xinfo_groups(client, args)
+    if name == "kv_xinfo_consumers":
+        return _call_xinfo_consumers(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":

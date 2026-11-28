@@ -4,7 +4,7 @@ The fake server implements just enough of cinder's surface (PING, SET,
 GET, DEL, KEYS, SCAN, DBSIZE, INCR, INCRBY, TTL, PTTL, EXISTS, EXPIRE, PEXPIRE, MSET, MGET,
 GETDEL, SETNX, SETEX, GETSET, LLEN, SCARD, HLEN,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LINDEX, LSET, LINSERT, LPUSHX, RPUSHX, LTRIM, LMOVE, SADD, SREM, SMEMBERS, SISMEMBER, SSCAN, HSET, HGET, HGETALL, HDEL, HEXISTS, HMGET, HSETNX, HINCRBY, HKEYS, HVALS, HINCRBYFLOAT, HSCAN, ZADD, ZRANGE, ZREVRANGE,
-ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, XGROUP, XREADGROUP, XACK, XCLAIM, XPENDING, MULTI, EXEC, DISCARD)
+ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZRANGEBYLEX, ZLEXCOUNT, ZCARD, ZSCORE, ZMSCORE, ZUNION, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZRANK, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZREMRANGEBYLEX, ZINCRBY, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZSCAN, GEOADD, GEODIST, GEOPOS, GEOHASH, GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER, GEORADIUS_RO, GEORADIUSBYMEMBER_RO, XADD, XRANGE, XREVRANGE, XLEN, XREAD, XGROUP, XREADGROUP, XACK, XCLAIM, XPENDING, XINFO, MULTI, EXEC, DISCARD)
 to prove the MCP layer works: the handshake, the tool list, a SET-then-GET round trip, and clean
 JSON-RPC errors when cinder is unreachable or a request is malformed.
 Keys in the fake store may also hold a list, set, dict, or sorted-set
@@ -82,12 +82,21 @@ class Stream:
     name to a dict with the last-delivered ID ("cursor"), the
     pending list ("pel": (ms, seq) -> [consumer, delivered_ms,
     delivery count]) and the consumers in the order they first
-    read ("consumers")."""
+    read ("consumers"), plus how many new entries the group has
+    read ("entries_read": -1 until a ">" read delivers something,
+    as in real cinder) and each consumer's last attempted
+    interaction and last successful read ("seen": consumer ->
+    [seen_ms, active_ms], as XINFO CONSUMERS reports them). The
+    stream also counts every entry ever added ("entries_added")
+    and the highest ID trimmed away by MAXLEN ("max_deleted"),
+    as XINFO STREAM reports them."""
 
     def __init__(self):
         self.entries = []
         self.top_ms = 0
         self.top_seq = 0
+        self.entries_added = 0
+        self.max_deleted = (0, 0)
         self.groups = {}
 
     def __len__(self):
@@ -335,6 +344,22 @@ class FakeCinder(threading.Thread):
             return "$-1\r\n"
         raw = value.encode()
         return "$%d\r\n%s\r\n" % (len(raw), value)
+
+    def _stream_entry(self, entry):
+        """One stream entry (ms, seq, [(field, value), ...]) as a
+        RESP [id, [field, value, ...]] array, or nil for None —
+        an empty stream's first or last entry, as XINFO STREAM
+        reports it."""
+        if entry is None:
+            return "$-1\r\n"
+        ms, seq, pairs = entry
+        out = "*2\r\n"
+        out += self._bulk("%d-%d" % (ms, seq))
+        flat = [item for pair in pairs for item in pair]
+        out += "*%d\r\n" % len(flat)
+        for item in flat:
+            out += self._bulk(item)
+        return out
 
     def _get(self, key):
         entry = self.store.get(key)
@@ -3365,11 +3390,15 @@ class FakeCinder(threading.Thread):
                 self.store[key] = (value, expires)
             value.entries.append((ms, seq, pairs))
             value.top_ms, value.top_seq = ms, seq
+            value.entries_added += 1
             if maxlen >= 0:
                 # MAXLEN trims from the front; a trim that empties
                 # the stream deletes the key, as in real cinder.
+                # The highest ID trimmed away is what XINFO STREAM
+                # reports as max-deleted-entry-id.
                 while len(value.entries) > maxlen:
-                    value.entries.pop(0)
+                    dropped = value.entries.pop(0)
+                    value.max_deleted = (dropped[0], dropped[1])
                 if not value.entries:
                     del self.store[key]
             return self._bulk("%d-%d" % (ms, seq))
@@ -3638,6 +3667,12 @@ class FakeCinder(threading.Thread):
                 if consumer in grp["consumers"]:
                     return ":0\r\n"
                 grp["consumers"].append(consumer)
+                # A consumer created up front starts with its seen
+                # and active times at now, as in real cinder, so
+                # XINFO CONSUMERS reports it as just interacted
+                # with and just read.
+                now_ms = int(time.time() * 1000)
+                grp["seen"][consumer] = [now_ms, now_ms]
                 return ":1\r\n"
             if args[0].upper() == "DELCONSUMER":
                 # XGROUP DELCONSUMER key group consumer: drop one
@@ -3669,6 +3704,7 @@ class FakeCinder(threading.Thread):
                     del grp["pel"][bound]
                     removed += 1
                 grp["consumers"].remove(consumer)
+                grp["seen"].pop(consumer, None)
                 return ":%d\r\n" % removed
             if args[0].upper() == "SETID":
                 if len(args) != 4:
@@ -3735,7 +3771,8 @@ class FakeCinder(threading.Thread):
                 return ("-ERR BUSYGROUP Consumer Group name already "
                         "exists\r\n")
             value.groups[group] = {"cursor": cursor, "pel": {},
-                                   "consumers": []}
+                                   "consumers": [], "entries_read": -1,
+                                   "seen": {}}
             return "+OK\r\n"
         elif name == "XREADGROUP":
             # XREADGROUP GROUP group consumer [COUNT count] [BLOCK
@@ -3842,8 +3879,29 @@ class FakeCinder(threading.Thread):
                     for ms, seq, _pairs in entries:
                         grp["pel"][(ms, seq)] = [consumer, now_ms, 1]
                     grp["cursor"] = (entries[-1][0], entries[-1][1])
+                    # A ">" read is the only thing that counts
+                    # towards the group's entries-read: a pending
+                    # re-read does not. The first delivery moves
+                    # the counter from -1 (never read) to the
+                    # count, as in real cinder.
+                    if grp["entries_read"] < 0:
+                        grp["entries_read"] = 0
+                    grp["entries_read"] += len(entries)
                 if consumer not in grp["consumers"]:
                     grp["consumers"].append(consumer)
+                # The consumer attempted to interact, whether or
+                # not the read returns anything — XINFO CONSUMERS
+                # reports the time since this as `idle`. A read
+                # that delivered entries is also a successful read,
+                # so it moves `inactive` too. A new consumer starts
+                # with both times at now, as in real cinder.
+                seen = grp["seen"].get(consumer)
+                if seen is None:
+                    grp["seen"][consumer] = [now_ms, now_ms]
+                else:
+                    seen[0] = now_ms
+                    if entries:
+                        seen[1] = now_ms
                 if entries:
                     out.append((key, entries))
             if not out and block >= 0:
@@ -3997,6 +4055,15 @@ class FakeCinder(threading.Thread):
                 return ("-ERR NOGROUP No such key '%s' or consumer "
                         "group '%s'\r\n" % (key, group))
             now_ms = int(time.time() * 1000)
+            # The consumer attempted to interact — XINFO
+            # CONSUMERS reports the time since this as `idle`. A
+            # claim is not a read, so `inactive` (time since the
+            # last successful read) is left alone, as in real
+            # cinder. A consumer that does not exist yet is not
+            # touched: it joins only when at least one entry is
+            # claimed, below.
+            if consumer in grp["seen"]:
+                grp["seen"][consumer][0] = now_ms
             delivery_time = now_ms
             if time_ms is not None:
                 delivery_time = time_ms
@@ -4030,6 +4097,9 @@ class FakeCinder(threading.Thread):
                 claimed.append((bound[0], bound[1], pairs))
             if claimed and consumer not in grp["consumers"]:
                 grp["consumers"].append(consumer)
+                # A consumer created by a claim starts with its
+                # seen and active times at now, as in real cinder.
+                grp["seen"][consumer] = [now_ms, now_ms]
             if justid:
                 reply = "*%d\r\n" % len(claimed)
                 for ms, seq, _pairs in claimed:
@@ -4044,6 +4114,127 @@ class FakeCinder(threading.Thread):
                 for item in flat:
                     reply += self._bulk(item)
             return reply
+        elif name == "XINFO":
+            # XINFO STREAM key / GROUPS key / CONSUMERS key group /
+            # HELP, as in real cinder: STREAM is a flat 14-element
+            # [key, value, ...] array — length, last-generated-id,
+            # max-deleted-entry-id, entries-added, groups, and the
+            # first and last entries (nil when the stream is
+            # empty); GROUPS is one flat 10-element array per
+            # group, in creation order — name, consumers, pending,
+            # last-delivered-id, entries-read (nil for a group
+            # that has never read); CONSUMERS is one flat
+            # 8-element array per consumer, in the order the
+            # consumers first read (or were created) — name,
+            # pending, idle ms since the last attempted
+            # interaction, inactive ms since the last successful
+            # read. STREAM errors on a missing key, GROUPS answers
+            # an empty array for one, and CONSUMERS errors with
+            # NOGROUP for a missing key or group; all three are
+            # WRONGTYPE on a non-stream key. HELP lists the
+            # subcommands, and an unknown subcommand is an error.
+            if not args:
+                return ("-ERR wrong number of arguments for 'xinfo' "
+                        "command\r\n")
+            sub = args[0].upper()
+            if sub == "HELP":
+                if len(args) != 1:
+                    return ("-ERR wrong number of arguments for 'xinfo' "
+                            "command\r\n")
+                reply = "*5\r\n"
+                for line in ("XINFO <subcommand> [<arg> [value] [opt] "
+                             "...]. Subcommands are:",
+                             "CONSUMERS <key> <group>", "GROUPS <key>",
+                             "STREAM <key>", "HELP"):
+                    reply += self._bulk(line)
+                return reply
+            if sub == "STREAM":
+                if len(args) != 2:
+                    return ("-ERR wrong number of arguments for 'xinfo' "
+                            "command\r\n")
+                value = self._get(args[1])
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key holding "
+                            "the wrong kind of value\r\n")
+                if value is None:
+                    return "-ERR no such key '%s'\r\n" % args[1]
+                reply = "*14\r\n"
+                reply += self._bulk("length")
+                reply += ":%d\r\n" % len(value)
+                reply += self._bulk("last-generated-id")
+                reply += self._bulk("%d-%d"
+                                    % (value.top_ms, value.top_seq))
+                reply += self._bulk("max-deleted-entry-id")
+                reply += self._bulk("%d-%d" % value.max_deleted)
+                reply += self._bulk("entries-added")
+                reply += ":%d\r\n" % value.entries_added
+                reply += self._bulk("groups")
+                reply += ":%d\r\n" % len(value.groups)
+                reply += self._bulk("first-entry")
+                reply += self._stream_entry(
+                    value.entries[0] if value.entries else None)
+                reply += self._bulk("last-entry")
+                reply += self._stream_entry(
+                    value.entries[-1] if value.entries else None)
+                return reply
+            if sub == "GROUPS":
+                if len(args) != 2:
+                    return ("-ERR wrong number of arguments for 'xinfo' "
+                            "command\r\n")
+                value = self._get(args[1])
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key holding "
+                            "the wrong kind of value\r\n")
+                groups = value.groups if value is not None else {}
+                reply = "*%d\r\n" % len(groups)
+                for group, grp in groups.items():
+                    reply += "*10\r\n"
+                    reply += self._bulk("name")
+                    reply += self._bulk(group)
+                    reply += self._bulk("consumers")
+                    reply += ":%d\r\n" % len(grp["consumers"])
+                    reply += self._bulk("pending")
+                    reply += ":%d\r\n" % len(grp["pel"])
+                    reply += self._bulk("last-delivered-id")
+                    reply += self._bulk("%d-%d" % grp["cursor"])
+                    reply += self._bulk("entries-read")
+                    if grp["entries_read"] < 0:
+                        reply += "$-1\r\n"
+                    else:
+                        reply += ":%d\r\n" % grp["entries_read"]
+                return reply
+            if sub == "CONSUMERS":
+                if len(args) != 3:
+                    return ("-ERR wrong number of arguments for 'xinfo' "
+                            "command\r\n")
+                key, group = args[1], args[2]
+                value = self._get(key)
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key holding "
+                            "the wrong kind of value\r\n")
+                grp = value.groups.get(group) if value is not None else None
+                if grp is None:
+                    return ("-ERR NOGROUP No such key '%s' or consumer "
+                            "group '%s'\r\n" % (key, group))
+                now_ms = int(time.time() * 1000)
+                reply = "*%d\r\n" % len(grp["consumers"])
+                for consumer in grp["consumers"]:
+                    pending = sum(1 for _bound, pel in grp["pel"].items()
+                                  if pel[0] == consumer)
+                    seen, active = grp["seen"].get(consumer,
+                                                   (now_ms, now_ms))
+                    reply += "*8\r\n"
+                    reply += self._bulk("name")
+                    reply += self._bulk(consumer)
+                    reply += self._bulk("pending")
+                    reply += ":%d\r\n" % pending
+                    reply += self._bulk("idle")
+                    reply += ":%d\r\n" % (now_ms - seen)
+                    reply += self._bulk("inactive")
+                    reply += ":%d\r\n" % (now_ms - active)
+                return reply
+            return ("-ERR unknown subcommand '%s'. Try XINFO HELP.\r\n"
+                    % args[0])
         elif name == "XPENDING":
             # XPENDING key group: the summary — total, lowest and
             # highest pending IDs (nil when nothing is pending),
@@ -4235,6 +4426,8 @@ class McpTests(unittest.TestCase):
                     "kv_xgroup_create", "kv_xack", "kv_xclaim",
                     "kv_xgroup_setid", "kv_xgroup_destroy",
                     "kv_xgroup_delconsumer", "kv_xgroup_createconsumer",
+                    "kv_xinfo_stream", "kv_xinfo_groups",
+                    "kv_xinfo_consumers",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -9327,6 +9520,27 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _xinfo_stream_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xinfo_stream", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _xinfo_groups_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xinfo_groups", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
+    def _xinfo_consumers_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xinfo_consumers", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def _xack_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_xack", "arguments": arguments,
@@ -11784,6 +11998,238 @@ class McpTests(unittest.TestCase):
             {"total": 1, "min_id": "5-0", "max_id": "5-0",
              "consumers": [{"consumer": "c1", "count": 1}]})
 
+    def test_kv_xinfo_stream_groups_consumers(self):
+        # Two entries, one group from the beginning, one consumer
+        # created up front and one that reads: the stream info
+        # reports the length, the top ID, no trimming, two entries
+        # ever added, one group, and the first and last entries as
+        # id/fields objects.
+        self.assertEqual(
+            self._xadd_result({"key": "xi:s", "id": "1000-0",
+                               "fields": {"name": "alice"}}),
+            "1000-0")
+        self.assertEqual(
+            self._xadd_result({"key": "xi:s", "id": "2000-0",
+                               "fields": {"name": "bob"}}),
+            "2000-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xi:s", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xgroup_createconsumer_result(
+                {"key": "xi:s", "group": "grp", "consumer": "c2"}),
+            1)
+        # c1 reads one entry, so the group has read one new entry
+        # and c1 holds one pending entry; c2 holds none.
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xi:s": ">"},
+                                     "count": 1}),
+            [{"key": "xi:s",
+              "entries": [{"id": "1000-0",
+                           "fields": {"name": "alice"}}]}])
+        self.assertEqual(
+            self._xinfo_stream_result({"key": "xi:s"}),
+            {"length": 2, "last_generated_id": "2000-0",
+             "max_deleted_entry_id": "0-0", "entries_added": 2,
+             "groups": 1,
+             "first_entry": {"id": "1000-0",
+                             "fields": {"name": "alice"}},
+             "last_entry": {"id": "2000-0",
+                            "fields": {"name": "bob"}}})
+        self.assertEqual(
+            self._xinfo_groups_result({"key": "xi:s"}),
+            [{"name": "grp", "consumers": 2, "pending": 1,
+              "last_delivered_id": "1000-0", "entries_read": 1}])
+        consumers = self._xinfo_consumers_result(
+            {"key": "xi:s", "group": "grp"})
+        self.assertEqual(
+            [(c["name"], c["pending"]) for c in consumers],
+            [("c2", 0), ("c1", 1)])
+        # Idle and inactive are real times, so only the shape and
+        # the ordering are exact: both are non-negative, and a
+        # consumer's idle never exceeds its inactive — the last
+        # attempted interaction is at least as recent as the last
+        # successful read.
+        for consumer in consumers:
+            self.assertGreaterEqual(consumer["idle_ms"], 0)
+            self.assertGreaterEqual(consumer["inactive_ms"],
+                                    consumer["idle_ms"])
+        # An empty stream reports length 0, the 0-0 IDs, no
+        # entries ever added, and null first and last entries; a
+        # group on it has never read, so its entries-read is null,
+        # and it has no consumers.
+        self.assertEqual(
+            self._raw().command("XGROUP", "CREATE", "xi:empty", "grp",
+                                "0", "MKSTREAM"),
+            "OK")
+        self.assertEqual(
+            self._xinfo_stream_result({"key": "xi:empty"}),
+            {"length": 0, "last_generated_id": "0-0",
+             "max_deleted_entry_id": "0-0", "entries_added": 0,
+             "groups": 1, "first_entry": None, "last_entry": None})
+        self.assertEqual(
+            self._xinfo_groups_result({"key": "xi:empty"}),
+            [{"name": "grp", "consumers": 0, "pending": 0,
+              "last_delivered_id": "0-0", "entries_read": None}])
+        self.assertEqual(
+            self._xinfo_consumers_result(
+                {"key": "xi:empty", "group": "grp"}),
+            [])
+        # A MAXLEN trim counts the trimmed entry in entries-added
+        # but not in the length, and reports it as the highest
+        # deleted ID.
+        self.assertEqual(
+            self._xadd_result({"key": "xi:t", "id": "1000-0",
+                               "fields": {"v": "a"}}),
+            "1000-0")
+        self.assertEqual(
+            self._xadd_result({"key": "xi:t", "id": "2000-0",
+                               "fields": {"v": "b"}, "maxlen": 1}),
+            "2000-0")
+        self.assertEqual(
+            self._xinfo_stream_result({"key": "xi:t"}),
+            {"length": 1, "last_generated_id": "2000-0",
+             "max_deleted_entry_id": "1000-0", "entries_added": 2,
+             "groups": 0,
+             "first_entry": {"id": "2000-0", "fields": {"v": "b"}},
+             "last_entry": {"id": "2000-0", "fields": {"v": "b"}}})
+        # A missing key fails STREAM and errors CONSUMERS with
+        # NOGROUP, but GROUPS answers an empty list for it, as in
+        # real cinder; a non-stream key is WRONGTYPE for all three.
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "xi:plain", "value": "v"},
+        })
+        for name, arguments, marker in (
+                ("kv_xinfo_stream", {"key": "xi:ghost"}, "no such key"),
+                ("kv_xinfo_consumers", {"key": "xi:ghost", "group": "grp"},
+                 "NOGROUP"),
+                ("kv_xinfo_consumers", {"key": "xi:s", "group": "nope"},
+                 "NOGROUP"),
+                ("kv_xinfo_stream", {"key": "xi:plain"}, "WRONGTYPE"),
+                ("kv_xinfo_groups", {"key": "xi:plain"}, "WRONGTYPE"),
+                ("kv_xinfo_consumers",
+                 {"key": "xi:plain", "group": "grp"}, "WRONGTYPE")):
+            reply = self._call("tools/call", 1, {
+                "name": name, "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn(marker, reply["error"]["message"], arguments)
+        self.assertEqual(
+            self._xinfo_groups_result({"key": "xi:ghost"}), [])
+
+    def test_kv_xinfo_rejects_bad_arguments(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xir:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xir:s", "group": "grp", "id": "0"}),
+            "OK")
+        bad = [({}, "kv_xinfo_stream"), ({}, "kv_xinfo_groups"),
+               ({"key": 1}, "kv_xinfo_stream"),
+               ({"key": 1}, "kv_xinfo_groups"),
+               ({}, "kv_xinfo_consumers"),
+               ({"key": "xir:s"}, "kv_xinfo_consumers"),
+               ({"key": "xir:s", "group": 1}, "kv_xinfo_consumers"),
+               ({"key": 1, "group": "grp"}, "kv_xinfo_consumers")]
+        for arguments, name in bad:
+            reply = self._call("tools/call", 1, {
+                "name": name, "arguments": arguments,
+            })
+            self.assertIn("error", reply, (name, arguments))
+            self.assertEqual(reply["error"]["code"], -32602,
+                             (name, arguments))
+
+    def test_kv_xinfo_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xib:s", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xadd", "key": "xib:s", "id": "2-0",
+                 "fields": {"v": "b"}},
+                {"op": "kv_xgroup_create", "key": "xib:s",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xib:s": ">"}},
+                {"op": "kv_xinfo_stream", "key": "xib:s"},
+                {"op": "kv_xinfo_groups", "key": "xib:s"},
+                {"op": "kv_xinfo_consumers", "key": "xib:s",
+                 "group": "grp"},
+                {"op": "kv_xinfo_stream", "key": "xib:ghost"},
+                {"op": "kv_xinfo_consumers", "key": "xib:s",
+                 "group": "nope"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 7)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(
+            summary["results"][4]["result"],
+            {"length": 2, "last_generated_id": "2-0",
+             "max_deleted_entry_id": "0-0", "entries_added": 2,
+             "groups": 1,
+             "first_entry": {"id": "1-0", "fields": {"v": "a"}},
+             "last_entry": {"id": "2-0", "fields": {"v": "b"}}})
+        self.assertEqual(
+            summary["results"][5]["result"],
+            [{"name": "grp", "consumers": 1, "pending": 2,
+              "last_delivered_id": "2-0", "entries_read": 2}])
+        self.assertEqual(
+            [(c["name"], c["pending"])
+             for c in summary["results"][6]["result"]],
+            [("c1", 2)])
+        self.assertFalse(summary["results"][7]["ok"])
+        self.assertIn("no such key", summary["results"][7]["error"])
+        self.assertFalse(summary["results"][8]["ok"])
+        self.assertIn("NOGROUP", summary["results"][8]["error"])
+        # The atomic batch queues the XINFO reads and runs them at
+        # EXEC: the stream info, the group and the consumer all
+        # read back, and an EXEC-time NOGROUP is recorded in place.
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xib2:s", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xgroup_create", "key": "xib2:s",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xgroup_createconsumer", "key": "xib2:s",
+                 "group": "grp", "consumer": "c1"},
+                {"op": "kv_xinfo_stream", "key": "xib2:s"},
+                {"op": "kv_xinfo_groups", "key": "xib2:s"},
+                {"op": "kv_xinfo_consumers", "key": "xib2:s",
+                 "group": "grp"},
+                {"op": "kv_xinfo_consumers", "key": "xib2:s",
+                 "group": "nope"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 6)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(
+            summary["results"][3]["result"],
+            {"length": 1, "last_generated_id": "5-0",
+             "max_deleted_entry_id": "0-0", "entries_added": 1,
+             "groups": 1,
+             "first_entry": {"id": "5-0", "fields": {"v": "x"}},
+             "last_entry": {"id": "5-0", "fields": {"v": "x"}}})
+        self.assertEqual(
+            summary["results"][4]["result"],
+            [{"name": "grp", "consumers": 1, "pending": 0,
+              "last_delivered_id": "0-0", "entries_read": None}])
+        self.assertEqual(
+            [(c["name"], c["pending"])
+             for c in summary["results"][5]["result"]],
+            [("c1", 0)])
+        self.assertFalse(summary["results"][6]["ok"])
+        self.assertIn("NOGROUP", summary["results"][6]["error"])
+
     def test_prompts_get_write_safety_covers_xgroup_create_and_xack(self):
         self.assertEqual(
             self._xadd_result({"key": "ws:g2", "id": "1-0",
@@ -12406,6 +12852,30 @@ class McpTests(unittest.TestCase):
             "op 5: kv_xpending is a read, not a write", text)
         self.assertIn(
             "op 6: kv_xpending is a read, not a write", text)
+
+    def test_prompts_get_write_safety_xinfo_tools_are_reads(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:xi", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:xi", "group": "grp", "id": "0"}),
+            "OK")
+        plan = [
+            {"op": "kv_xinfo_stream", "key": "ws:xi"},
+            {"op": "kv_xinfo_groups", "key": "ws:xi"},
+            {"op": "kv_xinfo_consumers", "key": "ws:xi",
+             "group": "grp"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 3 op(s), 0 audited, 3 not audited.", text)
+        self.assertIn(
+            "op 0: kv_xinfo_stream is a read, not a write", text)
+        self.assertIn(
+            "op 1: kv_xinfo_groups is a read, not a write", text)
+        self.assertIn(
+            "op 2: kv_xinfo_consumers is a read, not a write", text)
 
     def test_resources_read_key_stream_returns_type_and_length(self):
         self.assertEqual(
