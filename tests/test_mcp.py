@@ -3571,8 +3571,9 @@ class FakeCinder(threading.Thread):
             return reply
         elif name == "XGROUP":
             # XGROUP CREATE key group id [MKSTREAM], XGROUP
-            # SETID key group id, XGROUP DESTROY key group and
-            # XGROUP DELCONSUMER key group consumer, as in real
+            # SETID key group id, XGROUP DESTROY key group,
+            # XGROUP DELCONSUMER key group consumer and XGROUP
+            # CREATECONSUMER key group consumer, as in real
             # cinder: "$" is the top ID, "0" from the
             # beginning, or an explicit ID; MKSTREAM creates the
             # stream empty when it is missing. SETID moves an
@@ -3586,8 +3587,13 @@ class FakeCinder(threading.Thread):
             # one consumer and the pending entries it held, and
             # answers how many it had, or 0 when there was no
             # such consumer; the group and the stream survive.
-            # A missing key is NOGROUP, and a non-stream key is
-            # WRONGTYPE. Other subcommands are an error.
+            # CREATECONSUMER creates a consumer on a group
+            # before it ever reads, and answers 1, or 0 when
+            # the consumer already existed; the consumer starts
+            # with no pending entries, and the group, its cursor
+            # and the stream are untouched. A missing key is
+            # NOGROUP, and a non-stream key is WRONGTYPE. Other
+            # subcommands are an error.
             if len(args) < 1:
                 return ("-ERR Unknown subcommand or wrong number of "
                         "arguments for 'xgroup'\r\n")
@@ -3606,6 +3612,32 @@ class FakeCinder(threading.Thread):
                 if group not in value.groups:
                     return ":0\r\n"
                 del value.groups[group]
+                return ":1\r\n"
+            if args[0].upper() == "CREATECONSUMER":
+                # XGROUP CREATECONSUMER key group consumer: create
+                # a consumer on a group before it ever reads, so
+                # it shows in the group's consumer list with no
+                # pending entries until a ">" read delivers some
+                # to it. Answers 1, or 0 when the consumer
+                # already existed. The group, its cursor, the
+                # other consumers and the stream are untouched. A
+                # missing key or group is NOGROUP, and a
+                # non-stream key is WRONGTYPE.
+                if len(args) != 4:
+                    return ("-ERR wrong number of arguments for "
+                            "'xgroup' command\r\n")
+                key, group, consumer = args[1], args[2], args[3]
+                value = self._get(key)
+                if value is not None and not isinstance(value, Stream):
+                    return ("-WRONGTYPE Operation against a key "
+                            "holding the wrong kind of value\r\n")
+                if value is None or group not in value.groups:
+                    return ("-ERR NOGROUP No such key '%s' or consumer "
+                            "group '%s'\r\n" % (key, group))
+                grp = value.groups[group]
+                if consumer in grp["consumers"]:
+                    return ":0\r\n"
+                grp["consumers"].append(consumer)
                 return ":1\r\n"
             if args[0].upper() == "DELCONSUMER":
                 # XGROUP DELCONSUMER key group consumer: drop one
@@ -4202,7 +4234,7 @@ class McpTests(unittest.TestCase):
                     "kv_xread", "kv_xreadgroup", "kv_xpending",
                     "kv_xgroup_create", "kv_xack", "kv_xclaim",
                     "kv_xgroup_setid", "kv_xgroup_destroy",
-                    "kv_xgroup_delconsumer",
+                    "kv_xgroup_delconsumer", "kv_xgroup_createconsumer",
                     "kv_zadd", "kv_zrange", "kv_zrevrange",
                     "kv_zrangebyscore", "kv_zrevrangebyscore",
                     "kv_zrangebylex", "kv_zlexcount", "kv_zcount",
@@ -9288,6 +9320,13 @@ class McpTests(unittest.TestCase):
         self.assertNotIn("error", reply, arguments)
         return json.loads(reply["result"]["content"][0]["text"])
 
+    def _xgroup_createconsumer_result(self, arguments):
+        reply = self._call("tools/call", 1, {
+            "name": "kv_xgroup_createconsumer", "arguments": arguments,
+        })
+        self.assertNotIn("error", reply, arguments)
+        return json.loads(reply["result"]["content"][0]["text"])
+
     def _xack_result(self, arguments):
         reply = self._call("tools/call", 1, {
             "name": "kv_xack", "arguments": arguments,
@@ -11589,6 +11628,162 @@ class McpTests(unittest.TestCase):
             {"total": 0, "min_id": None, "max_id": None,
              "consumers": []})
 
+    def test_kv_xgroup_createconsumer_creates_a_consumer(self):
+        # One entry and one group from the beginning. Creating
+        # a consumer up front answers 1, and the consumer shows
+        # in the pending summary only once a ">" read delivers
+        # an entry to it — before that it holds nothing, and the
+        # group's cursor has not moved.
+        self.assertEqual(
+            self._xadd_result({"key": "xgcc:s", "id": "1000-0",
+                               "fields": {"name": "alice"}}),
+            "1000-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgcc:s", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xgroup_createconsumer_result(
+                {"key": "xgcc:s", "group": "grp", "consumer": "c1"}),
+            1)
+        # Creating the same consumer again answers 0 instead of
+        # failing, and a second consumer answers 1.
+        self.assertEqual(
+            self._xgroup_createconsumer_result(
+                {"key": "xgcc:s", "group": "grp", "consumer": "c1"}),
+            0)
+        self.assertEqual(
+            self._xgroup_createconsumer_result(
+                {"key": "xgcc:s", "group": "grp", "consumer": "c2"}),
+            1)
+        # Neither consumer holds anything pending yet, and the
+        # group cursor is still at the beginning: the next ">"
+        # read delivers the entry to c1.
+        self.assertEqual(
+            self._xpending_result({"key": "xgcc:s", "group": "grp"}),
+            {"total": 0, "min_id": None, "max_id": None,
+             "consumers": []})
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"xgcc:s": ">"}}),
+            [{"key": "xgcc:s",
+              "entries": [{"id": "1000-0", "fields": {"name": "alice"}}]}])
+        self.assertEqual(
+            self._xpending_result({"key": "xgcc:s", "group": "grp"}),
+            {"total": 1, "min_id": "1000-0", "max_id": "1000-0",
+             "consumers": [{"consumer": "c1", "count": 1}]})
+        # The pre-created c2 holds nothing pending, so deleting
+        # it answers 0 — and c1's entry is still pending, so the
+        # group itself is untouched.
+        self.assertEqual(
+            self._xgroup_delconsumer_result(
+                {"key": "xgcc:s", "group": "grp", "consumer": "c2"}),
+            0)
+        self.assertEqual(
+            self._xpending_result({"key": "xgcc:s", "group": "grp"}),
+            {"total": 1, "min_id": "1000-0", "max_id": "1000-0",
+             "consumers": [{"consumer": "c1", "count": 1}]})
+        # A missing key or group fails with NOGROUP, and a
+        # non-stream key with WRONGTYPE, as server errors.
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "xgcc:plain", "value": "v"},
+        })
+        for arguments, marker in (
+                ({"key": "xgcc:ghost", "group": "grp",
+                  "consumer": "c1"}, "NOGROUP"),
+                ({"key": "xgcc:s", "group": "nope",
+                  "consumer": "c1"}, "NOGROUP"),
+                ({"key": "xgcc:plain", "group": "grp",
+                  "consumer": "c1"}, "WRONGTYPE")):
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xgroup_createconsumer", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32000, arguments)
+            self.assertIn(marker, reply["error"]["message"], arguments)
+
+    def test_kv_xgroup_createconsumer_rejects_bad_arguments(self):
+        self.assertEqual(
+            self._xadd_result({"key": "xgccr:s", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "xgccr:s", "group": "grp", "id": "0"}),
+            "OK")
+        bad = [{}, {"key": "xgccr:s"}, {"key": "xgccr:s", "group": "grp"},
+               {"key": "xgccr:s", "group": "grp", "consumer": 1},
+               {"key": 1, "group": "grp", "consumer": "c1"},
+               {"key": "xgccr:s", "group": 1, "consumer": "c1"}]
+        for arguments in bad:
+            reply = self._call("tools/call", 1, {
+                "name": "kv_xgroup_createconsumer", "arguments": arguments,
+            })
+            self.assertIn("error", reply, arguments)
+            self.assertEqual(reply["error"]["code"], -32602, arguments)
+
+    def test_kv_xgroup_createconsumer_in_plain_and_atomic_batch(self):
+        plain = self._call("tools/call", 1, {
+            "name": "kv_batch",
+            "arguments": {"ops": [
+                {"op": "kv_xadd", "key": "xgccb1", "id": "1-0",
+                 "fields": {"v": "a"}},
+                {"op": "kv_xgroup_create", "key": "xgccb1",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xgroup_createconsumer", "key": "xgccb1",
+                 "group": "grp", "consumer": "c1"},
+                {"op": "kv_xgroup_createconsumer", "key": "xgccb1",
+                 "group": "grp", "consumer": "c1"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgccb1": ">"}},
+                {"op": "kv_xpending", "key": "xgccb1",
+                 "group": "grp"},
+                {"op": "kv_xgroup_createconsumer", "key": "xgccb1",
+                 "group": "nope", "consumer": "c1"},
+            ]},
+        })
+        summary = json.loads(plain["result"]["content"][0]["text"])
+        self.assertEqual(summary["ok"], 6)
+        self.assertEqual(summary["failed"], 1)
+        # Creating the consumer answers 1, then 0 for the same
+        # name, and the pre-created consumer reads as itself.
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(summary["results"][3]["result"], 0)
+        self.assertEqual(
+            summary["results"][5]["result"],
+            {"total": 1, "min_id": "1-0", "max_id": "1-0",
+             "consumers": [{"consumer": "c1", "count": 1}]})
+        self.assertFalse(summary["results"][6]["ok"])
+        self.assertIn("NOGROUP", summary["results"][6]["error"])
+        # The atomic batch queues the create and runs it at
+        # EXEC: the consumer exists, and the pending read after
+        # it answers the delivered entry.
+        atomic = self._call("tools/call", 2, {
+            "name": "kv_batch",
+            "arguments": {"atomic": True, "ops": [
+                {"op": "kv_xadd", "key": "xgccb2", "id": "5-0",
+                 "fields": {"v": "x"}},
+                {"op": "kv_xgroup_create", "key": "xgccb2",
+                 "group": "grp", "id": "0"},
+                {"op": "kv_xgroup_createconsumer", "key": "xgccb2",
+                 "group": "grp", "consumer": "c1"},
+                {"op": "kv_xreadgroup", "group": "grp",
+                 "consumer": "c1", "streams": {"xgccb2": ">"}},
+                {"op": "kv_xpending", "key": "xgccb2",
+                 "group": "grp"},
+            ]},
+        })
+        summary = json.loads(atomic["result"]["content"][0]["text"])
+        self.assertTrue(summary["atomic"])
+        self.assertEqual(summary["ok"], 5)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["results"][2]["result"], 1)
+        self.assertEqual(
+            summary["results"][4]["result"],
+            {"total": 1, "min_id": "5-0", "max_id": "5-0",
+             "consumers": [{"consumer": "c1", "count": 1}]})
+
     def test_prompts_get_write_safety_covers_xgroup_create_and_xack(self):
         self.assertEqual(
             self._xadd_result({"key": "ws:g2", "id": "1-0",
@@ -12070,6 +12265,80 @@ class McpTests(unittest.TestCase):
             "op 5: kv_xgroup_delconsumer — consumer 'ghost' holds "
             "no pending entries in group 'grp' on stream 'ws:dc', "
             "so deleting it drops only the consumer and answers 0",
+            safe,
+        )
+
+    def test_prompts_get_write_safety_covers_xgroup_createconsumer(self):
+        self.assertEqual(
+            self._xadd_result({"key": "ws:cc", "id": "1-0",
+                               "fields": {"v": "a"}}),
+            "1-0")
+        self.assertEqual(
+            self._xadd_result({"key": "ws:cc", "id": "2-0",
+                               "fields": {"v": "b"}}),
+            "2-0")
+        self.assertEqual(
+            self._xgroup_create_result(
+                {"key": "ws:cc", "group": "grp", "id": "0"}),
+            "OK")
+        self.assertEqual(
+            self._xgroup_createconsumer_result(
+                {"key": "ws:cc", "group": "grp", "consumer": "c1"}),
+            1)
+        self.assertEqual(
+            self._xreadgroup_result({"group": "grp", "consumer": "c1",
+                                     "streams": {"ws:cc": ">"}}),
+            [{"key": "ws:cc",
+              "entries": [{"id": "1-0", "fields": {"v": "a"}},
+                          {"id": "2-0", "fields": {"v": "b"}}]}])
+        self._call("tools/call", 1, {
+            "name": "kv_set",
+            "arguments": {"key": "ws:plain", "value": "v"},
+        })
+        plan = [
+            {"op": "kv_xgroup_createconsumer", "key": "ws:ghost",
+             "group": "grp", "consumer": "c1"},
+            {"op": "kv_xgroup_createconsumer", "key": "ws:cc",
+             "group": "grp", "consumer": "c1"},
+            {"op": "kv_xgroup_createconsumer", "key": "ws:plain",
+             "group": "grp", "consumer": "c1"},
+            {"op": "kv_xgroup_createconsumer", "key": "ws:cc",
+             "group": "nope", "consumer": "c1"},
+            {"op": "kv_xgroup_createconsumer", "key": "ws:cc",
+             "group": "grp", "consumer": "c2"},
+        ]
+        text = self._write_safety_text(plan)
+        self.assertIn("Plan: 5 op(s), 5 audited, 0 not audited.", text)
+        risky = text.split("Risky (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 0: kv_xgroup_createconsumer — 'ws:ghost' would fail: "
+            "no such key or consumer group 'grp'",
+            risky,
+        )
+        self.assertIn(
+            "op 2: kv_xgroup_createconsumer — 'ws:plain' would fail "
+            "with WRONGTYPE: the key is a string of 1 bytes",
+            risky,
+        )
+        self.assertIn(
+            "op 3: kv_xgroup_createconsumer — 'ws:cc' would fail: no "
+            "such key or consumer group 'nope'",
+            risky,
+        )
+        safe = text.split("Safe (")[1].split("\n\n")[0]
+        self.assertIn(
+            "op 1: kv_xgroup_createconsumer — consumer 'c1' already "
+            "exists in group 'grp' on stream 'ws:cc' with 2 pending "
+            "entries, so creating it again answers 0 and changes "
+            "nothing",
+            safe,
+        )
+        self.assertIn(
+            "op 4: kv_xgroup_createconsumer — creates consumer 'c2' "
+            "in group 'grp' on stream 'ws:cc' with no pending "
+            "entries, or the consumer already exists with none, in "
+            "which case the call answers 0; either way no delivery "
+            "state changes",
             safe,
         )
 

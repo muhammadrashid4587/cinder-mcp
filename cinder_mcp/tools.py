@@ -788,6 +788,19 @@ TOOLS = [
         },
     },
     {
+        "name": "kv_xgroup_createconsumer",
+        "description": "Create a consumer on a consumer group before it ever reads: XGROUP CREATECONSUMER key group consumer. Takes `key`, `group` and `consumer` as strings and returns 1 when the consumer was created, 0 when it already existed. A consumer otherwise comes into being only when it first reads, so creating it up front means it shows in the group's consumer list with no pending entries until a \">\" read delivers some to it. Creating a consumer changes no delivery state: the group's cursor, the other consumers and their pending entries are untouched, and the stream is untouched. A missing key or a group that does not exist fails with NOGROUP, and a key that is not a stream fails with WRONGTYPE.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "group": {"type": "string"},
+                "consumer": {"type": "string"},
+            },
+            "required": ["key", "group", "consumer"],
+        },
+    },
+    {
         "name": "kv_zadd",
         "description": "Add members with scores to a sorted set: ZADD key [NX | XX | GT | LT | CH | INCR] score member [score member ...]. Takes `members` as an object mapping member names to scores. Returns the number of members that were newly added (updating an existing member's score returns 0 for it), or with ch=true the number of members added or updated. With nx=true only members not already present are added, with xx=true only members already present are updated, with gt=true an existing member's score only moves up, with lt=true it only moves down; nx cannot combine with xx, gt or lt, and gt cannot combine with lt. With incr=true exactly one member is given and the call returns that member's new score as a number (or null when the conditions rejected the update), like ZINCRBY.",
         "inputSchema": {
@@ -1605,7 +1618,7 @@ TOOLS = [
     },
     {
         "name": "kv_batch",
-        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_xgroup_setid, kv_xgroup_destroy, kv_xgroup_delconsumer, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
+        "description": "Run several kv operations in one call, in order, and get one summary back. Each op is an object with an \"op\" naming one of kv_get, kv_set, kv_del, kv_keys, kv_dbsize, kv_incr, kv_ttl, kv_pttl, kv_exists, kv_expire, kv_pexpire, kv_mget, kv_mset, kv_getdel, kv_setnx, kv_setex, kv_getset, kv_append, kv_strlen, kv_decr, kv_decrby, kv_getex, kv_getrange, kv_setrange, kv_setbit, kv_getbit, kv_bitcount, kv_bitop, kv_bitfield, kv_hset, kv_hget, kv_hgetall, kv_hdel, kv_hexists, kv_hlen, kv_hmget, kv_hsetnx, kv_hincrby, kv_hscan, kv_hkeys, kv_hvals, kv_hincrbyfloat, kv_hexpire, kv_hpexpire, kv_hexpireat, kv_hpexpireat, kv_httl, kv_hpttl, kv_hpersist, kv_xadd, kv_xrange, kv_xrevrange, kv_xlen, kv_xread, kv_xreadgroup, kv_xpending, kv_xgroup_create, kv_xack, kv_xclaim, kv_xgroup_setid, kv_xgroup_destroy, kv_xgroup_delconsumer, kv_xgroup_createconsumer, kv_zadd, kv_zrange, kv_zrevrange, kv_zrangebyscore, kv_zrevrangebyscore, kv_zrangebylex, kv_zlexcount, kv_zcount, kv_zcard, kv_zscore, kv_zmscore, kv_zrank, kv_zrevrank, kv_zrem, kv_zremrangebyscore, kv_zremrangebyrank, kv_zremrangebylex, kv_zincrby, kv_zpopmin, kv_zpopmax, kv_zrandmember, kv_zscan, kv_zunion, kv_zinter, kv_zdiff, kv_zunionstore, kv_zinterstore, kv_zdiffstore, kv_pfadd, kv_pfcount, kv_pfmerge, kv_geoadd, kv_geodist, kv_geopos, kv_geohash, kv_geosearch, kv_geosearchstore, kv_georadius, kv_georadiusbymember, kv_georadius_ro, kv_georadiusbymember_ro, kv_lpush, kv_rpush, kv_lrange, kv_llen, kv_lpop, kv_rpop, kv_lindex, kv_lset, kv_linsert, kv_lpushx, kv_rpushx, kv_ltrim, kv_lmove, kv_sadd, kv_smembers, kv_sscan, kv_scard, kv_srem or kv_sismember plus that tool's arguments. Ops run sequentially and the batch keeps going past a failed op; each op's result or error is reported. At most 100 ops per call. Pass atomic=true to run the ops as one MULTI/EXEC transaction instead: they execute together with no other client interleaved, and an op that fails at EXEC time is recorded in place while the rest still run. An atomic batch only takes the single-command ops (kv_keys_scan cannot run inside a transaction); an op that cannot be queued fails the whole call before anything runs, so check the ops first. A kv_xread or kv_xreadgroup with block cannot run in an atomic batch: cinder refuses to queue a BLOCK inside MULTI/EXEC, so the whole call fails; a plain kv_xread or kv_xreadgroup queues and runs at EXEC.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1741,7 +1754,7 @@ BATCHABLE_TOOLS = {
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
     "kv_xclaim", "kv_xgroup_setid", "kv_xgroup_destroy",
-    "kv_xgroup_delconsumer",
+    "kv_xgroup_delconsumer", "kv_xgroup_createconsumer",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -1841,7 +1854,7 @@ ATOMIC_BATCHABLE_TOOLS = {
     "kv_xadd", "kv_xrange", "kv_xrevrange", "kv_xlen", "kv_xread",
     "kv_xreadgroup", "kv_xpending", "kv_xgroup_create", "kv_xack",
     "kv_xclaim", "kv_xgroup_setid", "kv_xgroup_destroy",
-    "kv_xgroup_delconsumer",
+    "kv_xgroup_delconsumer", "kv_xgroup_createconsumer",
     "kv_zadd", "kv_zrange", "kv_zrevrange", "kv_zrangebyscore",
     "kv_zrevrangebyscore", "kv_zrangebylex",
     "kv_zlexcount", "kv_zcount", "kv_zcard",
@@ -2717,6 +2730,15 @@ def _op_argv(name, args):
         # pending entries survive, and the stream is untouched.
         key, group, consumer = _xgroup_delconsumer_args(args)
         return ["XGROUP", "DELCONSUMER", key, group, consumer]
+    if name == "kv_xgroup_createconsumer":
+        # XGROUP CREATECONSUMER key group consumer — creates
+        # a consumer on a group before it ever reads, so it
+        # shows in the group's consumer list with no pending
+        # entries until a ">" read delivers some to it. The
+        # group's cursor, the other consumers and their pending
+        # entries are untouched, and the stream is untouched.
+        key, group, consumer = _xgroup_createconsumer_args(args)
+        return ["XGROUP", "CREATECONSUMER", key, group, consumer]
     if name == "kv_zadd":
         return (["ZADD", _require(args, "key")] + _zadd_options(args)
                 + _zadd_member_args(args))
@@ -4348,6 +4370,32 @@ def _call_xgroup_delconsumer(client, args):
     group, answering how many pending entries the consumer had
     — 0 when there was no such consumer, or when it held none."""
     reply = client.command(*_op_argv("kv_xgroup_delconsumer", args))
+    return reply
+
+
+def _xgroup_createconsumer_args(args):
+    """Validate a kv_xgroup_createconsumer call: (key, group,
+    consumer). All three must be strings. There is no id: the
+    consumer starts with no pending entries, whatever entries
+    the stream holds."""
+    key = _require(args, "key")
+    if not isinstance(key, str):
+        raise ValueError("kv_xgroup_createconsumer key must be a string")
+    group = _require(args, "group")
+    if not isinstance(group, str):
+        raise ValueError("kv_xgroup_createconsumer group must be a string")
+    consumer = _require(args, "consumer")
+    if not isinstance(consumer, str):
+        raise ValueError(
+            "kv_xgroup_createconsumer consumer must be a string")
+    return key, group, consumer
+
+
+def _call_xgroup_createconsumer(client, args):
+    """kv_xgroup_createconsumer: create a consumer on a consumer
+    group before it ever reads, answering 1 when it was created,
+    0 when it already existed."""
+    reply = client.command(*_op_argv("kv_xgroup_createconsumer", args))
     return reply
 
 
@@ -6095,6 +6143,8 @@ def _call_single(client, name, args):
         return _call_xgroup_destroy(client, args)
     if name == "kv_xgroup_delconsumer":
         return _call_xgroup_delconsumer(client, args)
+    if name == "kv_xgroup_createconsumer":
+        return _call_xgroup_createconsumer(client, args)
     if name == "kv_smembers":
         return _call_smembers(client, args)
     if name == "kv_hgetall":
