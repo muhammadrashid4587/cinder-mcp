@@ -64,8 +64,8 @@ from .resp import RespError
 from .scan import DEFAULT_SCAN_BATCH_SIZE, iter_keys
 from .tools import (MAX_GEOSEARCH_MEMBERS, MAX_XPENDING_ENTRIES,
                     _xack_args, _xadd_args, _xclaim_args,
-                    _xgroup_create_args, _xgroup_destroy_args,
-                    _xgroup_setid_args,
+                    _xgroup_create_args, _xgroup_delconsumer_args,
+                    _xgroup_destroy_args, _xgroup_setid_args,
                     _xreadgroup_args)
 
 # Keys per batch when ttl-audit and cleanup-plan scan the keyspace.
@@ -156,6 +156,7 @@ WRITE_SAFETY_WRITE_OPS = (
     "kv_lpushx", "kv_rpushx", "kv_ltrim", "kv_lmove",
     "kv_xadd", "kv_xreadgroup", "kv_xgroup_create", "kv_xack",
     "kv_xclaim", "kv_xgroup_setid", "kv_xgroup_destroy",
+    "kv_xgroup_delconsumer",
 )
 WRITE_SAFETY_READ_OPS = ("kv_get", "kv_keys", "kv_dbsize", "kv_ttl",
                          "kv_exists",
@@ -2285,6 +2286,74 @@ def _audit_xgroup_destroy(client, op):
     )
 
 
+def _audit_xgroup_delconsumer(client, op):
+    """Audit one kv_xgroup_delconsumer op: the stream and the
+    group are probed live, and the pending summary is read with
+    XPENDING so a delete that would drop unacknowledged work is
+    judged against the consumer's own count. Dropping a consumer
+    deletes its pending entries with it — the entries stay in the
+    stream, but they become unclaimable, so they would have to be
+    re-read through another consumer or group. A consumer holding
+    pending entries is risky, a consumer holding none is safe —
+    the delete drops only the consumer itself and answers 0, and
+    a consumer that does not exist at all answers 0 too, so the
+    two cannot be told apart and are judged together. Returns
+    (verdict, line)."""
+    key, group, consumer = _xgroup_delconsumer_args(op)
+    if client.command("EXISTS", key) == 0:
+        return "risky", (
+            "kv_xgroup_delconsumer — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    ttl = client.command("TTL", key)
+    if ttl == -2:
+        # The key expired while auditing; the delete would fail.
+        return "risky", (
+            "kv_xgroup_delconsumer — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    try:
+        kind, _size_value, size, _sample = _inspect_key(client, key)
+    except ValueError:
+        # The key expired between the TTL read and the probe.
+        return "risky", (
+            "kv_xgroup_delconsumer — %r would fail: no such key or "
+            "consumer group %r" % (key, group)
+        )
+    if kind != "stream":
+        return "risky", (
+            "kv_xgroup_delconsumer — %r would fail with WRONGTYPE: "
+            "the key is a %s of %s" % (key, kind, size)
+        )
+    try:
+        _total, _min_id, _max_id, consumers = client.command(
+            "XPENDING", key, group)
+    except RespError as exc:
+        if "NOGROUP" in str(exc):
+            return "risky", (
+                "kv_xgroup_delconsumer — %r would fail: no such key "
+                "or consumer group %r" % (key, group)
+            )
+        raise
+    for name, count in consumers:
+        if name != consumer:
+            continue
+        return "risky", (
+            "kv_xgroup_delconsumer — drops consumer %r in group %r "
+            "on stream %r with %d pending %s; the entries stay in "
+            "the stream, but they become unclaimable, so the "
+            "pending work would have to be re-read through another "
+            "consumer or group"
+            % (consumer, group, key, count,
+               "entry" if count == 1 else "entries")
+        )
+    return "safe", (
+        "kv_xgroup_delconsumer — consumer %r holds no pending "
+        "entries in group %r on stream %r, so deleting it drops "
+        "only the consumer and answers 0" % (consumer, group, key)
+    )
+
+
 def _audit_lmove(client, op):
     """Audit one kv_lmove op: the source and the destination are
     both probed live, because the move reads the source, writes the
@@ -3737,6 +3806,10 @@ def _audit_write_op(client, op):
         # XGROUP DESTROY drops a whole group, so it is audited
         # on its own.
         return _audit_xgroup_destroy(client, op)
+    if name == "kv_xgroup_delconsumer":
+        # XGROUP DELCONSUMER drops one consumer and its pending
+        # entries, so it is audited on its own.
+        return _audit_xgroup_delconsumer(client, op)
     key = op.get("key")
     if not key:
         raise ValueError("op is missing a key: %r" % (op,))
